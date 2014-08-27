@@ -40,7 +40,7 @@
 #define MASK_SIZE		32
 #define SCM_SET_REGSAVE_CMD	0x2
 #define SCM_SVC_SEC_WDOG_DIS	0x7
-#define MAX_CPU_CTX_SIZE	512
+#define MAX_CPU_CTX_SIZE	1024
 
 static struct workqueue_struct *wdog_wq;
 static struct msm_watchdog_data *wdog_data;
@@ -106,6 +106,7 @@ static int msm_watchdog_suspend(struct device *dev)
 	__raw_writel(0, wdog_dd->base + WDT0_EN);
 	mb();
 	wdog_dd->enabled = false;
+	wdog_dd->last_pet = sched_clock();
 	return 0;
 }
 
@@ -119,6 +120,7 @@ static int msm_watchdog_resume(struct device *dev)
 	__raw_writel(1, wdog_dd->base + WDT0_RST);
 	mb();
 	wdog_dd->enabled = true;
+	wdog_dd->last_pet = sched_clock();
 	return 0;
 }
 
@@ -221,7 +223,7 @@ static ssize_t wdog_disable_set(struct device *dev,
 		work_data.wdog_dd = wdog_dd;
 		init_completion(&work_data.complete);
 		INIT_WORK_ONSTACK(&work_data.work, wdog_disable_work);
-		queue_work(wdog_wq, &work_data.work);
+		queue_work_on(0, wdog_wq, &work_data.work);
 		wait_for_completion(&work_data.complete);
 		mutex_unlock(&wdog_dd->disable_lock);
 	} else {
@@ -296,7 +298,7 @@ static void pet_watchdog_work(struct work_struct *work)
 	/* Check again before scheduling *
 	 * Could have been changed on other cpu */
 	if (enable)
-		queue_delayed_work(wdog_wq,
+		queue_delayed_work_on(0, wdog_wq,
 				&wdog_dd->dogwork_struct, delay_time);
 }
 
@@ -311,7 +313,7 @@ static int msm_watchdog_remove(struct platform_device *pdev)
 		work_data.wdog_dd = wdog_dd;
 		init_completion(&work_data.complete);
 		INIT_WORK_ONSTACK(&work_data.work, wdog_disable_work);
-		queue_work(wdog_wq, &work_data.work);
+		queue_work_on(0, wdog_wq, &work_data.work);
 		wait_for_completion(&work_data.complete);
 	}
 	mutex_unlock(&wdog_dd->disable_lock);
@@ -489,7 +491,7 @@ static void init_watchdog_work(struct work_struct *work)
 	atomic_notifier_chain_register(&panic_notifier_list,
 				       &wdog_dd->panic_blk);
 	mutex_init(&wdog_dd->disable_lock);
-	queue_delayed_work(wdog_wq, &wdog_dd->dogwork_struct,
+	queue_delayed_work_on(0, wdog_wq, &wdog_dd->dogwork_struct,
 			delay_time);
 	__raw_writel(1, wdog_dd->base + WDT0_EN);
 	__raw_writel(1, wdog_dd->base + WDT0_RST);
@@ -568,7 +570,7 @@ static int msm_wdog_dt_to_pdata(struct platform_device *pdev,
 								__func__);
 		return -ENXIO;
 	}
-	pdata->irq_ppi = irq_is_percpu(pdata->bark_irq);
+	pdata->irq_ppi = irq_is_per_cpu(pdata->bark_irq);
 	dump_pdata(pdata);
 	return 0;
 }
@@ -597,7 +599,7 @@ static int msm_watchdog_probe(struct platform_device *pdev)
 	cpumask_clear(&wdog_dd->alive_mask);
 	INIT_WORK(&wdog_dd->init_dogwork_struct, init_watchdog_work);
 	INIT_DELAYED_WORK(&wdog_dd->dogwork_struct, pet_watchdog_work);
-	queue_work(wdog_wq, &wdog_dd->init_dogwork_struct);
+	queue_work_on(0, wdog_wq, &wdog_dd->init_dogwork_struct);
 	wdog_data = wdog_dd;
 	return 0;
 err:

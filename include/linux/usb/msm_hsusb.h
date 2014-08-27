@@ -270,7 +270,6 @@ struct msm_otg_platform_data {
 	bool enable_lpm_on_dev_suspend;
 	bool core_clk_always_on_workaround;
 	bool delay_lpm_on_disconnect;
-	bool delay_lpm_hndshk_on_disconnect;
 	bool dp_manual_pullup;
 	bool enable_sec_phy;
 	struct msm_bus_scale_pdata *bus_scale_table;
@@ -376,8 +375,8 @@ struct msm_otg_platform_data {
  * @ui_enabled: USB Intterupt is enabled or disabled.
  * @pm_done: It is used to increment the pm counter using pm_runtime_get_sync.
 	     This handles the race case when PM resume thread returns before
-	     the charger detection starts. When USB is disconnected and in lpm
-	     pm_done is set to true.
+	     the charger detection starts. When USB is disconnected pm_done
+	     is set to true.
  * @ext_id_irq: IRQ for ID interrupt.
  */
 struct msm_otg {

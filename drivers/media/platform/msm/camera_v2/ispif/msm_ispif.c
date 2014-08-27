@@ -65,6 +65,25 @@ static inline int msm_ispif_is_intf_valid(uint32_t csid_version,
 		false : true;
 }
 
+static struct msm_cam_clk_info ispif_8626_reset_clk_info[] = {
+	{"ispif_ahb_clk", NO_SET_RATE},
+	{"camss_top_ahb_clk", NO_SET_RATE},
+	{"csi0_ahb_clk", NO_SET_RATE},
+	{"csi0_src_clk", NO_SET_RATE},
+	{"csi0_phy_clk", NO_SET_RATE},
+	{"csi0_clk", NO_SET_RATE},
+	{"csi0_pix_clk", NO_SET_RATE},
+	{"csi0_rdi_clk", NO_SET_RATE},
+	{"csi1_ahb_clk", NO_SET_RATE},
+	{"csi1_src_clk", NO_SET_RATE},
+	{"csi1_phy_clk", NO_SET_RATE},
+	{"csi1_clk", NO_SET_RATE},
+	{"csi1_pix_clk", NO_SET_RATE},
+	{"csi1_rdi_clk", NO_SET_RATE},
+	{"camss_vfe_vfe_clk", NO_SET_RATE},
+	{"camss_csi_vfe_clk", NO_SET_RATE},
+};
+
 static struct msm_cam_clk_info ispif_8974_ahb_clk_info[ISPIF_CLK_INFO_MAX];
 
 static struct msm_cam_clk_info ispif_8974_reset_clk_info[] = {
@@ -97,13 +116,26 @@ static int msm_ispif_reset_hw(struct ispif_device *ispif)
 	int rc = 0;
 	long timeout = 0;
 	struct clk *reset_clk[ARRAY_SIZE(ispif_8974_reset_clk_info)];
+	struct clk *reset_clk1[ARRAY_SIZE(ispif_8626_reset_clk_info)];
+	ispif->clk_idx = 0;
 
 	rc = msm_cam_clk_enable(&ispif->pdev->dev,
 		ispif_8974_reset_clk_info, reset_clk,
 		ARRAY_SIZE(ispif_8974_reset_clk_info), 1);
 	if (rc < 0) {
-		pr_err("%s: cannot enable clock, error = %d",
-			__func__, rc);
+		rc = msm_cam_clk_enable(&ispif->pdev->dev,
+			ispif_8626_reset_clk_info, reset_clk1,
+			ARRAY_SIZE(ispif_8626_reset_clk_info), 1);
+		if (rc < 0) {
+			pr_err("%s: cannot enable clock, error = %d",
+				__func__, rc);
+		} else {
+			/* This is set when device is 8x26 */
+			ispif->clk_idx = 2;
+		}
+	} else {
+		/* This is set when device is 8974 */
+		ispif->clk_idx = 1;
 	}
 
 	init_completion(&ispif->reset_complete[VFE0]);
@@ -120,16 +152,25 @@ static int msm_ispif_reset_hw(struct ispif_device *ispif)
 	timeout = wait_for_completion_timeout(
 			&ispif->reset_complete[VFE0], msecs_to_jiffies(500));
 	CDBG("%s: VFE0 done\n", __func__);
+
 	if (timeout <= 0) {
 		pr_err("%s: VFE0 reset wait timeout\n", __func__);
-		msm_cam_clk_enable(&ispif->pdev->dev,
+		rc = msm_cam_clk_enable(&ispif->pdev->dev,
 			ispif_8974_reset_clk_info, reset_clk,
 			ARRAY_SIZE(ispif_8974_reset_clk_info), 0);
+		if (rc < 0) {
+			rc = msm_cam_clk_enable(&ispif->pdev->dev,
+				ispif_8626_reset_clk_info, reset_clk1,
+				ARRAY_SIZE(ispif_8626_reset_clk_info), 0);
+			if (rc < 0)
+				pr_err("%s: VFE0 reset wait timeout\n",
+					 __func__);
+		}
 		return -ETIMEDOUT;
 	}
 
 	if (ispif->hw_num_isps > 1) {
-		timeout = wait_for_completion_interruptible_timeout(
+		timeout = wait_for_completion_timeout(
 				&ispif->reset_complete[VFE1],
 				msecs_to_jiffies(500));
 		CDBG("%s: VFE1 done\n", __func__);
@@ -142,13 +183,26 @@ static int msm_ispif_reset_hw(struct ispif_device *ispif)
 		}
 	}
 
-	rc = msm_cam_clk_enable(&ispif->pdev->dev,
-		ispif_8974_reset_clk_info, reset_clk,
-		ARRAY_SIZE(ispif_8974_reset_clk_info), 0);
-	if (rc < 0) {
-		pr_err("%s: cannot disable clock, error = %d",
-			__func__, rc);
+	if (ispif->clk_idx == 1) {
+		rc = msm_cam_clk_enable(&ispif->pdev->dev,
+			ispif_8974_reset_clk_info, reset_clk,
+			ARRAY_SIZE(ispif_8974_reset_clk_info), 0);
+		if (rc < 0) {
+			pr_err("%s: cannot disable clock, error = %d",
+				__func__, rc);
+		}
 	}
+
+	if (ispif->clk_idx == 2) {
+		rc = msm_cam_clk_enable(&ispif->pdev->dev,
+			ispif_8626_reset_clk_info, reset_clk1,
+			ARRAY_SIZE(ispif_8626_reset_clk_info), 0);
+		if (rc < 0) {
+			pr_err("%s: cannot disable clock, error = %d",
+				__func__, rc);
+		}
+	}
+
 	return rc;
 }
 
@@ -170,6 +224,7 @@ int msm_ispif_get_ahb_clk_info(struct ispif_device *ispif_dev,
 		return 0;
 	}
 
+	count = ISPIF_AHB_CLK_INFO;
 	if (count > ISPIF_CLK_INFO_MAX) {
 		pr_err("invalid count=%d, max is %d\n", count,
 			ISPIF_CLK_INFO_MAX);
@@ -194,7 +249,7 @@ int msm_ispif_get_ahb_clk_info(struct ispif_device *ispif_dev,
 	}
 	for (i = 0; i < count; i++) {
 		ispif_8974_ahb_clk_info[i].clk_rate =
-			 (rates[i] == 0) ? (long)-1 : rates[i];
+			 (rates[i] == 0) ? -1 : rates[i];
 		CDBG("clk_rate[%d] = %ld\n", i,
 			 ispif_8974_ahb_clk_info[i].clk_rate);
 	}
@@ -218,7 +273,7 @@ static int msm_ispif_clk_ahb_enable(struct ispif_device *ispif, int enable)
 	}
 
 	rc = msm_cam_clk_enable(&ispif->pdev->dev,
-		ispif_8974_ahb_clk_info, &ispif->ahb_clk,
+		ispif_8974_ahb_clk_info, ispif->ahb_clk,
 		ispif->num_clk, enable);
 	if (rc < 0) {
 		pr_err("%s: cannot enable clock, error = %d",
@@ -996,11 +1051,7 @@ static int msm_ispif_init(struct ispif_device *ispif,
 		goto error_ahb;
 	}
 
-	if (of_device_is_compatible(ispif->pdev->dev.of_node,
-				    "qcom,ispif-v3.0")) {
-		/* currently HW reset is implemented for 8974 only */
-		msm_ispif_reset_hw(ispif);
-	}
+	msm_ispif_reset_hw(ispif);
 
 	rc = msm_ispif_reset(ispif);
 	if (rc == 0) {
@@ -1101,6 +1152,14 @@ static struct v4l2_file_operations msm_ispif_v4l2_subdev_fops;
 static long msm_ispif_subdev_ioctl(struct v4l2_subdev *sd,
 	unsigned int cmd, void *arg)
 {
+#ifdef CONFIG_COMPAT
+	void __user *up;
+	if (is_compat_task()) {
+		up = (void __user *)compat_ptr((unsigned long)arg);
+		arg = up;
+	}
+#endif
+
 	switch (cmd) {
 	case VIDIOC_MSM_ISPIF_CFG:
 		return msm_ispif_cmd(sd, arg);
@@ -1265,7 +1324,7 @@ static int ispif_probe(struct platform_device *pdev)
 #ifdef CONFIG_COMPAT
 	msm_ispif_v4l2_subdev_fops.compat_ioctl32 = msm_ispif_subdev_fops_ioctl;
 #endif
-	ispif->msm_sd.sd.devnode->fops = &msm_ispif_v4l2_subdev_fops;
+
 	ispif->pdev = pdev;
 	ispif->ispif_state = ISPIF_POWER_DOWN;
 	ispif->open_cnt = 0;

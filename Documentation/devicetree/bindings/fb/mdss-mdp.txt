@@ -30,10 +30,7 @@ Required properties
 - qcom,mdss-pipe-vig-clk-ctrl-off: Array of offsets describing clk control
 				offsets for dynamic clock gating. 1st value
 				in the array represents offset of the control
-				register. The offsets are calculated from
-				"mdp_phys" + mdp-reg-offset that are defined
-				in reg property and mdss-mdp-reg-offset respectively.
-				2nd value represents bit offset within
+				register. 2nd value represents bit offset within
 				control register and 3rd value represents bit
 				offset within status register. Number of tuples
 				defined should match the number of offsets
@@ -56,10 +53,7 @@ Required properties
 - qcom,mdss-pipe-rgb-clk-ctrl-off: Array of offsets describing clk control
 				offsets for dynamic clock gating. 1st value
 				in the array represents offset of the control
-				register. The offsets are calculated from
-				"mdp_phys" + mdp-reg-offset that are defined
-				in reg property and mdss-mdp-reg-offset respectively.
-				2nd value represents bit offset within
+				register. 2nd value represents bit offset within
 				control register and 3rd value represents bit
 				offset within status register. Number of tuples
 				defined should match the number of offsets
@@ -82,10 +76,7 @@ Required properties
 - qcom,mdss-pipe-dma-clk-ctrl-off: Array of offsets describing clk control
 				offsets for dynamic clock gating. 1st value
 				in the array represents offset of the control
-				register. The offsets are calculated from
-				"mdp_phys" + mdp-reg-offset that are defined
-				in reg property and mdss-mdp-reg-offset respectively.
-				2nd value represents bit offset within
+				register. 2nd value represents bit offset within
 				control register and 3rd value represents bit
 				offset within status register. Number of tuples
 				defined should match the number of offsets
@@ -243,6 +234,11 @@ Optional properties:
 				pipes which have no scaling support.
 - qcom,mdss-has-decimation: Boolean property to indicate the presence of
 			    decimation feature in fetch.
+- qcom,mdss-has-fixed-qos-arbiter-enabled: Boolean property to indicate the
+			    presence of rt/nrt feature. This feature enables
+			    increased performance by prioritizing the real time
+			    (rt) traffic over non real time (nrt) traffic to
+			    access the memory.
 - qcom,mdss-has-source-split: Boolean property to indicate if source split
 			      feature is available or not.
 - qcom,mdss-ad-off:		Array of offset addresses for the available
@@ -311,6 +307,10 @@ Optional properties:
 				 priority for real time clients.
 - qcom,mdss-vbif-qos-nrt-setting: This array is used to program vbif qos remapper register
 				  priority for non real time clients.
+- qcom,mdss-traffic-shaper-enabled: This boolean property enables traffic shaper functionality
+				    for MDSS rotator which spread out rotator bandwidth request
+				    so that rotator don't compete with other real time read
+				    clients.
 
 Fudge Factors:			Fudge factors are used to boost demand for
 				resources like bus bandswidth, clk rate etc. to
@@ -347,6 +347,23 @@ Fudge Factors:			Fudge factors are used to boost demand for
 				command mode panels.
 - qcom,max-bandwidth-per-pipe-kbps: This value indicates the max bandwidth in KB
 				that a single pipe can support without underflow.
+- qcom,mdss-has-panic-ctrl: Boolean property to indicate if panic/robust signal
+				control feature is available or not.
+- qcom,mdss-pipe-vig-panic-ctrl-offsets: Array of panic/robust signal offsets
+				corresponding to the respective VIG pipes.
+				Number of signal offsets should match the
+				number of offsets defined in property:
+				qcom,mdss-pipe-vig-off
+- qcom,mdss-pipe-rgb-panic-ctrl-offsets: Array of panic/robust signal offsets
+				corresponding to the respective RGB pipes.
+				Number of signal offsets should match the
+				number of offsets defined in property:
+				qcom,mdss-pipe-rgb-off
+- qcom,mdss-pipe-dma-panic-ctrl-offsets: Array of panic/robust signal offsets
+				corresponding to the respective DMA pipes.
+				Number of signal offsets should match the
+				number of offsets defined in property:
+				qcom,mdss-pipe-dma-off
 
 Optional subnodes:
 Child nodes representing the frame buffer virtual devices.
@@ -390,6 +407,9 @@ Subnode properties:
 					screen feature and has no relation with
 					qcom,cont-splash-enabled entry present in
 					panel configuration.
+- qcom,mdss-idle-power-collapse-enabled: Boolean property that enables support
+					for mdss power collapse in idle
+					screen use cases with smart panels.
 
 Example:
 	mdss_mdp: qcom,mdss_mdp@fd900000 {
@@ -451,9 +471,11 @@ Example:
 		qcom,mdss-has-non-scalar-rgb;
 		qcom,mdss-has-bwc;
 		qcom,mdss-has-decimation;
+		qcom,mdss-has-fixed-qos-arbiter-enabled;
 		qcom,mdss-has-source-split;
 		qcom,mdss-wfd-mode = "intf";
 		qcom,mdss-no-lut-read;
+		qcom,mdss-traffic-shaper-enabled;
 
 		qcom,mdss-pipe-vig-xin-id = <0 4 8>;
 		qcom,mdss-pipe-rgb-xin-id = <1 5 9>;
@@ -471,6 +493,11 @@ Example:
 
 		qcom,mdss-pipe-dma-clk-ctrl-offsets = <0x3AC 8 12>,
 						      <0x3B4 8 12>;
+
+		qcom,mdss-has-panic-ctrl;
+		qcom,mdss-pipe-vig-panic-ctrl-offsets = <0 1 2 3>;
+		qcom,mdss-pipe-rgb-panic-ctrl-offsets = <4 5 6 7>;
+		qcom,mdss-pipe-dma-panic-ctrl-offsets = <8 9>;
 
 		qcom,mdss-pipe-sw-reset-off = <0x0128>;
 		qcom,mdss-pipe-vig-sw-reset-map = <5 6 7 8>;
@@ -497,6 +524,7 @@ Example:
 		qcom,mdss-prefill-post-scaler-buffer-pixels = <2048>;
 		qcom,mdss-prefill-pingpong-buffer-pixels = <5120>;
 		qcom,mdss-prefill-fbc-lines = <2>;
+		qcom,mdss-idle-power-collapse-enabled;
 
 		mdss_fb0: qcom,mdss_fb_primary {
 			cell-index = <0>;

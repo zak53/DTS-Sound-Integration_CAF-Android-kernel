@@ -13,7 +13,6 @@
 #include "dsi-panel-sharp-qhd-video.dtsi"
 #include "msm8974-camera-sensor-dragonboard.dtsi"
 #include "msm8974-leds.dtsi"
-#include "msm-rdbg.dtsi"
 
 &vph_pwr_vreg {
 	status = "ok";
@@ -295,7 +294,7 @@
 	qcom,charging-disabled;
 	vbus_dwc3-supply = <0>;
 	dwc3@f9200000 {
-		snps,host-only-mode;
+		host-only-mode;
 	};
 };
 

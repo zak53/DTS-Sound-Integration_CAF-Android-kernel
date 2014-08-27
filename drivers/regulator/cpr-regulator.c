@@ -431,7 +431,7 @@ static void cpr_ctl_enable(struct cpr_regulator *cpr_vreg, int corner)
 			cpr_vreg->save_ctl[corner]);
 	cpr_irq_set(cpr_vreg, cpr_vreg->save_irq[corner]);
 
-	if (cpr_is_allowed(cpr_vreg) &&
+	if (cpr_is_allowed(cpr_vreg) && cpr_vreg->vreg_enabled &&
 	    (cpr_vreg->ceiling_volt[fuse_corner] >
 		cpr_vreg->floor_volt[fuse_corner]))
 		val = RBCPR_CTL_LOOP_EN;
@@ -884,12 +884,11 @@ static int cpr_regulator_enable(struct regulator_dev *rdev)
 		return rc;
 	}
 
-	cpr_vreg->vreg_enabled = true;
-
 	mutex_lock(&cpr_vreg->cpr_mutex);
+	cpr_vreg->vreg_enabled = true;
 	if (cpr_is_allowed(cpr_vreg) && cpr_vreg->corner) {
 		cpr_irq_clr(cpr_vreg);
-		cpr_corner_switch(cpr_vreg, cpr_vreg->corner);
+		cpr_corner_restore(cpr_vreg, cpr_vreg->corner);
 		cpr_ctl_enable(cpr_vreg, cpr_vreg->corner);
 	}
 	mutex_unlock(&cpr_vreg->cpr_mutex);
@@ -912,9 +911,8 @@ static int cpr_regulator_disable(struct regulator_dev *rdev)
 			return rc;
 		}
 
-		cpr_vreg->vreg_enabled = false;
-
 		mutex_lock(&cpr_vreg->cpr_mutex);
+		cpr_vreg->vreg_enabled = false;
 		if (cpr_is_allowed(cpr_vreg))
 			cpr_ctl_disable(cpr_vreg);
 		mutex_unlock(&cpr_vreg->cpr_mutex);
@@ -1951,10 +1949,8 @@ static int cpr_init_cpr_efuse(struct platform_device *pdev,
 		int *quot = cpr_vreg->cpr_fuse_target_quot;
 		bool valid_fuse = true;
 
-		if ((quot[CPR_FUSE_CORNER_TURBO] >
-			quot[CPR_FUSE_CORNER_NORMAL]) &&
-		    (quot[CPR_FUSE_CORNER_NORMAL] >
-			quot[CPR_FUSE_CORNER_SVS])) {
+		if (quot[CPR_FUSE_CORNER_TURBO] >
+			quot[CPR_FUSE_CORNER_NORMAL]) {
 			if ((quot[CPR_FUSE_CORNER_TURBO] -
 			     quot[CPR_FUSE_CORNER_NORMAL])
 					<= CPR_FUSE_MIN_QUOT_DIFF)

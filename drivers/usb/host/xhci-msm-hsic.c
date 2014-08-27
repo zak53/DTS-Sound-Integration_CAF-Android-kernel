@@ -28,7 +28,6 @@
 #include <linux/msm-bus.h>
 #include <mach/rpm-regulator.h>
 #include <mach/msm_iomap.h>
-#include <linux/debugfs.h>
 
 #include "xhci.h"
 
@@ -112,9 +111,6 @@ struct mxhci_hsic_hcd {
 	struct workqueue_struct	*wq;
 
 	bool			wakeup_irq_enabled;
-	bool			xhci_remove_flag;
-	bool			phy_in_lpm_flag;
-	bool			xhci_shutdown_flag;
 	int			strobe;
 	int			data;
 	int			host_ready;
@@ -126,7 +122,7 @@ struct mxhci_hsic_hcd {
 	unsigned int		vdd_high_vol_level;
 	unsigned int		in_lpm;
 	unsigned int		pm_usage_cnt;
-	wait_queue_head_t	phy_in_lpm_wq;
+	struct completion	phy_in_lpm;
 
 	uint32_t		wakeup_int_cnt;
 	uint32_t		pwr_evt_irq_inlpm;
@@ -134,6 +130,7 @@ struct mxhci_hsic_hcd {
 };
 
 #define SYNOPSIS_DWC3_VENDOR	0x5533
+
 
 static struct dbg_data dbg_hsic = {
 	.ctrl_idx = 0,
@@ -146,11 +143,6 @@ static struct dbg_data dbg_hsic = {
 	.outep_log_mask = 1
 };
 
-static inline void dbg_inc(unsigned *idx)
-{
-	*idx = (*idx + 1) & (DBG_MAX_MSG-1);
-}
-
 /* xhci dbg logging */
 module_param_named(enable_payload_log,
 			dbg_hsic.log_payload, uint, S_IRUGO | S_IWUSR);
@@ -161,106 +153,6 @@ module_param_named(ep_addr_rxdbg_mask,
 			dbg_hsic.inep_log_mask, uint, S_IRUGO | S_IWUSR);
 module_param_named(ep_addr_txdbg_mask,
 			dbg_hsic.outep_log_mask, uint, S_IRUGO | S_IWUSR);
-
-static int mxhci_hsic_data_events_show(struct seq_file *s, void *unused)
-{
-	unsigned long	flags;
-	unsigned	i;
-
-	read_lock_irqsave(&dbg_hsic.data_lck, flags);
-
-	i = dbg_hsic.data_idx;
-	for (dbg_inc(&i); i != dbg_hsic.data_idx; dbg_inc(&i)) {
-		if (!strnlen(dbg_hsic.data_buf[i], DBG_MSG_LEN))
-			continue;
-		seq_printf(s, "%s\n", dbg_hsic.data_buf[i]);
-	}
-
-	read_unlock_irqrestore(&dbg_hsic.data_lck, flags);
-
-	return 0;
-}
-
-static int mxhci_hsic_data_events_open(struct inode *inode, struct file *f)
-{
-	return single_open(f, mxhci_hsic_data_events_show, inode->i_private);
-}
-
-const struct file_operations mxhci_hsic_dbg_data_fops = {
-	.open = mxhci_hsic_data_events_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static int mxhci_hsic_ctrl_events_show(struct seq_file *s, void *unused)
-{
-	unsigned long	flags;
-	unsigned	i;
-
-	read_lock_irqsave(&dbg_hsic.ctrl_lck, flags);
-
-	i = dbg_hsic.ctrl_idx;
-	for (dbg_inc(&i); i != dbg_hsic.ctrl_idx; dbg_inc(&i)) {
-		if (!strnlen(dbg_hsic.ctrl_buf[i], DBG_MSG_LEN))
-			continue;
-		seq_printf(s, "%s\n", dbg_hsic.ctrl_buf[i]);
-	}
-
-	read_unlock_irqrestore(&dbg_hsic.ctrl_lck, flags);
-
-	return 0;
-}
-
-static int mxhci_hsic_ctrl_events_open(struct inode *inode, struct file *f)
-{
-	return single_open(f, mxhci_hsic_ctrl_events_show, inode->i_private);
-}
-
-const struct file_operations mxhci_hsic_dbg_ctrl_fops = {
-	.open = mxhci_hsic_ctrl_events_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static struct dentry *xhci_msm_hsic_dbg_dent;
-static int mxhci_hsic_debugfs_init(void)
-{
-	struct dentry *xhci_msm_hsic_dentry;
-
-	xhci_msm_hsic_dbg_dent = debugfs_create_dir("xhci_msm_hsic_dbg", NULL);
-
-	if (!xhci_msm_hsic_dbg_dent || IS_ERR(xhci_msm_hsic_dbg_dent))
-		return -ENODEV;
-
-	xhci_msm_hsic_dentry = debugfs_create_file("show_ctrl_events",
-						S_IRUGO,
-						xhci_msm_hsic_dbg_dent, 0,
-						&mxhci_hsic_dbg_ctrl_fops);
-
-	if (!xhci_msm_hsic_dentry) {
-		debugfs_remove_recursive(xhci_msm_hsic_dbg_dent);
-		return -ENODEV;
-	}
-
-	xhci_msm_hsic_dentry = debugfs_create_file("show_data_events",
-						S_IRUGO,
-						xhci_msm_hsic_dbg_dent, 0,
-						&mxhci_hsic_dbg_data_fops);
-
-	if (!xhci_msm_hsic_dentry) {
-		debugfs_remove_recursive(xhci_msm_hsic_dbg_dent);
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static void mxhci_hsic_debugfs_cleanup(void)
-{
-	debugfs_remove_recursive(xhci_msm_hsic_dbg_dent);
-}
 
 static void xhci_hsic_log_urb(struct urb *urb, char *event, unsigned extra)
 {
@@ -709,10 +601,8 @@ static irqreturn_t mxhci_hsic_pwr_event_irq(int irq, void *data)
 		mb();
 
 		/* this can be spurious interrupt if in_lpm is true */
-		if (!in_lpm) {
-			mxhci->phy_in_lpm_flag = true;
-			wake_up(&mxhci->phy_in_lpm_wq);
-		}
+		if (!in_lpm)
+			complete(&mxhci->phy_in_lpm);
 
 	} else if (stat & LPM_OUT_L2_IRQ_STAT) {
 		xhci_dbg_log_event(&dbg_hsic, NULL, "LPM_OUT_L2_IRQ", stat);
@@ -753,19 +643,15 @@ static int mxhci_hsic_bus_suspend(struct usb_hcd *hcd)
 
 	xhci_dbg_log_event(&dbg_hsic, NULL, "mxhci_hsic_bus_suspend", 0);
 
-	mxhci->phy_in_lpm_flag = false;
+	init_completion(&mxhci->phy_in_lpm);
 
 	ret = xhci_bus_suspend(hcd);
 	if (ret)
 		return ret;
 
 	/* make sure HSIC phy is in LPM */
-	ret = wait_event_interruptible_timeout(mxhci->phy_in_lpm_wq,
-			(mxhci->phy_in_lpm_flag == true) ||
-			(mxhci->xhci_remove_flag == true) ||
-			(mxhci->xhci_shutdown_flag == true),
+	ret = wait_for_completion_timeout(&mxhci->phy_in_lpm,
 			msecs_to_jiffies(PHY_LPM_WAIT_TIMEOUT_MS));
-
 	if (!ret) {
 		dev_dbg(mxhci->dev, "IN_L2_IRQ timeout\n");
 		xhci_dbg_log_event(&dbg_hsic, NULL, "IN_L2_IRQ timeout",
@@ -954,19 +840,6 @@ static void mxhci_hsic_set_autosuspend_delay(struct usb_device *dev)
 		pm_runtime_set_autosuspend_delay(&dev->dev, 200);
 }
 
-void mxhci_hsic_shutdown(struct usb_hcd *hcd)
-{
-	struct mxhci_hsic_hcd *mxhci = hcd_to_hsic(hcd->primary_hcd);
-
-	if (!usb_hcd_is_primary_hcd(hcd))
-		return;
-
-	xhci_dbg_log_event(&dbg_hsic, NULL,  "mxhci_hsic_shutdown", 0);
-	mxhci->xhci_shutdown_flag = true;
-	wake_up(&mxhci->phy_in_lpm_wq);
-	if (!mxhci->in_lpm)
-		xhci_shutdown(hcd);
-}
 
 static struct hc_driver mxhci_hsic_hc_driver = {
 	.description =		"xhci-hcd",
@@ -984,7 +857,7 @@ static struct hc_driver mxhci_hsic_hc_driver = {
 	.reset =		mxhci_hsic_plat_setup,
 	.start =		xhci_run,
 	.stop =			xhci_stop,
-	.shutdown =		mxhci_hsic_shutdown,
+	.shutdown =		xhci_shutdown,
 
 	/*
 	 * managing i/o requests and associated device resources
@@ -1180,8 +1053,6 @@ static int mxhci_hsic_probe(struct platform_device *pdev)
 
 	mxhci = hcd_to_hsic(hcd);
 	mxhci->dev = &pdev->dev;
-	mxhci->xhci_remove_flag = false;
-	mxhci->xhci_shutdown_flag = false;
 
 	/* Get pinctrl if target uses pinctrl */
 	mxhci->hsic_pinctrl = devm_pinctrl_get(&pdev->dev);
@@ -1390,7 +1261,7 @@ static int mxhci_hsic_probe(struct platform_device *pdev)
 	/* Enable HSIC PHY */
 	mxhci_hsic_ulpi_write(mxhci, 0x01, MSM_HSIC_CFG_SET);
 
-	init_waitqueue_head(&mxhci->phy_in_lpm_wq);
+	init_completion(&mxhci->phy_in_lpm);
 
 	device_init_wakeup(&pdev->dev, 1);
 	pm_stay_awake(mxhci->dev);
@@ -1404,9 +1275,6 @@ static int mxhci_hsic_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "%s: Probe complete\n", __func__);
 
-	ret = mxhci_hsic_debugfs_init();
-	if (ret)
-		dev_dbg(&pdev->dev, "debugfs is not availabile\n");
 	return 0;
 
 delete_wq:
@@ -1446,6 +1314,8 @@ static int mxhci_hsic_remove(struct platform_device *pdev)
 
 	xhci_dbg_log_event(&dbg_hsic, NULL,  "mxhci_hsic_remove", 0);
 
+	complete(&mxhci->phy_in_lpm);
+
 	/* disable STROBE_PAD_CTL */
 	reg = readl_relaxed(TLMM_GPIO_HSIC_STROBE_PAD_CTL);
 	writel_relaxed(reg & 0xfdffffff, TLMM_GPIO_HSIC_STROBE_PAD_CTL);
@@ -1458,23 +1328,17 @@ static int mxhci_hsic_remove(struct platform_device *pdev)
 
 	device_remove_file(&pdev->dev, &dev_attr_config_imod);
 	device_remove_file(&pdev->dev, &dev_attr_host_ready);
-	mxhci_hsic_debugfs_cleanup();
 
-	mxhci->xhci_remove_flag = true;
-	wake_up(&mxhci->phy_in_lpm_wq);
-
-	pm_runtime_get_sync(mxhci->dev);
 	/* If the device was removed no need to call pm_runtime_disable */
 	if (pdev->dev.power.power_state.event != PM_EVENT_INVALID)
 		pm_runtime_disable(&pdev->dev);
 
 	pm_runtime_set_suspended(&pdev->dev);
+
 	usb_remove_hcd(xhci->shared_hcd);
 	usb_put_hcd(xhci->shared_hcd);
 
 	usb_remove_hcd(hcd);
-
-	pm_runtime_put_noidle(mxhci->dev);
 
 	if (mxhci->wakeup_irq_enabled)
 		disable_irq_wake(mxhci->wakeup_irq);
@@ -1612,7 +1476,6 @@ MODULE_DEVICE_TABLE(of, of_mxhci_hsic_matach);
 static struct platform_driver mxhci_hsic_driver = {
 	.probe	= mxhci_hsic_probe,
 	.remove	= mxhci_hsic_remove,
-	.shutdown = usb_hcd_platform_shutdown,
 	.driver	= {
 		.owner  = THIS_MODULE,
 		.name = "xhci_msm_hsic",

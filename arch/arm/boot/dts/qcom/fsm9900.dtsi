@@ -169,17 +169,6 @@
 		status = "disabled";
 	};
 
-	qcom,uim@f995d000 { /* BLSP2_UART1 */
-		compatible = "qcom,uim";
-		reg = <0xf995d000 0x1000>;
-		interrupts = <0 101 0>;
-		status = "disabled";
-		qcom,uim-data-gpio = <&msmgpio 24 0>;
-		qcom,uim-clk-gpio = <&msmgpio 25 0>;
-		qcom,uim-reset-gpio = <&msmgpio 26 0>;
-		qcom,uim-card-detect-gpio = <&msmgpio 27 0>;
-	};
-
 	qcom,smem@1c100000 {
 		compatible = "qcom,smem";
 		reg = <0x1c100000 0x200000>,
@@ -573,8 +562,8 @@
 
 	qcom,sps@fe204000 {
 		compatible = "qcom,msm_sps";
-		reg = <0xfe204000 0x1f000>,
-			<0xfe223000 0x10000>;
+		reg = <0xfe204000 0x15000>,
+			<0xfe223000 0xb000>;
 		reg-names = "bam_mem", "core_mem";
 		interrupts = <0 94 0>;
 	};
@@ -645,33 +634,42 @@
 		compatible = "qcom,msm-thermal";
 		qcom,sensor-id = <3>;
 		qcom,poll-ms = <250>;
-		qcom,limit-temp = <85>;
+		qcom,limit-temp = <90>;
 		qcom,temp-hysteresis = <10>;
 		qcom,freq-step = <2>;
 		qcom,freq-control-mask = <0xf>;
-		qcom,therm-reset-temp = <115>;
-		qcom,core-limit-temp = <110>;
+		qcom,core-limit-temp = <115>;
 		qcom,core-temp-hysteresis = <10>;
 		qcom,core-control-mask = <0xe>;
-		qcom,hotplug-temp = <110>;
+		qcom,hotplug-temp = <115>;
 		qcom,hotplug-temp-hysteresis = <20>;
-		qcom,freq-mitigation-temp = <110>;
-		qcom,freq-mitigation-temp-hysteresis = <20>;
-		qcom,freq-mitigation-value = <883200>;
-		qcom,freq-mitigation-control-mask = <0x01>;
 		qcom,cpu-sensors = "tsens_tz_sensor3", "tsens_tz_sensor4",
 				"tsens_tz_sensor5", "tsens_tz_sensor6";
 	};
 
-	qcom,cpubw {
-		compatible = "qcom,cpubw";
-		qcom,cpu-mem-ports = <1 512>, <2 512>;
+	cpubw: qcom,cpubw {
+		compatible = "qcom,devbw";
+		governor = "cpufreq";
+		qcom,src-dst-ports = <1 512>, <2 512>;
+		qcom,active-only;
 		qcom,bw-tbl =
 			<  572 /*  75 MHz */ >,
 			< 1144 /* 150 MHz */ >,
 			< 2342 /* 307 MHz */ >,
 			< 3509 /* 460 MHz */ >,
 			< 6103 /* 800 MHz */ >;
+	};
+
+	devfreq-cpufreq {
+		cpubw-cpufreq {
+			target-dev = <&cpubw>;
+			cpu-to-dev-map =
+				<  300000  572 >,
+				<  422400 1144 >,
+				<  883200 2342 >,
+				< 1190400 3509 >,
+				< 2265600 6103 >;
+		};
 	};
 
 	qcom,msm-cpufreq {
@@ -684,20 +682,20 @@
 			 <&clock_krait clk_krait2_clk>,
 			 <&clock_krait clk_krait3_clk>;
 		qcom,cpufreq-table =
-			<  300000  300000  572 >,
-			<  422400  422400 1144 >,
-			<  576000  576000 2342 >,
-			<  729600  729600 2342 >,
-			<  883200  883200 2342 >,
-			< 1036800 1036800 3509 >,
-			< 1190400 1190400 3509 >,
-			< 1344000 1344000 6103 >,
-			< 1497600 1497600 6103 >,
-			< 1651200 1651200 6103 >,
-			< 1804800 1651200 6103 >,
-			< 1958400 1651200 6103 >,
-			< 2112000 1651200 6103 >,
-			< 2265600 1651200 6103 >;
+			<  300000 >,
+			<  422400 >,
+			<  576000 >,
+			<  729600 >,
+			<  883200 >,
+			< 1036800 >,
+			< 1190400 >,
+			< 1344000 >,
+			< 1497600 >,
+			< 1651200 >,
+			< 1804800 >,
+			< 1958400 >,
+			< 2112000 >,
+			< 2265600 >;
 	};
 
 	clock_krait: qcom,clock-krait@f9016000 {
@@ -860,7 +858,7 @@
 			< 1958400000  950000  569 >;
 
 		/*   1.8GHz   */
-		qcom,speed4-pvs0-bin-v0 =
+		qcom,speed1-pvs0-bin-v0 =
 			<          0       0    0 >,
 			<  300000000  850000   75 >,
 			<  422400000  870000  105 >,
@@ -874,7 +872,7 @@
 			< 1651200000 1030000  467 >,
 			< 1804800000 1050000  518 >;
 
-		qcom,speed4-pvs1-bin-v0 =
+		qcom,speed1-pvs1-bin-v0 =
 			<          0       0    0 >,
 			<  300000000  850000   75 >,
 			<  422400000  850000  105 >,
@@ -888,7 +886,7 @@
 			< 1651200000 1005000  467 >,
 			< 1804800000 1025000  518 >;
 
-		qcom,speed4-pvs2-bin-v0 =
+		qcom,speed1-pvs2-bin-v0 =
 			<          0       0    0 >,
 			<  300000000  800000   75 >,
 			<  422400000  820000  105 >,
@@ -902,7 +900,7 @@
 			< 1651200000  980000  467 >,
 			< 1804800000 1000000  518 >;
 
-		qcom,speed4-pvs3-bin-v0 =
+		qcom,speed1-pvs3-bin-v0 =
 			<          0       0    0 >,
 			<  300000000  800000   75 >,
 			<  422400000  800000  105 >,
@@ -916,7 +914,7 @@
 			< 1651200000  955000  467 >,
 			< 1804800000  975000  518 >;
 
-		qcom,speed4-pvs4-bin-v0 =
+		qcom,speed1-pvs4-bin-v0 =
 			<          0       0    0 >,
 			<  300000000  775000   75 >,
 			<  422400000  775000  105 >,
@@ -1236,7 +1234,7 @@
 
 	android_usb@fe8050c8 {
 		compatible = "qcom,android-usb";
-		qcom,android-usb-swfi-latency = <1>;
+		qcom,pm-qos-latency = <2 1001 30001>;
 	};
 
 	pcie0: qcom,pcie@fc520000 {

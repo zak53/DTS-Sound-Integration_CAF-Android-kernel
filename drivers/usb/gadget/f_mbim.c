@@ -1499,10 +1499,7 @@ static void mbim_suspend(struct usb_function *f)
 
 	pr_info("mbim suspended\n");
 
-	pr_debug("%s(): remote_wakeup:%d\n:", __func__,
-			mbim->cdev->gadget->remote_wakeup);
-	if (mbim->cdev->gadget->remote_wakeup ||
-			(mbim->cdev->gadget->speed == USB_SPEED_SUPER)) {
+	if (mbim->cdev->gadget->remote_wakeup) {
 		bam_data_suspend(MBIM_ACTIVE_PORT);
 	} else {
 		/*
@@ -1524,8 +1521,7 @@ static void mbim_resume(struct usb_function *f)
 
 	pr_info("mbim resumed\n");
 
-	if (mbim->cdev->gadget->remote_wakeup ||
-			(mbim->cdev->gadget->speed == USB_SPEED_SUPER)) {
+	if (mbim->cdev->gadget->remote_wakeup) {
 		bam_data_resume(MBIM_ACTIVE_PORT);
 	} else {
 		/* Restore endpoint descriptors info. */
@@ -1709,6 +1705,7 @@ static void mbim_unbind(struct usb_configuration *c, struct usb_function *f)
 	struct f_mbim	*mbim = func_to_mbim(f);
 
 	pr_debug("unbinding mbim\n");
+	bam_data_destroy(mbim->port_num);
 
 	if (gadget_is_superspeed(c->cdev->gadget))
 		usb_free_descriptors(f->ss_descriptors);
@@ -1721,7 +1718,6 @@ static void mbim_unbind(struct usb_configuration *c, struct usb_function *f)
 	usb_ep_free_request(mbim->not_port.notify, mbim->not_port.notify_req);
 
 	mbim_ext_config_desc.function.subCompatibleID[0] = 0;
-	bam_work_destroy();
 }
 
 /**

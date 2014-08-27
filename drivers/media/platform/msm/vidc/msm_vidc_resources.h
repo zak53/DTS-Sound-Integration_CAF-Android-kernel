@@ -21,6 +21,7 @@
 struct load_freq_table {
 	u32 load;
 	u32 freq;
+	u32 supported_codecs;
 };
 
 struct reg_value_pair {
@@ -79,7 +80,7 @@ struct clock_info {
 	struct clk *clk;
 	struct load_freq_table *load_freq_tbl;
 	u32 count; /* == has_scaling iff count != 0 */
-	bool has_sw_power_collapse;
+	bool has_gating;
 };
 
 struct clock_set {
@@ -114,7 +115,7 @@ struct msm_vidc_platform_resources {
 	struct regulator_set regulator_set;
 	struct clock_set clock_set;
 	struct bus_set bus_set;
-	bool use_non_secure_pil;
+	bool sw_power_collapsible;
 };
 
 static inline int is_iommu_present(struct msm_vidc_platform_resources *res)

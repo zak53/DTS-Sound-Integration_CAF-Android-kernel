@@ -15,11 +15,7 @@
 #define __CAMERA2_H__
 
 #include <media/msm_cam_sensor.h>
-#include <linux/interrupt.h>
-#include <linux/of_platform.h>
-#include <linux/of_device.h>
-#include <linux/of.h>
-
+#include <mach/board.h>
 
 enum msm_camera_device_type_t {
 	MSM_CAMERA_I2C_DEVICE,
@@ -57,6 +53,7 @@ struct msm_pinctrl_info {
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *gpio_state_active;
 	struct pinctrl_state *gpio_state_suspend;
+	bool use_pinctrl;
 };
 
 struct msm_cam_clk_setting {
@@ -70,28 +67,6 @@ struct v4l2_subdev_info {
 	enum v4l2_colorspace colorspace;
 	uint16_t fmt;
 	uint16_t order;
-};
-
-struct msm_camera_gpio_num_info {
-	uint16_t gpio_num[10];
-	uint8_t valid[10];
-};
-
-struct msm_camera_gpio_conf {
-	void *cam_gpiomux_conf_tbl;
-	uint8_t cam_gpiomux_conf_tbl_size;
-	struct gpio *cam_gpio_common_tbl;
-	uint8_t cam_gpio_common_tbl_size;
-	struct gpio *cam_gpio_req_tbl;
-	uint8_t cam_gpio_req_tbl_size;
-	struct msm_gpio_set_tbl *cam_gpio_set_tbl;
-	uint8_t cam_gpio_set_tbl_size;
-	uint32_t gpio_no_mux;
-	uint32_t *camera_off_table;
-	uint8_t camera_off_table_size;
-	uint32_t *camera_on_table;
-	uint8_t camera_on_table_size;
-	struct msm_camera_gpio_num_info *gpio_num_info;
 };
 
 struct msm_camera_power_ctrl_t {
@@ -108,37 +83,6 @@ struct msm_camera_power_ctrl_t {
 	struct msm_pinctrl_info pinctrl_info;
 	uint8_t cam_pinctrl_status;
 	uint16_t clk_info_size;
-};
-
-enum msm_camera_actuator_name {
-	MSM_ACTUATOR_MAIN_CAM_0,
-	MSM_ACTUATOR_MAIN_CAM_1,
-	MSM_ACTUATOR_MAIN_CAM_2,
-	MSM_ACTUATOR_MAIN_CAM_3,
-	MSM_ACTUATOR_MAIN_CAM_4,
-	MSM_ACTUATOR_MAIN_CAM_5,
-	MSM_ACTUATOR_WEB_CAM_0,
-	MSM_ACTUATOR_WEB_CAM_1,
-	MSM_ACTUATOR_WEB_CAM_2,
-};
-
-struct msm_actuator_info {
-	struct i2c_board_info const *board_info;
-	enum msm_camera_actuator_name cam_name;
-	int bus_id;
-	int vcm_pwd;
-	int vcm_enable;
-};
-enum msm_camera_i2c_mux_mode {
-	MODE_R,
-	MODE_L,
-	MODE_DUAL
-};
-
-struct msm_camera_i2c_conf {
-	uint8_t use_i2c_mux;
-	struct platform_device *mux_dev;
-	enum msm_camera_i2c_mux_mode i2c_mux_mode;
 };
 
 struct msm_camera_sensor_board_info {

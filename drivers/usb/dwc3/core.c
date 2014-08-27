@@ -592,10 +592,10 @@ static int dwc3_probe(struct platform_device *pdev)
 	}
 
 	dwc->core_reset_after_phy_init =
-		of_property_read_bool(node, "snps,core-reset-after-phy-init");
+		of_property_read_bool(node, "core_reset_after_phy_init");
 
 	dwc->needs_fifo_resize = of_property_read_bool(node, "tx-fifo-resize");
-	host_only_mode = of_property_read_bool(node, "snps,host-only-mode");
+	host_only_mode = of_property_read_bool(node, "host-only-mode");
 	dwc->hsphy_auto_suspend_disable = of_property_read_bool(node,
 						"snps,hsphy-auto-suspend-disable");
 	dwc->maximum_speed = of_usb_get_maximum_speed(node);
@@ -672,7 +672,7 @@ static int dwc3_probe(struct platform_device *pdev)
 	}
 
 	dwc->nominal_elastic_buffer = of_property_read_bool(node,
-			"snps,nominal-elastic-buffer");
+			"nominal-elastic-buffer");
 
 	ret = dwc3_core_init(dwc);
 	if (ret) {

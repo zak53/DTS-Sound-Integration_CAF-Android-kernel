@@ -18,7 +18,6 @@
 
 #include "msm8226.dtsi"
 #include "msm8226-memory.dtsi"
-#include "msm8226-qseecom.dtsi"
 #include "msm8226-v2-pm.dtsi"
 
 / {
@@ -47,10 +46,6 @@
 
 &qsecom_mem {
 	linux,memory-limit = <0x0>;
-};
-
-&clock_gcc {
-	compatible = "qcom,gcc-8226-v2";
 };
 
 &soc {

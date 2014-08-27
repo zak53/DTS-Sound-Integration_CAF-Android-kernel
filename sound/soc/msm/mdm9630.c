@@ -43,8 +43,8 @@
 #define MDM_MI2S_RATE 48000
 
 #define LPAIF_OFFSET 0xFE000000
-#define LPAIF_PRI_MODE_MUXSEL (LPAIF_OFFSET + 0x34000)
-#define LPAIF_SEC_MODE_MUXSEL (LPAIF_OFFSET + 0x35000)
+#define LPAIF_PRI_MODE_MUXSEL (LPAIF_OFFSET + 0x2B000)
+#define LPAIF_SEC_MODE_MUXSEL (LPAIF_OFFSET + 0x2C000)
 
 #define I2S_SEL 0
 #define I2S_PCM_SEL 1
@@ -505,6 +505,7 @@ static int mdm9630_mclk_event(struct snd_soc_dapm_widget *w,
 
 static int mdm9630_auxpcm_startup(struct snd_pcm_substream *substream)
 {
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	int ret = 0;
 
 	if (atomic_inc_return(&aux_ref_count) == 1) {
@@ -519,15 +520,26 @@ static int mdm9630_auxpcm_startup(struct snd_pcm_substream *substream)
 			pr_err("%s, GPIO setup failed\n", __func__);
 			return ret;
 		}
+		ret = mdm9630_mi2s_clk_ctl(rtd, true);
+		if (ret < 0) {
+			pr_err("set format for codec dai failed\n");
+			return ret;
+		}
 	}
 	return ret;
 }
 
 static void mdm9630_auxpcm_snd_shutdown(struct snd_pcm_substream *substream)
 {
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	int ret;
+
 	if (atomic_dec_return(&aux_ref_count) == 0) {
 		mdm9630_mi2s_free_gpios(substream,
 					   MDM_MI2S_AUXPCM_PRIM_INTF);
+		ret = mdm9630_mi2s_clk_ctl(rtd, false);
+		if (ret < 0)
+			pr_err("%s:clock disable failed\n", __func__);
 	}
 }
 
@@ -888,55 +900,6 @@ static struct snd_soc_dai_link mdm9630_dai[] = {
 		.ignore_suspend = 1,
 		.be_id = MSM_FRONTEND_DAI_DTMF_RX,
 		.no_host_mode = SND_SOC_DAI_LINK_NO_HOST,
-	},
-	{
-		.name = "DTMF TX",
-		.stream_name = "DTMF TX",
-		.cpu_dai_name = "msm-dai-stub-dev.4",
-		.platform_name = "msm-pcm-dtmf",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-tx",
-		.ignore_suspend = 1,
-	},
-	{
-		.name = "CS-VOICE HOST RX CAPTURE",
-		.stream_name = "CS-VOICE HOST RX CAPTURE",
-		.cpu_dai_name = "msm-dai-stub-dev.5",
-		.platform_name  = "msm-voice-host-pcm",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-tx",
-		.ignore_suspend = 1,
-		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
-			    SND_SOC_DPCM_TRIGGER_POST},
-	},
-	{
-		.name = "CS-VOICE HOST RX PLAYBACK",
-		.stream_name = "CS-VOICE HOST RX PLAYBACK",
-		.cpu_dai_name = "msm-dai-stub-dev.6",
-		.platform_name  = "msm-voice-host-pcm",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-rx",
-		.ignore_suspend = 1,
-	},
-	{
-		.name = "CS-VOICE HOST TX CAPTURE",
-		.stream_name = "CS-VOICE HOST TX CAPTURE",
-		.cpu_dai_name = "msm-dai-stub-dev.7",
-		.platform_name  = "msm-voice-host-pcm",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-tx",
-		.ignore_suspend = 1,
-		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
-			    SND_SOC_DPCM_TRIGGER_POST},
-	},
-	{
-		.name = "CS-VOICE HOST TX PLAYBACK",
-		.stream_name = "CS-VOICE HOST TX PLAYBACK",
-		.cpu_dai_name = "msm-dai-stub-dev.8",
-		.platform_name  = "msm-voice-host-pcm",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-rx",
-		.ignore_suspend = 1,
 	},
 	{
 		.name = "MDM9630 Media2",

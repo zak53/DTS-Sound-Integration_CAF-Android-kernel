@@ -13,7 +13,6 @@ config ARM64
 	select CLONE_BACKWARDS
 	select COMMON_CLK if !ARCH_MSM
 	select CPU_PM if (SUSPEND || CPU_IDLE)
-	select DCACHE_WORD_ACCESS
 	select GENERIC_CLOCKEVENTS
 	select GENERIC_CLOCKEVENTS_BROADCAST if SMP
 	select GENERIC_IOMAP
@@ -21,22 +20,17 @@ config ARM64
 	select GENERIC_IRQ_SHOW
 	select GENERIC_SCHED_CLOCK
 	select GENERIC_SMP_IDLE_THREAD
-	select GENERIC_STRNCPY_FROM_USER
-	select GENERIC_STRNLEN_USER
 	select GENERIC_TIME_VSYSCALL
 	select HARDIRQS_SW_RESEND
-	select HAVE_ARCH_JUMP_LABEL
 	select HAVE_ARCH_TRACEHOOK
 	select HAVE_DEBUG_BUGVERBOSE
 	select HAVE_DEBUG_KMEMLEAK
 	select HAVE_DMA_API_DEBUG
 	select HAVE_DMA_ATTRS
 	select HAVE_DMA_CONTIGUOUS
-	select HAVE_EFFICIENT_UNALIGNED_ACCESS
 	select HAVE_GENERIC_DMA_COHERENT
 	select HAVE_HW_BREAKPOINT if PERF_EVENTS
 	select HAVE_MEMBLOCK
-	select HAVE_PATA_PLATFORM
 	select HAVE_PERF_EVENTS
 	select IRQ_DOMAIN
 	select MODULES_USE_ELF_RELA
@@ -141,7 +135,10 @@ config ARCH_MSM
 	select ARCH_HAS_CPUFREQ
 	select CPU_FREQ_MSM
 	select PM_DEVFREQ
-	select MSM_DEVFREQ_CPUBW
+	select MSM_DEVFREQ_DEVBW
+	select MSM_BIMC_BWMON
+	select DEVFREQ_GOV_MSM_BW_HWMON
+	select DEVFREQ_SIMPLE_DEV
 	help
 	  This enables support for the ARMv8 based Qualcomm chipsets.
 
@@ -152,11 +149,11 @@ config ARCH_MSM8916
 	  This enables support for the MSM8916 chipset. If you dont
 	  know what do here, say N
 
-config ARCH_MSM8994
-	bool "Enable Support for Qualcomm MSM8994"
+config ARCH_MSMPLUTONIUM
+	bool "Enable Support for Qualcomm MSMPLUTONIUM"
 	depends on ARCH_MSM
 	help
-	  This enables support for the MSM8994 chipset. If you dont
+	  This enables support for the MSMPLUTONIUM chipset. If you dont
 	  know what do here, say N
 
 config ARCH_XGENE

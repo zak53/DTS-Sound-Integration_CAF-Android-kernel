@@ -54,15 +54,44 @@
  */
 #define NUM_WCD9XXX_REG_RET	9
 
-#define SLIM_USR_MC_REPEAT_CHANGE_VALUE 0x0
-#define SLIM_REPEAT_WRITE_MAX_SLICE 16
-
 struct wcd9xxx_i2c {
 	struct i2c_client *client;
 	struct i2c_msg xfer_msg[2];
 	struct mutex xfer_lock;
 	int mod_id;
 };
+
+struct pinctrl_info {
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *extncodec_sus;
+	struct pinctrl_state *extncodec_act;
+};
+
+static struct pinctrl_info pinctrl_info1;
+static int extcodec_get_pinctrl(struct device *dev)
+{
+	struct pinctrl *pinctrl;
+	pinctrl = pinctrl_get(dev);
+	if (IS_ERR(pinctrl)) {
+		pr_err("%s: Unable to get pinctrl handle\n", __func__);
+		return -EINVAL;
+	}
+	pinctrl_info1.pinctrl = pinctrl;
+	/* get all the states handles from Device Tree*/
+	pinctrl_info1.extncodec_sus = pinctrl_lookup_state(pinctrl, "suspend");
+	if (IS_ERR(pinctrl_info1.extncodec_sus)) {
+		pr_err("%s: Unable to get pinctrl disable state handle\n",
+				__func__);
+		return -EINVAL;
+	}
+	pinctrl_info1.extncodec_act = pinctrl_lookup_state(pinctrl, "active");
+	if (IS_ERR(pinctrl_info1.extncodec_act)) {
+		pr_err("%s: Unable to get pinctrl disable state handle\n",
+				__func__);
+		return -EINVAL;
+	}
+	return 0;
+}
 
 static int wcd9xxx_dt_parse_vreg_info(struct device *dev,
 				      struct wcd9xxx_regulator *vreg,
@@ -266,79 +295,6 @@ static int wcd9xxx_slim_read_device(struct wcd9xxx *wcd9xxx, unsigned short reg,
 
 	return ret;
 }
-
-static int wcd9xxx_slim_get_allowed_slice(struct wcd9xxx *wcd9xxx,
-					  int bytes)
-{
-	int allowed_sz = bytes;
-
-	if (likely(bytes == SLIM_REPEAT_WRITE_MAX_SLICE))
-		allowed_sz = 16;
-	else if (bytes >= 12)
-		allowed_sz = 12;
-	else if (bytes >= 8)
-		allowed_sz = 8;
-	else if (bytes >= 6)
-		allowed_sz = 6;
-	else if (bytes >= 4)
-		allowed_sz = 4;
-	else
-		allowed_sz = bytes;
-
-	return allowed_sz;
-}
-
-/*
- * wcd9xxx_slim_write_repeat: Write the same register with multiple values
- * @wcd9xxx: handle to wcd core
- * @reg: register to be written
- * @bytes: number of bytes to be written to reg
- * @src: buffer with data content to be written to reg
- * This API will write reg with bytes from src in a single slimbus
- * transaction. All values from 1 to 16 are supported by this API.
- */
-
-int wcd9xxx_slim_write_repeat(struct wcd9xxx *wcd9xxx, unsigned short reg,
-			      int bytes, void *src)
-{
-	int ret = 0, bytes_to_write = bytes, bytes_allowed;
-	struct slim_ele_access slim_msg;
-
-	slim_msg.start_offset = WCD9XXX_REGISTER_START_OFFSET + reg;
-	slim_msg.comp = NULL;
-
-	if (unlikely(bytes > SLIM_REPEAT_WRITE_MAX_SLICE)) {
-		dev_err(wcd9xxx->dev, "%s: size %d not supported\n",
-			__func__, bytes);
-		return -EINVAL;
-	}
-
-	while (bytes_to_write > 0) {
-		bytes_allowed = wcd9xxx_slim_get_allowed_slice(wcd9xxx,
-				       bytes_to_write);
-
-		slim_msg.num_bytes = bytes_allowed;
-		mutex_lock(&wcd9xxx->xfer_lock);
-		ret = slim_user_msg(wcd9xxx->slim, wcd9xxx->slim->laddr,
-				    SLIM_MSG_MT_DEST_REFERRED_USER,
-				    SLIM_USR_MC_REPEAT_CHANGE_VALUE,
-				    &slim_msg, src, bytes_allowed);
-		mutex_unlock(&wcd9xxx->xfer_lock);
-
-		if (ret) {
-			dev_err(wcd9xxx->dev, "%s: failed, ret = %d\n",
-				__func__, ret);
-			break;
-		}
-
-		bytes_to_write = bytes_to_write - bytes_allowed;
-		src = ((u8 *)src) + bytes_allowed;
-	};
-
-	return ret;
-}
-EXPORT_SYMBOL(wcd9xxx_slim_write_repeat);
-
 /* Interface specifies whether the write is to the interface or general
  * registers.
  */
@@ -507,7 +463,8 @@ static int wcd9xxx_reset(struct wcd9xxx *wcd9xxx)
 {
 	int ret;
 
-	if (wcd9xxx->reset_gpio && wcd9xxx->slim_device_bootup) {
+	if (wcd9xxx->reset_gpio && wcd9xxx->slim_device_bootup
+			&& !wcd9xxx->use_pinctrl) {
 		ret = gpio_request(wcd9xxx->reset_gpio, "CDC_RESET");
 		if (ret) {
 			pr_err("%s: Failed to request gpio %d\n", __func__,
@@ -517,10 +474,32 @@ static int wcd9xxx_reset(struct wcd9xxx *wcd9xxx)
 		}
 	}
 	if (wcd9xxx->reset_gpio) {
-		gpio_direction_output(wcd9xxx->reset_gpio, 0);
-		msleep(20);
-		gpio_direction_output(wcd9xxx->reset_gpio, 1);
-		msleep(20);
+		if (wcd9xxx->use_pinctrl) {
+			/* Reset the CDC PDM TLMM pins to a default state */
+			ret = pinctrl_select_state(pinctrl_info1.pinctrl,
+				pinctrl_info1.extncodec_act);
+			if (ret != 0) {
+				pr_err("%s: Failed to enable gpio pins\n",
+						__func__);
+				return -EIO;
+			}
+			gpio_set_value_cansleep(wcd9xxx->reset_gpio, 0);
+			msleep(20);
+			gpio_set_value_cansleep(wcd9xxx->reset_gpio, 1);
+			msleep(20);
+			ret = pinctrl_select_state(pinctrl_info1.pinctrl,
+					pinctrl_info1.extncodec_sus);
+			if (ret != 0) {
+				pr_err("%s: Failed to suspend reset pins\n",
+						__func__);
+				return -EIO;
+			}
+		} else {
+			gpio_direction_output(wcd9xxx->reset_gpio, 0);
+			msleep(20);
+			gpio_direction_output(wcd9xxx->reset_gpio, 1);
+			msleep(20);
+		}
 	}
 	return 0;
 }
@@ -528,8 +507,11 @@ static int wcd9xxx_reset(struct wcd9xxx *wcd9xxx)
 static void wcd9xxx_free_reset(struct wcd9xxx *wcd9xxx)
 {
 	if (wcd9xxx->reset_gpio) {
-		gpio_free(wcd9xxx->reset_gpio);
-		wcd9xxx->reset_gpio = 0;
+		if (!wcd9xxx->use_pinctrl) {
+			gpio_free(wcd9xxx->reset_gpio);
+			wcd9xxx->reset_gpio = 0;
+		} else
+			pinctrl_put(pinctrl_info1.pinctrl);
 	}
 }
 
@@ -1230,6 +1212,14 @@ static int wcd9xxx_i2c_probe(struct i2c_client *client,
 			ret = -EINVAL;
 			goto fail;
 		}
+		pdata = wcd9xxx_populate_dt_pdata(&client->dev);
+		ret = extcodec_get_pinctrl(&client->dev);
+		if (ret < 0)
+			wcd9xxx->use_pinctrl = false;
+		else
+			wcd9xxx->use_pinctrl = true;
+		dev_dbg(&client->dev, " wcd9xxx->use_pinctrl = %d\n",wcd9xxx->use_pinctrl);
+
 		if (i2c_check_functionality(client->adapter,
 					    I2C_FUNC_I2C) == 0) {
 			dev_dbg(&client->dev, "can't talk I2C?\n");

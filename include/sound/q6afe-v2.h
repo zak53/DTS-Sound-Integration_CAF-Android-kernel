@@ -89,7 +89,7 @@ enum {
 	IDX_SPDIF_RX = 47,
 	IDX_GLOBAL_CFG,
 	IDX_AUDIO_PORT_ID_I2S_RX,
-	IDX_AFE_PORT_ID_SECONDARY_MI2S_RX_VIBRA,
+	IDX_AFE_PORT_ID_SECONDARY_MI2S_RX_SD1,
 	AFE_MAX_PORTS
 };
 
@@ -154,6 +154,7 @@ int afe_get_port_index(u16 port_id);
 int afe_start_pseudo_port(u16 port_id);
 int afe_stop_pseudo_port(u16 port_id);
 uint32_t afe_req_mmap_handle(struct afe_audio_client *ac);
+int afe_unmap_cal_blocks(void);
 int afe_memory_map(phys_addr_t dma_addr_p, u32 dma_buf_sz,
 		struct afe_audio_client *ac);
 int afe_cmd_memory_map(phys_addr_t dma_addr_p, u32 dma_buf_sz);

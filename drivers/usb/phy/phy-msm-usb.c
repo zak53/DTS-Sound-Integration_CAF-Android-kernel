@@ -786,6 +786,9 @@ static int msm_otg_set_suspend(struct usb_phy *phy, int suspend)
 	if (aca_enabled())
 		return 0;
 
+	pr_debug("%s(%d) in %s state\n", __func__, suspend,
+				usb_otg_state_string(phy->state));
+
 	/*
 	 * UDC and HCD call usb_phy_set_suspend() to enter/exit LPM
 	 * during bus suspend/resume.  Update the relevant state
@@ -801,8 +804,14 @@ static int msm_otg_set_suspend(struct usb_phy *phy, int suspend)
 		case OTG_STATE_A_HOST:
 			pr_debug("host bus suspend\n");
 			clear_bit(A_BUS_REQ, &motg->inputs);
-			if (!atomic_read(&motg->in_lpm))
+			if (!atomic_read(&motg->in_lpm) &&
+					!test_bit(ID, &motg->inputs)) {
 				queue_work(system_nrt_wq, &motg->sm_work);
+				/* Flush sm_work to avoid it race with
+				 * subsequent calls of set_suspend.
+				 */
+				flush_work(&motg->sm_work);
+			}
 			break;
 		case OTG_STATE_B_PERIPHERAL:
 			pr_debug("peripheral bus suspend\n");
@@ -894,9 +903,15 @@ phcd_retry:
 	if (atomic_read(&motg->in_lpm))
 		return 0;
 
-	if (motg->pdata->delay_lpm_hndshk_on_disconnect &&
-			!msm_bam_usb_lpm_ok(CI_CTRL))
+	/*
+	 * Don't allow low power mode if bam pipes are still connected.
+	 * Otherwise it could lead to unclocked access when sps driver
+	 * accesses USB bam registers as part of disconnecting bam pipes.
+	 */
+	if (!msm_bam_usb_lpm_ok(CI_CTRL)) {
+		pm_schedule_suspend(phy->dev, 1000);
 		return -EBUSY;
+	}
 
 	motg->ui_enabled = 0;
 	disable_irq(motg->irq);
@@ -1171,8 +1186,7 @@ static int msm_otg_resume(struct msm_otg *motg)
 	if (!atomic_read(&motg->in_lpm))
 		return 0;
 
-	if (motg->pdata->delay_lpm_hndshk_on_disconnect)
-		msm_bam_notify_lpm_resume(CI_CTRL);
+	msm_bam_notify_lpm_resume(CI_CTRL);
 
 	if (motg->ui_enabled) {
 		motg->ui_enabled = 0;
@@ -3469,10 +3483,12 @@ static void msm_otg_set_vbus_state(int online)
 
 	if (online) {
 		pr_debug("PMIC: BSV set\n");
-		set_bit(B_SESS_VLD, &motg->inputs);
+		if (test_and_set_bit(B_SESS_VLD, &motg->inputs) && init)
+			return;
 	} else {
 		pr_debug("PMIC: BSV clear\n");
-		clear_bit(B_SESS_VLD, &motg->inputs);
+		if (!test_and_clear_bit(B_SESS_VLD, &motg->inputs) && init)
+			return;
 	}
 
 	/* do not queue state m/c work if id is grounded */
@@ -3488,11 +3504,17 @@ static void msm_otg_set_vbus_state(int online)
 
 	if (!init) {
 		init = true;
+		if (pmic_vbus_init.done &&
+				test_bit(B_SESS_VLD, &motg->inputs)) {
+			pr_debug("PMIC: BSV came late\n");
+			goto out;
+		}
 		complete(&pmic_vbus_init);
 		pr_debug("PMIC: BSV init complete\n");
 		return;
 	}
 
+out:
 	if (test_bit(MHL, &motg->inputs) ||
 			mhl_det_in_progress) {
 		pr_debug("PMIC: BSV interrupt ignored in MHL\n");
@@ -4250,18 +4272,6 @@ msm_otg_ext_chg_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		else
 			pr_debug("%s:voltage request failed\n", __func__);
 		break;
-	case MSM_USB_EXT_CHG_TYPE:
-		if (get_user(val, (int __user *)arg)) {
-			pr_err("%s: get_user failed\n\n", __func__);
-			ret = -EFAULT;
-			break;
-		}
-
-		if (val)
-			pr_debug("%s:charger is external charger\n", __func__);
-		else
-			pr_debug("%s:charger is not ext charger\n", __func__);
-		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -4435,8 +4445,6 @@ struct msm_otg_platform_data *msm_otg_dt_to_pdata(struct platform_device *pdev)
 				"qcom,hsusb-otg-clk-always-on-workaround");
 	pdata->delay_lpm_on_disconnect = of_property_read_bool(node,
 				"qcom,hsusb-otg-delay-lpm");
-	pdata->delay_lpm_hndshk_on_disconnect = of_property_read_bool(node,
-				"qcom,hsusb-otg-delay-lpm-hndshk-on-disconnect");
 	pdata->dp_manual_pullup = of_property_read_bool(node,
 				"qcom,dp-manual-pullup");
 	pdata->enable_sec_phy = of_property_read_bool(node,
@@ -5221,8 +5229,6 @@ static int msm_otg_pm_resume(struct device *dev)
 	dev_dbg(dev, "OTG PM resume\n");
 
 	motg->pm_done = 0;
-	if (!motg->host_bus_suspend)
-		atomic_set(&motg->pm_suspended, 0);
 
 	if (motg->async_int || motg->sm_work_pending ||
 			!pm_runtime_suspended(dev)) {
@@ -5234,14 +5240,7 @@ static int msm_otg_pm_resume(struct device *dev)
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 
-		/*
-		 * Defer any host mode disconnect events until
-		 * all devices are RESUMED
-		 */
-		if (motg->sm_work_pending && !motg->host_bus_suspend) {
-			motg->sm_work_pending = false;
-			queue_work(system_nrt_wq, &motg->sm_work);
-		}
+		/* sm work will start in pm notify */
 	}
 
 	return ret;

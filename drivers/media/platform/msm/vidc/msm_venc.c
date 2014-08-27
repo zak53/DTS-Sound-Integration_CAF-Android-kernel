@@ -596,9 +596,9 @@ static struct msm_vidc_ctrl msm_venc_ctrls[] = {
 		.id = V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE,
 		.name = "H.264 Loop Filter Mode",
 		.type = V4L2_CTRL_TYPE_MENU,
-		.minimum = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED,
+		.minimum = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED,
 		.maximum = L_MODE,
-		.default_value = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_DISABLED,
+		.default_value = V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED,
 		.step = 1,
 		.menu_skip_mask = ~(
 		(1 << V4L2_MPEG_VIDEO_H264_LOOP_FILTER_MODE_ENABLED) |
@@ -1145,7 +1145,7 @@ static int msm_venc_queue_setup(struct vb2_queue *q,
 	return rc;
 }
 
-static int msm_venc_enable_hier_p(struct msm_vidc_inst *inst)
+static int msm_venc_toggle_hier_p(struct msm_vidc_inst *inst, bool enable)
 {
 	int num_enh_layers = 0;
 	u32 property_id = 0;
@@ -1160,9 +1160,10 @@ static int msm_venc_enable_hier_p(struct msm_vidc_inst *inst)
 	if (inst->fmts[CAPTURE_PORT]->fourcc != V4L2_PIX_FMT_VP8)
 		return 0;
 
-	num_enh_layers = inst->capability.hier_p.max - 1;
-	if (!num_enh_layers)
-		return 0;
+	num_enh_layers = enable ? inst->capability.hier_p.max - 1 : 0;
+
+	dprintk(VIDC_DBG, "%s Hier-P in firmware\n",
+			num_enh_layers ? "Enable" : "Disable");
 
 	hdev = inst->core->device;
 	property_id = HAL_PARAM_VENC_HIER_P_MAX_ENH_LAYERS;
@@ -1187,10 +1188,6 @@ static inline int start_streaming(struct msm_vidc_inst *inst)
 		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
 		return -EINVAL;
 	}
-
-	rc = msm_venc_enable_hier_p(inst);
-	if (rc)
-		return rc;
 
 	if (inst->capability.pixelprocess_capabilities &
 		HAL_VIDEO_ENCODER_SCALING_CAPABILITY)
@@ -1597,15 +1594,6 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_MPEG_VIDC_VIDEO_IDR_PERIOD:
-		if (inst->fmts[CAPTURE_PORT]->fourcc != V4L2_PIX_FMT_H264 &&
-			inst->fmts[CAPTURE_PORT]->fourcc !=
-				V4L2_PIX_FMT_H264_NO_SC) {
-			dprintk(VIDC_ERR, "Control 0x%x only valid for H264\n",
-					ctrl->id);
-			rc = -ENOTSUPP;
-			break;
-		}
-
 		property_id =
 			HAL_CONFIG_VENC_IDR_PERIOD;
 		idr_period.idr_period = ctrl->val;
@@ -2369,6 +2357,9 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDC_VIDEO_HIER_P_NUM_LAYERS:
 		property_id = HAL_CONFIG_VENC_HIER_P_NUM_FRAMES;
 		hier_p_layers = ctrl->val;
+		rc = msm_venc_toggle_hier_p(inst, hier_p_layers ? true : false);
+		if (rc)
+			break;
 		if (hier_p_layers > (inst->capability.hier_p.max - 1)) {
 			dprintk(VIDC_ERR,
 				"Error setting hier p num layers = %d max supported by f/w = %d\n",
@@ -2428,6 +2419,12 @@ static int try_set_ext_ctrl(struct msm_vidc_inst *inst,
 	for (i = 0; i < ctrl->count; i++) {
 		switch (control[i].id) {
 		case V4L2_CID_MPEG_VIDC_VIDEO_LTRMODE:
+			if (control[i].value !=
+				V4L2_MPEG_VIDC_VIDEO_LTR_MODE_DISABLE) {
+				rc = msm_venc_toggle_hier_p(inst, false);
+				if (rc)
+					break;
+			}
 			ltrmode.ltrmode = control[i].value;
 			ltrmode.trustmode = 1;
 			property_id = HAL_PARAM_VENC_LTRMODE;
@@ -2847,7 +2844,7 @@ int msm_venc_s_fmt(struct msm_vidc_inst *inst, struct v4l2_format *f)
 		fmt = msm_comm_get_pixel_fmt_fourcc(venc_formats,
 			ARRAY_SIZE(venc_formats), f->fmt.pix_mp.pixelformat,
 			OUTPUT_PORT);
-		if (!fmt || fmt->type != OUTPUT_PORT) {
+		if (fmt && fmt->type != OUTPUT_PORT) {
 			dprintk(VIDC_ERR,
 				"Format: %d not supported on OUTPUT port\n",
 				f->fmt.pix_mp.pixelformat);

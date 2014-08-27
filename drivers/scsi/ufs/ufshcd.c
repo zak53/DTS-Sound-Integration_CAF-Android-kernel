@@ -50,13 +50,6 @@
 #include <trace/events/ufs.h>
 
 #ifdef CONFIG_DEBUG_FS
-
-#define UFSHCD_UPDATE_ERROR_STATS(hba, type)	\
-	do {					\
-		if (type < UFS_ERR_MAX)	\
-			hba->ufs_stats.err_stats[type]++;	\
-	} while (0)
-
 #define UFSHCD_UPDATE_TAG_STATS(hba, tag)			\
 	do {							\
 		struct request *rq = hba->lrb[task_tag].cmd ?	\
@@ -100,7 +93,6 @@
 #define UFSHCD_UPDATE_TAG_STATS_COMPLETION(hba, cmd)
 #define UFSDBG_ADD_DEBUGFS(hba)
 #define UFSDBG_REMOVE_DEBUGFS(hba)
-#define UFSHCD_UPDATE_ERROR_STATS(hba, type)
 
 #endif
 
@@ -109,9 +101,6 @@
 				 UFSHCD_ERROR_MASK)
 /* UIC command timeout, unit: ms */
 #define UIC_CMD_TIMEOUT	500
-
-/* Retries waiting for doorbells to clear */
-#define POWER_MODE_RETRIES	10
 
 /* NOP OUT retries waiting for NOP IN response */
 #define NOP_OUT_RETRIES    10
@@ -247,22 +236,6 @@ ufs_get_pm_lvl_to_link_pwr_state(enum ufs_pm_level lvl)
 	return ufs_pm_lvl_states[lvl].link_state;
 }
 
-static inline enum ufs_pm_level
-ufs_get_desired_pm_lvl_for_dev_link_state(enum ufs_dev_pwr_mode dev_state,
-					  enum uic_link_state link_state)
-{
-	enum ufs_pm_level lvl;
-
-	for (lvl = UFS_PM_LVL_0; lvl < UFS_PM_LVL_MAX; lvl++) {
-		if ((ufs_pm_lvl_states[lvl].dev_state == dev_state) &&
-		    (ufs_pm_lvl_states[lvl].link_state == link_state))
-			return lvl;
-	}
-
-	/* if no match found, return the level 0 */
-	return UFS_PM_LVL_0;
-}
-
 static void ufshcd_tmc_handler(struct ufs_hba *hba);
 static void ufshcd_async_scan(void *data, async_cookie_t cookie);
 static int ufshcd_reset_and_restore(struct ufs_hba *hba);
@@ -281,8 +254,6 @@ static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on);
 static int ufshcd_uic_hibern8_exit(struct ufs_hba *hba);
 static int ufshcd_uic_hibern8_enter(struct ufs_hba *hba);
 static int ufshcd_host_reset_and_restore(struct ufs_hba *hba);
-static void ufshcd_resume_clkscaling(struct ufs_hba *hba);
-static void ufshcd_suspend_clkscaling(struct ufs_hba *hba);
 
 static inline void ufshcd_enable_irq(struct ufs_hba *hba)
 {
@@ -653,6 +624,12 @@ ufshcd_config_intr_aggr(struct ufs_hba *hba, u8 cnt, u8 tmout)
 #define ufshcd_is_intr_aggr_broken(hba) ((hba)->quirks & \
 					 UFSHCD_QUIRK_BROKEN_INTR_AGGR)
 
+#define ufshcd_can_queue(hba)	\
+	({			\
+		((hba)->quirks & \
+		 UFSHCD_QUIRK_BROKEN_DEVICE_Q_CMND) ? 1 : (hba)->nutrs; \
+	})
+
 /**
  * ufshcd_disable_intr_aggr - Disables interrupt aggregation.
  * @hba: per adapter instance
@@ -763,8 +740,8 @@ static void ufshcd_ungate_work(struct work_struct *work)
 		hba->clk_gating.is_suspended = false;
 	}
 unblock_reqs:
-	if (hba->clk_scaling.is_allowed)
-		ufshcd_resume_clkscaling(hba);
+	if (ufshcd_is_clkscaling_enabled(hba))
+		devfreq_resume_device(hba->devfreq);
 	scsi_unblock_requests(hba->host);
 }
 
@@ -869,7 +846,10 @@ static void ufshcd_gate_work(struct work_struct *work)
 		ufshcd_set_link_hibern8(hba);
 	}
 
-	ufshcd_suspend_clkscaling(hba);
+	if (ufshcd_is_clkscaling_enabled(hba)) {
+		devfreq_suspend_device(hba->devfreq);
+		hba->clk_scaling.window_start_t = 0;
+	}
 
 	if (!ufshcd_is_link_active(hba))
 		ufshcd_setup_clocks(hba, false);
@@ -953,41 +933,6 @@ static ssize_t ufshcd_clkgate_delay_store(struct device *dev,
 	return count;
 }
 
-static ssize_t ufshcd_clkgate_enable_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", hba->clk_gating.is_enabled);
-}
-
-static ssize_t ufshcd_clkgate_enable_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-	unsigned long flags;
-	u32 value;
-
-	if (kstrtou32(buf, 0, &value))
-		return -EINVAL;
-
-	value = !!value;
-	if (value == hba->clk_gating.is_enabled)
-		goto out;
-
-	if (value) {
-		ufshcd_release(hba);
-	} else {
-		spin_lock_irqsave(hba->host->host_lock, flags);
-		hba->clk_gating.active_reqs++;
-		spin_unlock_irqrestore(hba->host->host_lock, flags);
-	}
-
-	hba->clk_gating.is_enabled = value;
-out:
-	return count;
-}
-
 static void ufshcd_init_clk_gating(struct ufs_hba *hba)
 {
 	if (!ufshcd_is_clkgating_allowed(hba))
@@ -997,8 +942,6 @@ static void ufshcd_init_clk_gating(struct ufs_hba *hba)
 	INIT_DELAYED_WORK(&hba->clk_gating.gate_work, ufshcd_gate_work);
 	INIT_WORK(&hba->clk_gating.ungate_work, ufshcd_ungate_work);
 
-	hba->clk_gating.is_enabled = true;
-
 	hba->clk_gating.delay_attr.show = ufshcd_clkgate_delay_show;
 	hba->clk_gating.delay_attr.store = ufshcd_clkgate_delay_store;
 	sysfs_attr_init(&hba->clk_gating.delay_attr.attr);
@@ -1006,14 +949,6 @@ static void ufshcd_init_clk_gating(struct ufs_hba *hba)
 	hba->clk_gating.delay_attr.attr.mode = S_IRUGO | S_IWUSR;
 	if (device_create_file(hba->dev, &hba->clk_gating.delay_attr))
 		dev_err(hba->dev, "Failed to create sysfs for clkgate_delay\n");
-
-	hba->clk_gating.enable_attr.show = ufshcd_clkgate_enable_show;
-	hba->clk_gating.enable_attr.store = ufshcd_clkgate_enable_store;
-	sysfs_attr_init(&hba->clk_gating.enable_attr.attr);
-	hba->clk_gating.enable_attr.attr.name = "clkgate_enable";
-	hba->clk_gating.enable_attr.attr.mode = S_IRUGO | S_IWUSR;
-	if (device_create_file(hba->dev, &hba->clk_gating.enable_attr))
-		dev_err(hba->dev, "Failed to create sysfs for clkgate_enable\n");
 }
 
 static void ufshcd_exit_clk_gating(struct ufs_hba *hba)
@@ -1021,13 +956,12 @@ static void ufshcd_exit_clk_gating(struct ufs_hba *hba)
 	if (!ufshcd_is_clkgating_allowed(hba))
 		return;
 	device_remove_file(hba->dev, &hba->clk_gating.delay_attr);
-	device_remove_file(hba->dev, &hba->clk_gating.enable_attr);
 }
 
 /* Must be called with host lock acquired */
 static void ufshcd_clk_scaling_start_busy(struct ufs_hba *hba)
 {
-	if (!ufshcd_is_clkscaling_supported(hba))
+	if (!ufshcd_is_clkscaling_enabled(hba))
 		return;
 
 	if (!hba->clk_scaling.is_busy_started) {
@@ -1040,7 +974,7 @@ static void ufshcd_clk_scaling_update_busy(struct ufs_hba *hba)
 {
 	struct ufs_clk_scaling *scaling = &hba->clk_scaling;
 
-	if (!ufshcd_is_clkscaling_supported(hba))
+	if (!ufshcd_is_clkscaling_enabled(hba))
 		return;
 
 	if (!hba->outstanding_reqs && scaling->is_busy_started) {
@@ -1130,6 +1064,9 @@ static inline void ufshcd_hba_capabilities(struct ufs_hba *hba)
 	hba->nutrs = (hba->capabilities & MASK_TRANSFER_REQUESTS_SLOTS) + 1;
 	hba->nutmrs =
 	((hba->capabilities & MASK_TASK_MANAGEMENT_REQUEST_SLOTS) >> 16) + 1;
+
+	if (hba->quirks & UFSHCD_QUIRK_BROKEN_CAP_64_BIT_0)
+		hba->capabilities |= MASK_64_ADDRESSING_SUPPORT;
 }
 
 /**
@@ -1215,12 +1152,15 @@ ufshcd_wait_for_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
  * @uic_cmd: UIC command
  *
  * Identical to ufshcd_send_uic_cmd() expect mutex. Must be called
- * with mutex held and host_lock locked.
+ * with mutex held.
  * Returns 0 only if success.
  */
 static int
 __ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 {
+	int ret;
+	unsigned long flags;
+
 	if (!ufshcd_ready_for_uic_cmd(hba)) {
 		dev_err(hba->dev,
 			"Controller not ready to accept UIC commands\n");
@@ -1229,9 +1169,13 @@ __ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 
 	init_completion(&uic_cmd->done);
 
+	spin_lock_irqsave(hba->host->host_lock, flags);
 	ufshcd_dispatch_uic_cmd(hba, uic_cmd);
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
-	return 0;
+	ret = ufshcd_wait_for_uic_cmd(hba, uic_cmd);
+
+	return ret;
 }
 
 /**
@@ -1245,19 +1189,12 @@ static int
 ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 {
 	int ret;
-	unsigned long flags;
 
 	ufshcd_hold(hba, false);
-	pm_runtime_get_sync(hba->dev);
 	mutex_lock(&hba->uic_cmd_mutex);
-	spin_lock_irqsave(hba->host->host_lock, flags);
 	ret = __ufshcd_send_uic_cmd(hba, uic_cmd);
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
-	if (!ret)
-		ret = ufshcd_wait_for_uic_cmd(hba, uic_cmd);
-
 	mutex_unlock(&hba->uic_cmd_mutex);
-	pm_runtime_put_sync(hba->dev);
+
 	ufshcd_release(hba);
 	return ret;
 }
@@ -2592,53 +2529,16 @@ int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 	unsigned long flags;
 	u8 status;
 	int ret;
-	u32 tm_doorbell;
-	u32 tr_doorbell;
-	bool uic_ready;
-	int retries = POWER_MODE_RETRIES;
 
 	ufshcd_hold(hba, false);
-	pm_runtime_get_sync(hba->dev);
 	mutex_lock(&hba->uic_cmd_mutex);
 	init_completion(&uic_async_done);
 
-	/*
-	 * Before changing the power mode there should be no outstanding
-	 * tasks/transfer requests. Verify by checking the doorbell registers
-	 * are clear.
-	 */
-	do {
-		spin_lock_irqsave(hba->host->host_lock, flags);
-		uic_ready = ufshcd_ready_for_uic_cmd(hba);
-		tm_doorbell = ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL);
-		tr_doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
-		if (!tm_doorbell && !tr_doorbell && uic_ready)
-			break;
-
-		spin_unlock_irqrestore(hba->host->host_lock, flags);
-		schedule();
-		retries--;
-	} while (retries && (tm_doorbell || tr_doorbell || !uic_ready));
-
-	if (!retries) {
-		dev_err(hba->dev,
-			"%s: too many retries waiting for doorbell to clear (tm=0x%x, tr=0x%x, uicrdy=%d)\n",
-			__func__, tm_doorbell, tr_doorbell, uic_ready);
-		ret = -EBUSY;
-		goto out;
-	}
-
+	spin_lock_irqsave(hba->host->host_lock, flags);
 	hba->uic_async_done = &uic_async_done;
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
 	ret = __ufshcd_send_uic_cmd(hba, cmd);
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
-	if (ret) {
-		dev_err(hba->dev,
-			"pwr ctrl cmd 0x%x with mode 0x%x uic error %d\n",
-			cmd->command, cmd->argument3, ret);
-		goto out;
-	}
-	ret = ufshcd_wait_for_uic_cmd(hba, cmd);
 	if (ret) {
 		dev_err(hba->dev,
 			"pwr ctrl cmd 0x%x with mode 0x%x uic error %d\n",
@@ -2667,7 +2567,7 @@ out:
 	hba->uic_async_done = NULL;
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
 	mutex_unlock(&hba->uic_cmd_mutex);
-	pm_runtime_put_sync(hba->dev);
+
 	ufshcd_release(hba);
 	return ret;
 }
@@ -2685,7 +2585,7 @@ static int ufshcd_uic_change_pwr_mode(struct ufs_hba *hba, u8 mode)
 	struct uic_command uic_cmd = {0};
 	int ret;
 
-	if (hba->quirks & UFSHCD_QUIRK_BROKEN_PA_RXHSUNTERMCAP) {
+	if (hba->quirks & UFSHCD_BROKEN_GEAR_CHANGE_INTO_HS) {
 		ret = ufshcd_dme_set(hba,
 				UIC_ARG_MIB_SEL(PA_RXHSUNTERMCAP, 0), 1);
 		if (ret) {
@@ -2705,20 +2605,11 @@ out:
 
 static int ufshcd_uic_hibern8_enter(struct ufs_hba *hba)
 {
-	int ret;
 	struct uic_command uic_cmd = {0};
 
 	uic_cmd.command = UIC_CMD_DME_HIBER_ENTER;
 
-	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
-
-	if (ret) {
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_HIBERN8_ENTER);
-		dev_err(hba->dev, "%s: hibern8 enter failed. ret = %d",
-			__func__, ret);
-	}
-
-	return ret;
+	return ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
 }
 
 static int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
@@ -2730,9 +2621,6 @@ static int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
 	ret = ufshcd_uic_pwr_ctrl(hba, &uic_cmd);
 	if (ret) {
 		ufshcd_set_link_off(hba);
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_HIBERN8_EXIT);
-		dev_err(hba->dev, "%s: hibern8 exit failed. ret = %d",
-			__func__, ret);
 		ret = ufshcd_host_reset_and_restore(hba);
 	}
 
@@ -2782,31 +2670,30 @@ static void ufshcd_init_pwr_info(struct ufs_hba *hba)
 }
 
 /**
- * ufshcd_get_max_pwr_mode - reads the max power mode negotiated with device
- * @hba: per-adapter instance
+ * ufshcd_config_max_pwr_mode - Set & Change power mode with
+ *	maximum capability attribute information.
+ * @hba: per adapter instance
+ *
+ * Returns 0 on success, non-zero value on failure
  */
-static int ufshcd_get_max_pwr_mode(struct ufs_hba *hba)
+static int ufshcd_config_max_pwr_mode(struct ufs_hba *hba)
 {
-	struct ufs_pa_layer_attr *pwr_info = &hba->max_pwr_info.info;
-
-	if (hba->max_pwr_info.is_valid)
-		return 0;
-
-	pwr_info->pwr_tx = FASTAUTO_MODE;
-	pwr_info->pwr_rx = FASTAUTO_MODE;
-	pwr_info->hs_rate = PA_HS_MODE_B;
+	enum {RX = 0, TX = 1};
+	u32 lanes[] = {1, 1};
+	u32 gear[] = {1, 1};
+	u8 pwr[] = {FASTAUTO_MODE, FASTAUTO_MODE};
+	struct ufs_pa_layer_attr dev_max_params = { 0 };
+	struct ufs_pa_layer_attr dev_required_params = { 0 };
+	u32 hs_rate = PA_HS_MODE_B;
+	int ret;
 
 	/* Get the connected lane count */
-	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDRXDATALANES),
-			&pwr_info->lane_rx);
-	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDTXDATALANES),
-			&pwr_info->lane_tx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDRXDATALANES), &lanes[RX]);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDTXDATALANES), &lanes[TX]);
 
-	if (!pwr_info->lane_rx || !pwr_info->lane_tx) {
+	if (!lanes[RX] || !lanes[TX]) {
 		dev_err(hba->dev, "%s: invalid connected lanes value. rx=%d, tx=%d\n",
-				__func__,
-				pwr_info->lane_rx,
-				pwr_info->lane_tx);
+				__func__, lanes[RX], lanes[TX]);
 		return -EINVAL;
 	}
 
@@ -2815,51 +2702,52 @@ static int ufshcd_get_max_pwr_mode(struct ufs_hba *hba)
 	 * If a zero value, it means there is no HSGEAR capability.
 	 * Then, get the maximum gears of PWM speed.
 	 */
-	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR), &pwr_info->gear_rx);
-	if (!pwr_info->gear_rx) {
-		ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXPWMGEAR),
-				&pwr_info->gear_rx);
-		if (!pwr_info->gear_rx) {
-			dev_err(hba->dev, "%s: invalid max pwm rx gear read = %d\n",
-				__func__, pwr_info->gear_rx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR), &gear[RX]);
+	if (!gear[RX]) {
+		ufshcd_dme_get(hba, UIC_ARG_MIB(PA_MAXRXPWMGEAR), &gear[RX]);
+		if (!gear[RX]) {
+			dev_err(hba->dev, "%s: invalid rx gear read = %d\n",
+				__func__, gear[RX]);
 			return -EINVAL;
 		}
-		pwr_info->pwr_rx = SLOWAUTO_MODE;
+		pwr[RX] = SLOWAUTO_MODE;
 	}
 
-	ufshcd_dme_peer_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR),
-			&pwr_info->gear_tx);
-	if (!pwr_info->gear_tx) {
+	ufshcd_dme_peer_get(hba, UIC_ARG_MIB(PA_MAXRXHSGEAR), &gear[TX]);
+	if (!gear[TX]) {
 		ufshcd_dme_peer_get(hba, UIC_ARG_MIB(PA_MAXRXPWMGEAR),
-				&pwr_info->gear_tx);
-		if (!pwr_info->gear_tx) {
-			dev_err(hba->dev, "%s: invalid max pwm tx gear read = %d\n",
-				__func__, pwr_info->gear_tx);
+				    &gear[TX]);
+		if (!gear[TX]) {
+			dev_err(hba->dev, "%s: invalid tx gear read = %d\n",
+				__func__, gear[TX]);
 			return -EINVAL;
 		}
-		pwr_info->pwr_tx = SLOWAUTO_MODE;
+		pwr[TX] = SLOWAUTO_MODE;
 	}
 
-	hba->max_pwr_info.is_valid = true;
-	return 0;
-}
+	if (hba->vops->pwr_change_notify) {
 
-/**
- * ufshcd_config_pwr_mode - configure a new power mode
- * @hba: per-adapter instance
- * @desired_pwr_mode: desired power configuration
- */
-int ufshcd_config_pwr_mode(struct ufs_hba *hba,
-		struct ufs_pa_layer_attr *desired_pwr_mode)
-{
-	struct ufs_pa_layer_attr final_params = { 0 };
-	int ret;
+		/* storing the device max capabilities */
+		dev_max_params.gear_rx = gear[RX];
+		dev_max_params.gear_tx = gear[TX];
+		dev_max_params.lane_rx = lanes[RX];
+		dev_max_params.lane_tx = lanes[TX];
+		dev_max_params.pwr_rx = pwr[RX];
+		dev_max_params.pwr_tx = pwr[TX];
+		dev_max_params.hs_rate = hs_rate;
 
-	if (hba->vops->pwr_change_notify)
 		hba->vops->pwr_change_notify(hba,
-		     PRE_CHANGE, desired_pwr_mode, &final_params);
-	else
-		memcpy(&final_params, desired_pwr_mode, sizeof(final_params));
+		     PRE_CHANGE, &dev_max_params, &dev_required_params);
+
+		/* restoring the min-max preferences to configure the device */
+		gear[RX] = dev_required_params.gear_rx;
+		gear[TX] = dev_required_params.gear_tx;
+		lanes[RX] = dev_required_params.lane_rx;
+		lanes[TX] = dev_required_params.lane_tx;
+		pwr[RX] = dev_required_params.pwr_rx;
+		pwr[TX] = dev_required_params.pwr_tx;
+		hs_rate = dev_required_params.hs_rate;
+	}
 
 	/*
 	 * Configure attributes for power mode change with below.
@@ -2867,47 +2755,47 @@ int ufshcd_config_pwr_mode(struct ufs_hba *hba,
 	 * - PA_TXGEAR, PA_ACTIVETXDATALANES, PA_TXTERMINATION,
 	 * - PA_HSSERIES
 	 */
-	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXGEAR), final_params.gear_rx);
-	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVERXDATALANES),
-			final_params.lane_rx);
-	if (final_params.pwr_rx == FASTAUTO_MODE ||
-			final_params.pwr_rx == FAST_MODE)
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXGEAR), gear[RX]);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVERXDATALANES), lanes[RX]);
+	if (pwr[RX] == FASTAUTO_MODE || pwr[RX] == FAST_MODE)
 		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXTERMINATION), TRUE);
 	else
 		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_RXTERMINATION), FALSE);
 
-	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXGEAR), final_params.gear_tx);
-	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVETXDATALANES),
-			final_params.lane_tx);
-	if (final_params.pwr_tx == FASTAUTO_MODE ||
-			final_params.pwr_tx == FAST_MODE)
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXGEAR), gear[TX]);
+	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_ACTIVETXDATALANES), lanes[TX]);
+	if (pwr[TX] == FASTAUTO_MODE || pwr[TX] == FAST_MODE)
 		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXTERMINATION), TRUE);
 	else
 		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TXTERMINATION), FALSE);
 
-	if ((final_params.pwr_rx == FASTAUTO_MODE ||
-			final_params.pwr_tx == FASTAUTO_MODE ||
-			final_params.pwr_rx == FAST_MODE ||
-			final_params.pwr_tx == FAST_MODE) &&
-			final_params.hs_rate == PA_HS_MODE_B)
-		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_HSSERIES),
-				final_params.hs_rate);
+	if ((pwr[RX] == FASTAUTO_MODE || pwr[TX] == FASTAUTO_MODE ||
+	     pwr[RX] == FAST_MODE || pwr[TX] == FAST_MODE) &&
+	     hs_rate == PA_HS_MODE_B)
+		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_HSSERIES), hs_rate);
 
-	ret = ufshcd_uic_change_pwr_mode(hba, final_params.pwr_rx << 4
-			| final_params.pwr_tx);
+	ret = ufshcd_uic_change_pwr_mode(hba, pwr[RX] << 4 | pwr[TX]);
 	if (ret) {
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_POWER_MODE_CHANGE);
 		dev_err(hba->dev,
 			"pwr_mode: power mode change failed %d\n", ret);
 	} else {
 		if (hba->vops->pwr_change_notify)
 			hba->vops->pwr_change_notify(hba,
-				POST_CHANGE, NULL, &final_params);
+				POST_CHANGE, NULL, &dev_required_params);
 
-		memcpy(&hba->pwr_info, &final_params, sizeof(final_params));
+		hba->pwr_info.gear_rx = gear[RX];
+		hba->pwr_info.gear_tx = gear[TX];
+		hba->pwr_info.lane_rx = lanes[RX];
+		hba->pwr_info.lane_tx = lanes[TX];
+		hba->pwr_info.pwr_rx = pwr[RX];
+		hba->pwr_info.pwr_tx = pwr[TX];
+		hba->pwr_info.hs_rate = hs_rate;
 	}
 
 	ufshcd_print_pwr_info(hba);
+
+	if (hba->quirks & UFSHCD_QUIRK_BROKEN_PWR_MODE_CHANGE)
+		msleep(1000);
 
 	return ret;
 }
@@ -3137,12 +3025,9 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
 			hba->vops->link_startup_notify(hba, PRE_CHANGE);
 
 		ret = ufshcd_dme_link_startup(hba);
-		if (ret)
-			UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_LINKSTARTUP);
 
 		/* check if device is detected by inter-connect layer */
 		if (!ret && !ufshcd_is_device_present(hba)) {
-			UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_LINKSTARTUP);
 			dev_err(hba->dev, "%s: Device not present\n", __func__);
 			ret = -ENXIO;
 			goto out;
@@ -3161,13 +3046,13 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
 		/* failed to get the link up... retire */
 		goto out;
 
-	if (hba->quirks & UFSHCD_QUIRK_BROKEN_LCC) {
+	if (hba->quirks & UFSHCD_BROKEN_LCC_PROCESSING_ON_HOST) {
 		ret = ufshcd_disable_device_tx_lcc(hba);
 		if (ret)
 			goto out;
 	}
 
-	if (hba->dev_quirks & UFS_DEVICE_QUIRK_BROKEN_LCC) {
+	if (hba->quirks & UFSHCD_BROKEN_LCC_PROCESSING_ON_DEVICE) {
 		ret = ufshcd_disable_host_tx_lcc(hba);
 		if (ret)
 			goto out;
@@ -3970,19 +3855,6 @@ static void ufshcd_err_handler(struct work_struct *work)
 	if (err_xfer || err_tm || (hba->saved_err & INT_FATAL_ERRORS) ||
 			((hba->saved_err & UIC_ERROR) &&
 			 (hba->saved_uic_err & UFSHCD_UIC_DL_PA_INIT_ERROR))) {
-
-		if (hba->saved_err & INT_FATAL_ERRORS)
-			UFSHCD_UPDATE_ERROR_STATS(hba,
-						  UFS_ERR_INT_FATAL_ERRORS);
-
-		if (hba->saved_err & UIC_ERROR)
-			UFSHCD_UPDATE_ERROR_STATS(hba,
-						  UFS_ERR_INT_UIC_ERROR);
-
-		if (err_xfer || err_tm)
-			UFSHCD_UPDATE_ERROR_STATS(hba,
-						  UFS_ERR_CLEAR_PEND_XFER_TM);
-
 		err = ufshcd_reset_and_restore(hba);
 		if (err) {
 			dev_err(hba->dev, "%s: reset and restore failed\n",
@@ -4348,8 +4220,6 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 	tag = cmd->request->tag;
 	lrbp = &hba->lrb[tag];
 
-	UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_TASK_ABORT);
-
 	/*
 	 * Task abort to the device W-LUN is illegal. When this command
 	 * will fail, due to spec violation, scsi err handling next step
@@ -4549,7 +4419,6 @@ static int ufshcd_eh_host_reset_handler(struct scsi_cmnd *cmd)
 	ufshcd_set_eh_in_progress(hba);
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
-	UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_EH);
 	err = ufshcd_reset_and_restore(hba);
 
 	spin_lock_irqsave(hba->host->host_lock, flags);
@@ -4743,8 +4612,6 @@ static int ufshcd_probe_hba(struct ufs_hba *hba)
 	if (ret)
 		goto out;
 
-	ufs_advertise_fixup_device(hba);
-
 	if (!hba->is_init_prefetch) {
 		ret = ufshcd_get_device_ref_clk(hba);
 		if (ret) {
@@ -4761,16 +4628,10 @@ static int ufshcd_probe_hba(struct ufs_hba *hba)
 	hba->ufshcd_state = UFSHCD_STATE_OPERATIONAL;
 	hba->wlun_dev_clr_ua = true;
 
-	if (ufshcd_get_max_pwr_mode(hba)) {
+	if (ufshcd_config_max_pwr_mode(hba))
 		dev_err(hba->dev,
-			"%s: Failed getting max supported power mode\n",
+			"%s: Failed configuring max supported power mode\n",
 			__func__);
-	} else {
-		ret = ufshcd_config_pwr_mode(hba, &hba->max_pwr_info.info);
-		if (ret)
-			dev_err(hba->dev, "%s: Failed setting power mode, err = %d\n",
-					__func__, ret);
-	}
 
 	/*
 	 * If we are in error handling context or in power management callbacks
@@ -4791,10 +4652,8 @@ static int ufshcd_probe_hba(struct ufs_hba *hba)
 		pm_runtime_put_sync(hba->dev);
 	}
 	/* Resume devfreq after UFS device is detected */
-	if (ufshcd_is_clkscaling_supported(hba)) {
-		ufshcd_resume_clkscaling(hba);
-		hba->clk_scaling.is_allowed = true;
-	}
+	if (ufshcd_is_clkscaling_enabled(hba))
+		devfreq_resume_device(hba->devfreq);
 	if (!hba->is_init_prefetch)
 		hba->is_init_prefetch = true;
 out:
@@ -5738,7 +5597,10 @@ disable_clks:
 	 * for pending clock scaling work to be done before clocks are
 	 * turned off.
 	 */
-	ufshcd_suspend_clkscaling(hba);
+	if (ufshcd_is_clkscaling_enabled(hba)) {
+		devfreq_suspend_device(hba->devfreq);
+		hba->clk_scaling.window_start_t = 0;
+	}
 	/*
 	 * Call vendor specific suspend callback. As these callbacks may access
 	 * vendor specific host controller register space call them before the
@@ -5778,12 +5640,10 @@ vops_resume:
 		hba->vops->resume(hba, pm_op);
 set_link_active:
 	ufshcd_vreg_set_hpm(hba);
-	if (ufshcd_is_link_hibern8(hba) && !ufshcd_uic_hibern8_exit(hba)) {
+	if (ufshcd_is_link_hibern8(hba) && !ufshcd_uic_hibern8_exit(hba))
 		ufshcd_set_link_active(hba);
-	} else if (ufshcd_is_link_off(hba)) {
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_VOPS_SUSPEND);
+	else if (ufshcd_is_link_off(hba))
 		ufshcd_host_reset_and_restore(hba);
-	}
 set_dev_active:
 	if (!ufshcd_set_dev_pwr_mode(hba, UFS_ACTIVE_PWR_MODE))
 		ufshcd_disable_auto_bkops(hba);
@@ -5792,10 +5652,6 @@ enable_gating:
 	ufshcd_release(hba);
 out:
 	hba->pm_op_in_progress = 0;
-
-	if (ret)
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_SUSPEND);
-
 	return ret;
 }
 
@@ -5864,8 +5720,8 @@ static int ufshcd_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	ufshcd_disable_auto_bkops(hba);
 	hba->clk_gating.is_suspended = false;
 
-	if (hba->clk_scaling.is_allowed)
-		ufshcd_resume_clkscaling(hba);
+	if (ufshcd_is_clkscaling_enabled(hba))
+		devfreq_resume_device(hba->devfreq);
 
 	/* Schedule clock gating in case of no access to UFS device yet */
 	ufshcd_release(hba);
@@ -5883,10 +5739,6 @@ disable_irq_and_vops_clks:
 	ufshcd_setup_clocks(hba, false);
 out:
 	hba->pm_op_in_progress = 0;
-
-	if (ret)
-		UFSHCD_UPDATE_ERROR_STATS(hba, UFS_ERR_RESUME);
-
 	return ret;
 }
 
@@ -6085,10 +5937,8 @@ void ufshcd_remove(struct ufs_hba *hba)
 	ufshcd_hba_stop(hba, true);
 
 	ufshcd_exit_clk_gating(hba);
-	if (ufshcd_is_clkscaling_supported(hba)) {
-		device_remove_file(hba->dev, &hba->clk_scaling.enable_attr);
+	if (ufshcd_is_clkscaling_enabled(hba))
 		devfreq_remove_device(hba->devfreq);
-	}
 	ufshcd_hba_exit(hba);
 }
 EXPORT_SYMBOL_GPL(ufshcd_remove);
@@ -6216,69 +6066,13 @@ out:
 	return ret;
 }
 
-static void ufshcd_suspend_clkscaling(struct ufs_hba *hba)
-{
-	if (!ufshcd_is_clkscaling_supported(hba))
-		return;
-
-	devfreq_suspend_device(hba->devfreq);
-	hba->clk_scaling.window_start_t = 0;
-}
-
-static void ufshcd_resume_clkscaling(struct ufs_hba *hba)
-{
-	devfreq_resume_device(hba->devfreq);
-}
-
-static ssize_t ufshcd_clkscale_enable_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", hba->clk_scaling.is_allowed);
-}
-
-static ssize_t ufshcd_clkscale_enable_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct ufs_hba *hba = dev_get_drvdata(dev);
-	u32 value;
-	int err;
-
-	if (kstrtou32(buf, 0, &value))
-		return -EINVAL;
-
-	value = !!value;
-	if (value == hba->clk_scaling.is_allowed)
-		goto out;
-
-	pm_runtime_get_sync(hba->dev);
-	ufshcd_hold(hba, false);
-
-	if (value) {
-		ufshcd_resume_clkscaling(hba);
-	} else {
-		ufshcd_suspend_clkscaling(hba);
-		err = ufshcd_scale_clks(hba, true);
-		if (err)
-			dev_err(hba->dev, "%s: failed to scale clocks up %d\n",
-					__func__, err);
-	}
-	hba->clk_scaling.is_allowed = value;
-
-	ufshcd_release(hba);
-	pm_runtime_put_sync(hba->dev);
-out:
-	return count;
-}
-
 static int ufshcd_devfreq_target(struct device *dev,
 				unsigned long *freq, u32 flags)
 {
 	int err = 0;
 	struct ufs_hba *hba = dev_get_drvdata(dev);
 
-	if (!ufshcd_is_clkscaling_supported(hba))
+	if (!ufshcd_is_clkscaling_enabled(hba))
 		return -EINVAL;
 
 	if (*freq == UINT_MAX)
@@ -6296,7 +6090,7 @@ static int ufshcd_devfreq_get_dev_status(struct device *dev,
 	struct ufs_clk_scaling *scaling = &hba->clk_scaling;
 	unsigned long flags;
 
-	if (!ufshcd_is_clkscaling_supported(hba))
+	if (!ufshcd_is_clkscaling_enabled(hba))
 		return -EINVAL;
 
 	memset(stat, 0, sizeof(*stat));
@@ -6348,16 +6142,6 @@ static struct devfreq_dev_profile ufs_devfreq_profile = {
 	.num_governor_data = ARRAY_SIZE(ufshcd_governors),
 #endif
 };
-static void ufshcd_clkscaling_init_sysfs(struct ufs_hba *hba)
-{
-	hba->clk_scaling.enable_attr.show = ufshcd_clkscale_enable_show;
-	hba->clk_scaling.enable_attr.store = ufshcd_clkscale_enable_store;
-	sysfs_attr_init(&hba->clk_scaling.enable_attr.attr);
-	hba->clk_scaling.enable_attr.attr.name = "clkscale_enable";
-	hba->clk_scaling.enable_attr.attr.mode = S_IRUGO | S_IWUSR;
-	if (device_create_file(hba->dev, &hba->clk_scaling.enable_attr))
-		dev_err(hba->dev, "Failed to create sysfs for clkscale_enable\n");
-}
 
 /**
  * ufshcd_init - Driver initialization routine
@@ -6391,6 +6175,9 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 
 	/* Get UFS version supported by the controller */
 	hba->ufs_version = ufshcd_get_ufs_version(hba);
+	if ((hba->quirks & UFSHCD_QUIRK_BROKEN_VER_REG_1_1) &&
+	    (hba->ufs_version == UFSHCI_VERSION_10))
+		hba->ufs_version = UFSHCI_VERSION_11;
 
 	/* Get Interrupt bit mask per version */
 	hba->intr_mask = ufshcd_get_intr_mask(hba);
@@ -6411,7 +6198,7 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	/* Configure LRB */
 	ufshcd_host_memory_configure(hba);
 
-	host->can_queue = hba->nutrs;
+	host->can_queue = ufshcd_can_queue(hba);
 	host->cmd_per_lun = hba->nutrs;
 	host->max_id = UFSHCD_MAX_ID;
 	host->max_lun = UFS_MAX_LUNS;
@@ -6419,8 +6206,6 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	host->unique_id = host->host_no;
 	host->max_cmd_len = MAX_CDB_SIZE;
 	host->report_wlus = 1;
-
-	hba->max_pwr_info.is_valid = false;
 
 	/* Initailize wait queue for task management */
 	init_waitqueue_head(&hba->tm_wq);
@@ -6470,7 +6255,7 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 		goto out_remove_scsi_host;
 	}
 
-	if (ufshcd_is_clkscaling_supported(hba)) {
+	if (ufshcd_is_clkscaling_enabled(hba)) {
 		hba->devfreq = devfreq_add_device(dev, &ufs_devfreq_profile,
 						   "simple_ondemand", NULL);
 		if (IS_ERR(hba->devfreq)) {
@@ -6479,19 +6264,9 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 			goto out_remove_scsi_host;
 		}
 		/* Suspend devfreq until the UFS device is detected */
-		ufshcd_suspend_clkscaling(hba);
-		ufshcd_clkscaling_init_sysfs(hba);
+		devfreq_suspend_device(hba->devfreq);
+		hba->clk_scaling.window_start_t = 0;
 	}
-
-	/*
-	 * Set the default power management level for UFS runtime and system
-	 * suspend. Default power saving mode selected is keeping UFS link in
-	 * Hibern8 state and UFS device in sleep.
-	 */
-	hba->rpm_lvl = ufs_get_desired_pm_lvl_for_dev_link_state(
-				UFS_SLEEP_PWR_MODE, UIC_LINK_HIBERN8_STATE);
-	hba->spm_lvl = ufs_get_desired_pm_lvl_for_dev_link_state(
-				UFS_SLEEP_PWR_MODE, UIC_LINK_HIBERN8_STATE);
 
 	/* Hold auto suspend until async scan completes */
 	pm_runtime_get_sync(dev);

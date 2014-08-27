@@ -254,6 +254,49 @@ static void __tmc_disable(struct tmc_drvdata *drvdata)
 	tmc_writel(drvdata, 0x0, TMC_CTL);
 }
 
+static void tmc_etr_sg_tbl_free(uint32_t *vaddr, uint32_t size, uint32_t ents)
+{
+	uint32_t i = 0, pte_n = 0, last_pte;
+	uint32_t *virt_st_tbl, *virt_pte;
+	void *virt_blk;
+	phys_addr_t phys_pte;
+	int total_ents = DIV_ROUND_UP(size, PAGE_SIZE);
+	int ents_per_blk = PAGE_SIZE/sizeof(uint32_t);
+
+	virt_st_tbl = vaddr;
+
+	while (i < total_ents) {
+		last_pte = ((i + ents_per_blk) > total_ents) ?
+			   total_ents : (i + ents_per_blk);
+		while (i < last_pte) {
+			virt_pte = virt_st_tbl + pte_n;
+
+			/* Do not go beyond number of entries allocated */
+			if (i == ents) {
+				free_page((unsigned long)virt_st_tbl);
+				return;
+			}
+
+			phys_pte = TMC_ETR_SG_ENT_TO_BLK(*virt_pte);
+			virt_blk = phys_to_virt(phys_pte);
+
+			if ((last_pte - i) > 1) {
+				free_page((unsigned long)virt_blk);
+				pte_n++;
+			} else if (last_pte == total_ents) {
+				free_page((unsigned long)virt_blk);
+				free_page((unsigned long)virt_st_tbl);
+			} else {
+				free_page((unsigned long)virt_st_tbl);
+				virt_st_tbl = (uint32_t *)virt_blk;
+				pte_n = 0;
+				break;
+			}
+			i++;
+		}
+	}
+}
+
 static void tmc_etr_sg_tbl_flush(uint32_t *vaddr, uint32_t size)
 {
 	uint32_t i = 0, pte_n = 0, last_pte;
@@ -326,8 +369,9 @@ static void tmc_etr_sg_tbl_flush(uint32_t *vaddr, uint32_t size)
  * b. ents_per_blk = 4
  */
 
-static int tmc_etr_sg_tbl_alloc(struct tmc_drvdata *drvdata, uint32_t size)
+static int tmc_etr_sg_tbl_alloc(struct tmc_drvdata *drvdata)
 {
+	int ret;
 	uint32_t i = 0, last_pte;
 	uint32_t *virt_pgdir, *virt_st_tbl;
 	void *virt_pte;
@@ -345,8 +389,10 @@ static int tmc_etr_sg_tbl_alloc(struct tmc_drvdata *drvdata, uint32_t size)
 			   total_ents : (i + ents_per_blk);
 		while (i < last_pte) {
 			virt_pte = (void *)get_zeroed_page(GFP_KERNEL);
-			if (!virt_pte)
-				return -ENOMEM;
+			if (!virt_pte) {
+				ret = -ENOMEM;
+				goto err;
+			}
 
 			if ((last_pte - i) > 1) {
 				*virt_st_tbl =
@@ -369,48 +415,15 @@ static int tmc_etr_sg_tbl_alloc(struct tmc_drvdata *drvdata, uint32_t size)
 	drvdata->paddr = virt_to_phys(virt_pgdir);
 
 	/* Flush the dcache before proceeding */
-	tmc_etr_sg_tbl_flush((uint32_t *)drvdata->vaddr, size);
+	tmc_etr_sg_tbl_flush((uint32_t *)drvdata->vaddr, drvdata->size);
 
 	dev_dbg(drvdata->dev, "%s: table starts at %#lx, total entries %d\n",
 		__func__, (unsigned long)drvdata->paddr, total_ents);
 
 	return 0;
-}
-
-static void tmc_etr_sg_tbl_free(uint32_t *vaddr, uint32_t size)
-{
-	uint32_t i = 0, pte_n = 0, last_pte;
-	uint32_t *virt_st_tbl, *virt_pte;
-	void *virt_blk;
-	phys_addr_t phys_pte;
-	int total_ents = DIV_ROUND_UP(size, PAGE_SIZE);
-	int ents_per_blk = PAGE_SIZE/sizeof(uint32_t);
-
-	virt_st_tbl = vaddr;
-
-	while (i < total_ents) {
-		last_pte = ((i + ents_per_blk) > total_ents) ?
-			   total_ents : (i + ents_per_blk);
-		while (i < last_pte) {
-			virt_pte = virt_st_tbl + pte_n;
-			phys_pte = TMC_ETR_SG_ENT_TO_BLK(*virt_pte);
-			virt_blk = phys_to_virt(phys_pte);
-
-			if ((last_pte - i) > 1) {
-				free_page((unsigned long)virt_blk);
-				pte_n++;
-			} else if (last_pte == total_ents) {
-				free_page((unsigned long)virt_blk);
-				free_page((unsigned long)virt_st_tbl);
-			} else {
-				free_page((unsigned long)virt_st_tbl);
-				virt_st_tbl = (uint32_t *)virt_blk;
-				pte_n = 0;
-				break;
-			}
-			i++;
-		}
-	}
+err:
+	tmc_etr_sg_tbl_free(virt_pgdir, drvdata->size, i);
+	return ret;
 }
 
 static void tmc_etr_sg_mem_reset(uint32_t *vaddr, uint32_t size)
@@ -667,7 +680,7 @@ static int tmc_etr_alloc_mem(struct tmc_drvdata *drvdata)
 				goto err;
 			}
 		} else {
-			ret = tmc_etr_sg_tbl_alloc(drvdata, drvdata->size);
+			ret = tmc_etr_sg_tbl_alloc(drvdata);
 			if (ret)
 				goto err;
 		}
@@ -691,7 +704,8 @@ static void tmc_etr_free_mem(struct tmc_drvdata *drvdata)
 					  drvdata->vaddr, drvdata->paddr);
 		else
 			tmc_etr_sg_tbl_free((uint32_t *)drvdata->vaddr,
-					    drvdata->size);
+				drvdata->size,
+				DIV_ROUND_UP(drvdata->size, PAGE_SIZE));
 	       drvdata->vaddr = 0;
 	       drvdata->paddr = 0;
 	}
@@ -947,7 +961,6 @@ static void __tmc_etb_dump(struct tmc_drvdata *drvdata)
 	char *hdr;
 	char *bufp;
 	uint32_t read_data;
-	int i;
 
 	hdr = drvdata->buf - PAGE_SIZE;
 	if (MSM_DUMP_MAJOR(msm_dump_table_version()) == 1)
@@ -968,16 +981,22 @@ static void __tmc_etb_dump(struct tmc_drvdata *drvdata)
 
 	bufp = drvdata->buf;
 	while (1) {
-		for (i = 0; i < memwords; i++) {
-			read_data = tmc_readl_no_log(drvdata, TMC_RRD);
-			if (read_data == 0xFFFFFFFF)
-				goto out;
-			memcpy(bufp, &read_data, BYTES_PER_WORD);
-			bufp += BYTES_PER_WORD;
+		read_data = tmc_readl_no_log(drvdata, TMC_RRD);
+		if (read_data == 0xFFFFFFFF)
+			goto out;
+		if ((bufp - drvdata->buf) >= drvdata->size) {
+			dev_err(drvdata->dev, "ETF-ETB end marker missing\n");
+			goto out;
 		}
+		memcpy(bufp, &read_data, BYTES_PER_WORD);
+		bufp += BYTES_PER_WORD;
 	}
 
 out:
+	if ((bufp - drvdata->buf) % (memwords * BYTES_PER_WORD))
+		dev_dbg(drvdata->dev, "ETF-ETB data is not %lx bytes aligned\n",
+			(unsigned long) memwords * BYTES_PER_WORD);
+
 	if (drvdata->aborting) {
 		if (MSM_DUMP_MAJOR(msm_dump_table_version()) == 1)
 			*(uint32_t *)(hdr + TMC_ETFETB_DUMP_MAGIC_OFF) =
@@ -1547,77 +1566,6 @@ static int tmc_etr_byte_cntr_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static void tmc_etr_sg_read_pos(struct tmc_drvdata *drvdata, loff_t *ppos,
-				size_t bytes, bool noirq, size_t *len,
-				char **bufpp)
-{
-	uint32_t rwp, i = 0;
-	uint32_t blk_num, sg_tbl_num, blk_num_loc, read_off;
-	uint32_t *virt_pte, *virt_st_tbl;
-	void *virt_blk;
-	phys_addr_t phys_pte;
-	int total_ents = DIV_ROUND_UP(drvdata->size, PAGE_SIZE);
-	int ents_per_pg = PAGE_SIZE/sizeof(uint32_t);
-
-	if (*len == 0)
-		return;
-
-	blk_num = *ppos / PAGE_SIZE;
-	read_off = *ppos % PAGE_SIZE;
-
-	virt_st_tbl = (uint32_t *)drvdata->vaddr;
-
-	/* Compute table index and block entry index within that table */
-	if (blk_num && (blk_num == (total_ents - 1)) &&
-	    !(blk_num % (ents_per_pg - 1))) {
-		sg_tbl_num = blk_num / ents_per_pg;
-		blk_num_loc = ents_per_pg - 1;
-	} else {
-		sg_tbl_num = blk_num / (ents_per_pg - 1);
-		blk_num_loc = blk_num % (ents_per_pg - 1);
-	}
-
-	for (i = 0; i < sg_tbl_num; i++) {
-		virt_pte = virt_st_tbl + (ents_per_pg - 1);
-		phys_pte = TMC_ETR_SG_ENT_TO_BLK(*virt_pte);
-		virt_st_tbl = (uint32_t *)phys_to_virt(phys_pte);
-	}
-
-	virt_pte = virt_st_tbl + blk_num_loc;
-	phys_pte = TMC_ETR_SG_ENT_TO_BLK(*virt_pte);
-	virt_blk = phys_to_virt(phys_pte);
-
-	*bufpp = virt_blk + read_off;
-
-	if (noirq) {
-		rwp = tmc_readl(drvdata, TMC_RWP);
-		tmc_etr_sg_rwp_pos(drvdata, rwp);
-		if (drvdata->sg_blk_num == blk_num &&
-		    rwp >= (phys_pte + read_off))
-			*len = rwp - phys_pte - read_off;
-		else if (drvdata->sg_blk_num > blk_num)
-			*len = PAGE_SIZE - read_off;
-		else
-			*len = bytes;
-	} else {
-
-		if (*len > (PAGE_SIZE - read_off))
-			*len = PAGE_SIZE - read_off;
-
-		if (*len >= (bytes - ((uint32_t)*ppos % bytes)))
-			*len = bytes - ((uint32_t)*ppos % bytes);
-
-		if ((*len + (uint32_t)*ppos) % bytes == 0)
-			atomic_dec(&drvdata->byte_cntr_irq_cnt);
-	}
-
-	/*
-	 * Invalidate cache range before reading. This will make sure that CPU
-	 * reads latest contents from DDR
-	 */
-	dmac_inv_range((void *)(*bufpp), (void *)(*bufpp) + *len);
-}
-
 static void tmc_etr_read_bytes(struct tmc_drvdata *drvdata, loff_t *ppos,
 			       size_t bytes, size_t *len)
 {
@@ -1671,21 +1619,13 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *file, char __user *data,
 			/* Read the last 'block' of data which might be needed
 			 * to be read partially. If already read, return 0
 			 */
-			if (drvdata->memtype == TMC_ETR_MEM_TYPE_CONTIG)
-				len = tmc_etr_flush_bytes(drvdata, ppos, bytes);
-			else
-				tmc_etr_sg_read_pos(drvdata, ppos, bytes,
-						    true, &len, &bufp);
+			len = tmc_etr_flush_bytes(drvdata, ppos, bytes);
 			if (!len)
 				goto read_err0;
 		} else {
 			/* Keep reading until you reach the last block of data
 			 */
-			if (drvdata->memtype == TMC_ETR_MEM_TYPE_CONTIG)
-				tmc_etr_read_bytes(drvdata, ppos, bytes, &len);
-			else
-				tmc_etr_sg_read_pos(drvdata, ppos, bytes,
-						    false, &len, &bufp);
+			tmc_etr_read_bytes(drvdata, ppos, bytes, &len);
 		}
 	} else {
 		if (!atomic_read(&drvdata->byte_cntr_irq_cnt)) {
@@ -1708,24 +1648,15 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *file, char __user *data,
 		}
 		if (!drvdata->byte_cntr_enable &&
 		    !atomic_read(&drvdata->byte_cntr_irq_cnt)) {
-			if (drvdata->memtype == TMC_ETR_MEM_TYPE_CONTIG)
-				len = tmc_etr_flush_bytes(drvdata, ppos, bytes);
-			else
-				tmc_etr_sg_read_pos(drvdata, ppos, bytes,
-						    true, &len, &bufp);
+			len = tmc_etr_flush_bytes(drvdata, ppos, bytes);
 			if (!len) {
 				ret = 0;
 				goto read_err0;
 			}
 		} else {
-			if (drvdata->memtype == TMC_ETR_MEM_TYPE_CONTIG)
-				tmc_etr_read_bytes(drvdata, ppos, bytes, &len);
-			else
-				tmc_etr_sg_read_pos(drvdata, ppos, bytes,
-						    false, &len, &bufp);
+			tmc_etr_read_bytes(drvdata, ppos, bytes, &len);
 		}
 	}
-
 	if (copy_to_user(data, bufp, len)) {
 		mutex_unlock(&drvdata->byte_cntr_lock);
 		dev_dbg(drvdata->dev, "%s: copy_to_user failed\n", __func__);

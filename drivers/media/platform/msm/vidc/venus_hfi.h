@@ -144,9 +144,8 @@ struct vidc_iface_q_info {
 
 struct hal_data {
 	u32 irq;
-	phys_addr_t firmware_base;
-	u8 __iomem *register_base;
-	u32 register_size;
+	phys_addr_t firmware_base_addr;
+	u8 *register_base_addr;
 };
 
 struct venus_bus_info {
@@ -165,17 +164,13 @@ struct venus_resources {
 	struct on_chip_mem ocmem;
 };
 
-enum venus_hfi_state {
-	VENUS_STATE_DEINIT = 1,
-	VENUS_STATE_INIT,
-};
-
 struct venus_hfi_device {
 	struct list_head list;
 	struct list_head sess_head;
 	u32 intr_status;
 	u32 device_id;
 	u32 clk_load;
+	u32 codecs_enabled;
 	struct vidc_bus_vote_data *bus_load;
 	enum clock_state clk_state;
 	bool power_enabled;
@@ -195,9 +190,12 @@ struct venus_hfi_device {
 	struct workqueue_struct *venus_pm_workq;
 	int spur_count;
 	int reg_count;
+	phys_addr_t firmware_base;
+	phys_addr_t register_base;
+	u32 register_size;
+	u32 irq;
 	struct venus_resources resources;
 	struct msm_vidc_platform_resources *res;
-	enum venus_hfi_state state;
 };
 
 void venus_hfi_delete_device(void *device);

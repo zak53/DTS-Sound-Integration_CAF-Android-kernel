@@ -22,6 +22,7 @@
 
 #define SMP_MB_SIZE		(mdss_res->smp_mb_size)
 #define SMP_MB_CNT		(mdss_res->smp_mb_cnt)
+#define SMP_ENTRIES_PER_MB	(SMP_MB_SIZE / 16)
 #define SMP_MB_ENTRY_SIZE	16
 #define MAX_BPP 4
 
@@ -51,6 +52,29 @@ static inline void mdss_mdp_pipe_write(struct mdss_mdp_pipe *pipe,
 static inline u32 mdss_mdp_pipe_read(struct mdss_mdp_pipe *pipe, u32 reg)
 {
 	return readl_relaxed(pipe->base + reg);
+}
+
+int mdss_mdp_pipe_panic_signal_ctrl(struct mdss_mdp_pipe *pipe, bool enable)
+{
+	uint32_t panic_robust_ctrl;
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+
+	if (!mdata->has_panic_ctrl)
+		goto end;
+
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	panic_robust_ctrl = readl_relaxed(mdata->mdp_base +
+			MMSS_MDP_PANIC_ROBUST_CTRL);
+	if (enable)
+		panic_robust_ctrl |= BIT(pipe->panic_ctrl_ndx);
+	else
+		panic_robust_ctrl &= ~BIT(pipe->panic_ctrl_ndx);
+	writel_relaxed(panic_robust_ctrl,
+				mdata->mdp_base + MMSS_MDP_PANIC_ROBUST_CTRL);
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+
+end:
+	return 0;
 }
 
 static u32 mdss_mdp_smp_mmb_reserve(struct mdss_mdp_pipe_smp_map *smp_map,
@@ -160,47 +184,31 @@ u32 mdss_mdp_smp_get_size(struct mdss_mdp_pipe *pipe)
 
 static void mdss_mdp_smp_set_wm_levels(struct mdss_mdp_pipe *pipe, int mb_cnt)
 {
-	u32 useable_space, val, wm[3];
+	u32 fetch_size, val, wm[3];
 
-	useable_space = mb_cnt * SMP_MB_SIZE;
+	fetch_size = mb_cnt * SMP_MB_SIZE;
 
 	/*
-	 * when source format is macrotile then useable space within total
-	 * allocated SMP space is limited to src_w * bpp * nlines. Unlike
-	 * linear format, any extra space left over is not filled.
+	 * when doing hflip, one line is reserved to be consumed down the
+	 * pipeline. This line will always be marked as full even if it doesn't
+	 * have any data. In order to generate proper priority levels ignore
+	 * this region while setting up watermark levels
 	 */
-	if (pipe->src_fmt->tile) {
-		useable_space = pipe->src.w * pipe->src_fmt->bpp;
-	} else if (pipe->flags & MDP_FLIP_LR) {
-		/*
-		 * when doing hflip, one line is reserved to be consumed down
-		 * the pipeline. This line will always be marked as full even
-		 * if it doesn't have any data. In order to generate proper
-		 * priority levels ignore this region while setting up
-		 * watermark levels
-		 */
+	if (pipe->flags & MDP_FLIP_LR) {
 		u8 bpp = pipe->src_fmt->is_yuv ? 1 :
 			pipe->src_fmt->bpp;
-		useable_space -= (pipe->src.w * bpp);
+		fetch_size -= (pipe->src.w * bpp);
 	}
 
-	if (pipe->src_fmt->tile) {
-		val = useable_space / SMP_MB_ENTRY_SIZE;
+	/* 1/4 of SMP pool that is being fetched */
+	val = (fetch_size / SMP_MB_ENTRY_SIZE) >> 2;
 
-		wm[0] = (val * 5) / 8;
-		wm[1] = (val * 6) / 8;
-		wm[2] = (val * 7) / 8;
-	} else {
-		/* 1/4 of SMP pool that is being fetched */
-		val = (useable_space / SMP_MB_ENTRY_SIZE) >> 2;
+	wm[0] = val;
+	wm[1] = wm[0] + val;
+	wm[2] = wm[1] + val;
 
-		wm[0] = val;
-		wm[1] = wm[0] + val;
-		wm[2] = wm[1] + val;
-	}
-
-	pr_debug("pnum=%d useable_space=%u watermarks %u,%u,%u\n", pipe->num,
-			useable_space, wm[0], wm[1], wm[2]);
+	pr_debug("pnum=%d fetch_size=%u watermarks %u,%u,%u\n", pipe->num,
+			fetch_size, wm[0], wm[1], wm[2]);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_REQPRIO_FIFO_WM_0, wm[0]);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_REQPRIO_FIFO_WM_1, wm[1]);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_REQPRIO_FIFO_WM_2, wm[2]);
@@ -289,7 +297,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 			}
 		}
 		rc = mdss_mdp_get_plane_sizes(format, width, pipe->src.h,
-			&ps, 0);
+			&ps, 0, 0);
 		if (rc)
 			return rc;
 
@@ -546,6 +554,47 @@ static void mdss_mdp_qos_vbif_remapper_setup(struct mdss_data_type *mdata,
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 }
 
+/**
+ * mdss_mdp_fixed_qos_arbiter_setup - Program the RT/NRT registers based on
+ *              real or non real time clients
+ * @mdata:      Pointer to the global mdss data structure.
+ * @pipe:       Pointer to source pipe struct to get xin id's.
+ * @is_realtime:        To determine if pipe's client is real or
+ *                      non real time.
+ */
+static void mdss_mdp_fixed_qos_arbiter_setup(struct mdss_data_type *mdata,
+		struct mdss_mdp_pipe *pipe, bool is_realtime)
+{
+	u32 mask, reg_val;
+
+	if (!mdata->has_fixed_qos_arbiter_enabled)
+		return;
+
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	mutex_lock(&mdata->reg_lock);
+	reg_val = readl_relaxed(mdata->vbif_base + MDSS_VBIF_FIXED_SORT_EN);
+	mask = 0x1 << pipe->xin_id;
+	reg_val |= mask;
+
+	/* Enable the fixed sort for the client */
+	writel_relaxed(reg_val, mdata->vbif_base + MDSS_VBIF_FIXED_SORT_EN);
+	reg_val = readl_relaxed(mdata->vbif_base + MDSS_VBIF_FIXED_SORT_SEL0);
+	mask = 0x1 << (pipe->xin_id * 2);
+	if (is_realtime) {
+		reg_val &= ~mask;
+		pr_debug("Real time traffic on pipe type=%x  pnum=%d\n",
+				pipe->type, pipe->num);
+	} else {
+		reg_val |= mask;
+		pr_debug("Non real time traffic on pipe type=%x  pnum=%d\n",
+				pipe->type, pipe->num);
+	}
+	/* Set the fixed_sort regs as per RT/NRT client */
+	writel_relaxed(reg_val, mdata->vbif_base + MDSS_VBIF_FIXED_SORT_SEL0);
+	mutex_unlock(&mdata->reg_lock);
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+}
+
 static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 	u32 type, u32 off, struct mdss_mdp_pipe *left_blend_pipe)
 {
@@ -609,6 +658,9 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 		return NULL;
 	}
 
+	if (pipe && mdss_mdp_panic_signal_supported(mdata, pipe))
+		mdss_mdp_pipe_panic_signal_ctrl(pipe, false);
+
 	if (pipe && mdss_mdp_pipe_is_sw_reset_available(mdata)) {
 		force_off_mask =
 			BIT(pipe->clk_ctrl.bit_off + CLK_FORCE_OFF_OFFSET);
@@ -633,6 +685,7 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 		is_realtime = !((mixer->ctl->intf_num == MDSS_MDP_NO_INTF)
 				|| mixer->rotator_mode);
 		mdss_mdp_qos_vbif_remapper_setup(mdata, pipe, is_realtime);
+		mdss_mdp_fixed_qos_arbiter_setup(mdata, pipe, is_realtime);
 	} else if (pipe_share) {
 		/*
 		 * when there is no dedicated wfd blk, DMA pipe can be
@@ -754,20 +807,24 @@ struct mdss_mdp_pipe *mdss_mdp_pipe_search(struct mdss_data_type *mdata,
 static void mdss_mdp_pipe_free(struct kref *kref)
 {
 	struct mdss_mdp_pipe *pipe;
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 
 	pipe = container_of(kref, struct mdss_mdp_pipe, kref);
 
 	pr_debug("ndx=%x pnum=%d\n", pipe->ndx, pipe->num);
 
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	if (pipe && mdss_mdp_panic_signal_supported(mdata, pipe))
+		mdss_mdp_pipe_panic_signal_ctrl(pipe, false);
+
 	if (pipe->play_cnt) {
-		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 		mdss_mdp_pipe_fetch_halt(pipe);
 		mdss_mdp_pipe_sspp_term(pipe);
 		mdss_mdp_smp_free(pipe);
-		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	} else {
 		mdss_mdp_smp_unreserve(pipe);
 	}
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 
 	pipe->flags = 0;
 	pipe->is_right_blend = false;
@@ -1031,7 +1088,8 @@ static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe,
 	u32 tmp_src_xy, tmp_src_size;
 	int ret = 0;
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
-	struct mdss_mdp_img_rect sci, dst, src;
+	struct mdss_rect sci, dst, src;
+	bool rotation = false;
 
 	pr_debug("pnum=%d wh=%dx%d src={%d,%d,%d,%d} dst={%d,%d,%d,%d}\n",
 			pipe->num, pipe->img_width, pipe->img_height,
@@ -1040,8 +1098,12 @@ static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe,
 
 	width = pipe->img_width;
 	height = pipe->img_height;
+
+	if (pipe->flags & MDP_SOURCE_ROTATED_90)
+		rotation = true;
+
 	mdss_mdp_get_plane_sizes(pipe->src_fmt->format, width, height,
-			&pipe->src_planes, pipe->bwc_mode);
+			&pipe->src_planes, pipe->bwc_mode, rotation);
 
 	if (data != NULL) {
 		ret = mdss_mdp_data_check(data, &pipe->src_planes);
@@ -1304,6 +1366,13 @@ static int mdss_mdp_pipe_solidfill_setup(struct mdss_mdp_pipe *pipe)
 		pipe->bg_color);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_UNPACK_PATTERN, unpack);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_ADDR_SW_STATUS, secure);
+	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_OP_MODE, 0);
+
+	if (pipe->type != MDSS_MDP_PIPE_TYPE_DMA) {
+		mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SCALE_CONFIG, 0);
+		if (pipe->type == MDSS_MDP_PIPE_TYPE_VIG)
+			mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_VIG_OP_MODE, 0);
+	}
 
 	return 0;
 }
@@ -1380,6 +1449,9 @@ int mdss_mdp_pipe_queue_data(struct mdss_mdp_pipe *pipe,
 		if (pipe->type == MDSS_MDP_PIPE_TYPE_VIG)
 			mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_VIG_OP_MODE,
 			opmode);
+
+		if (mdss_mdp_panic_signal_supported(mdata, pipe))
+			mdss_mdp_pipe_panic_signal_ctrl(pipe, true);
 	}
 
 	if ((pipe->flags & MDP_VPU_PIPE) && (src_data == NULL ||

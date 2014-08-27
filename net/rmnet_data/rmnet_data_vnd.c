@@ -541,10 +541,10 @@ int rmnet_vnd_init(void)
  *
  * Return:
  *      - 0 if successful
- *      - RMNET_CONFIG_BAD_ARGUMENTS if id is out of range or prefix is too long
- *      - RMNET_CONFIG_DEVICE_IN_USE if id already in use
- *      - RMNET_CONFIG_NOMEM if net_device allocation failed
- *      - RMNET_CONFIG_UNKNOWN_ERROR if register_netdevice() fails
+ *      - -EINVAL if id is out of range, or id already in use
+ *      - -EINVAL if net_device allocation failed
+ *      - -EINVAL if prefix does not fit in buffer
+ *      - return code of register_netdevice() on other errors
  */
 int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 			 const char *prefix)
@@ -553,14 +553,9 @@ int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 	char dev_prefix[IFNAMSIZ];
 	int p, rc = 0;
 
-	if (id < 0 || id > RMNET_DATA_MAX_VND) {
+	if (id < 0 || id >= RMNET_DATA_MAX_VND || rmnet_devices[id] != 0) {
 		*new_device = 0;
-		return RMNET_CONFIG_BAD_ARGUMENTS;
-	}
-
-	if (rmnet_devices[id] != 0) {
-		*new_device = 0;
-		return RMNET_CONFIG_DEVICE_IN_USE;
+		return -EINVAL;
 	}
 
 	if (!prefix)
@@ -570,8 +565,8 @@ int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 		p = scnprintf(dev_prefix, IFNAMSIZ, "%s%%d",
 			  prefix);
 	if (p >= (IFNAMSIZ-1)) {
-		LOGE("Specified prefix longer than IFNAMSIZ");
-		return RMNET_CONFIG_BAD_ARGUMENTS;
+		LOGE("Specified prefix (%d) longer than IFNAMSIZ", p);
+		return -EINVAL;
 	}
 
 	dev = alloc_netdev(sizeof(struct rmnet_vnd_private_s),
@@ -580,7 +575,7 @@ int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 	if (!dev) {
 		LOGE("Failed to to allocate netdev for id %d", id);
 		*new_device = 0;
-		return RMNET_CONFIG_NOMEM;
+		return -EINVAL;
 	}
 
 	rc = register_netdevice(dev);
@@ -588,7 +583,6 @@ int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 		LOGE("Failed to to register netdev [%s]", dev->name);
 		free_netdev(dev);
 		*new_device = 0;
-		return RMNET_CONFIG_UNKNOWN_ERROR;
 	} else {
 		rmnet_devices[id] = dev;
 		*new_device = dev;
@@ -617,32 +611,22 @@ int rmnet_vnd_create_dev(int id, struct net_device **new_device,
 int rmnet_vnd_free_dev(int id)
 {
 	struct rmnet_logical_ep_conf_s *epconfig_l;
-	struct net_device *dev;
 
-	rtnl_lock();
 	if ((id < 0) || (id >= RMNET_DATA_MAX_VND) || !rmnet_devices[id]) {
-		rtnl_unlock();
 		LOGM("Invalid id [%d]", id);
 		return RMNET_CONFIG_NO_SUCH_DEVICE;
 	}
 
 	epconfig_l = rmnet_vnd_get_le_config(rmnet_devices[id]);
-	if (epconfig_l && epconfig_l->refcount) {
-		rtnl_unlock();
-		return RMNET_CONFIG_DEVICE_IN_USE;
-	}
+		if (epconfig_l && epconfig_l->refcount)
+			return RMNET_CONFIG_DEVICE_IN_USE;
 
-	dev = rmnet_devices[id];
+	unregister_netdev(rmnet_devices[id]);
+	free_netdev(rmnet_devices[id]);
+	rtnl_lock();
 	rmnet_devices[id] = 0;
 	rtnl_unlock();
-
-	if (dev) {
-		unregister_netdev(dev);
-		free_netdev(dev);
-		return 0;
-	} else {
-		return RMNET_CONFIG_NO_SUCH_DEVICE;
-	}
+	return 0;
 }
 
 /**
@@ -1039,22 +1023,4 @@ fcdone:
 	read_unlock(&dev_conf->flow_map_lock);
 
 	return error;
-}
-
-/**
- * rmnet_vnd_get_by_id() - Get VND by array index ID
- * @id: Virtual network deice id [0:RMNET_DATA_MAX_VND]
- *
- * Return:
- *      - 0 if no device or ID out of range
- *      - otherwise return pointer to VND net_device struct
- */
-struct net_device *rmnet_vnd_get_by_id(int id)
-{
-	if (id < 0 || id >= RMNET_DATA_MAX_VND) {
-		pr_err("Bug; VND ID out of bounds");
-		BUG();
-		return 0;
-	}
-	return rmnet_devices[id];
 }

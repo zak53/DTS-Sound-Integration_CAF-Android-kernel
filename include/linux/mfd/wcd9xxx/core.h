@@ -44,6 +44,10 @@
 #define TAPAN_IS_1_0(ver) \
 	((ver == TAPAN_VERSION_1_0) ? 1 : 0)
 
+#define TOMBAK_VERSION_1_0	0
+#define TOMBAK_IS_1_0(ver) \
+	((ver == TOMBAK_VERSION_1_0) ? 1 : 0)
+
 enum wcd9xxx_slim_slave_addr_type {
 	WCD9XXX_SLIM_SLAVE_ADDR_TYPE_TABLA,
 	WCD9XXX_SLIM_SLAVE_ADDR_TYPE_TAIKO,
@@ -204,6 +208,7 @@ struct wcd9xxx {
 	struct wcd9xxx_ch *rx_chs;
 	struct wcd9xxx_ch *tx_chs;
 	u32 mclk_rate;
+	u16 use_pinctrl;
 
 	const struct wcd9xxx_codec_type *codec_type;
 };
@@ -212,13 +217,12 @@ int wcd9xxx_interface_reg_read(struct wcd9xxx *wcd9xxx, unsigned short reg);
 int wcd9xxx_interface_reg_write(struct wcd9xxx *wcd9xxx, unsigned short reg,
 		u8 val);
 int wcd9xxx_get_logical_addresses(u8 *pgd_la, u8 *inf_la);
-int wcd9xxx_slim_write_repeat(struct wcd9xxx *wcd9xxx, unsigned short reg,
-			     int bytes, void *src);
 
 #if defined(CONFIG_WCD9310_CODEC) || \
 	defined(CONFIG_WCD9304_CODEC) || \
 	defined(CONFIG_WCD9320_CODEC) || \
-	defined(CONFIG_WCD9306_CODEC)
+	defined(CONFIG_WCD9306_CODEC) || \
+	defined(CONFIG_SND_SOC_MSM8X16_WCD)
 int __init wcd9xxx_irq_of_init(struct device_node *node,
 			       struct device_node *parent);
 #else

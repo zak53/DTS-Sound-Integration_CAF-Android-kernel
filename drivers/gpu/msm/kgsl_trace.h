@@ -38,18 +38,18 @@ TRACE_EVENT(kgsl_issueibcmds,
 	TP_PROTO(struct kgsl_device *device,
 			int drawctxt_id,
 			struct kgsl_cmdbatch *cmdbatch,
-			unsigned int numibs,
 			int timestamp,
 			int flags,
 			int result,
 			unsigned int type),
 
-	TP_ARGS(device, drawctxt_id, cmdbatch, numibs, timestamp,
-		flags, result, type),
+	TP_ARGS(device, drawctxt_id, cmdbatch, timestamp, flags,
+		result, type),
 
 	TP_STRUCT__entry(
 		__string(device_name, device->name)
 		__field(unsigned int, drawctxt_id)
+		__field(unsigned int, ibdesc_addr)
 		__field(unsigned int, numibs)
 		__field(unsigned int, timestamp)
 		__field(unsigned int, flags)
@@ -60,7 +60,8 @@ TRACE_EVENT(kgsl_issueibcmds,
 	TP_fast_assign(
 		__assign_str(device_name, device->name);
 		__entry->drawctxt_id = drawctxt_id;
-		__entry->numibs = numibs;
+		__entry->ibdesc_addr = cmdbatch->ibdesc[0].gpuaddr;
+		__entry->numibs = cmdbatch->ibcount;
 		__entry->timestamp = timestamp;
 		__entry->flags = flags;
 		__entry->result = result;
@@ -68,20 +69,18 @@ TRACE_EVENT(kgsl_issueibcmds,
 	),
 
 	TP_printk(
-		"d_name=%s ctx=%u ib=0x0 numibs=%u ts=%u "
+		"d_name=%s ctx=%u ib=0x%X numibs=%u ts=%u "
 		"flags=0x%x(%s) result=%d type=%s",
 		__get_str(device_name),
 		__entry->drawctxt_id,
+		__entry->ibdesc_addr,
 		__entry->numibs,
 		__entry->timestamp,
 		__entry->flags,
 		__entry->flags ? __print_flags(__entry->flags, "|",
-			{ KGSL_CMDBATCH_SUBMIT_IB_LIST, "IB_LIST" },
-			{ KGSL_CMDBATCH_CTX_SWITCH, "CTX_SWITCH" },
-			{ KGSL_CMDBATCH_SYNC, "SYNC" },
-			{ KGSL_CMDBATCH_END_OF_FRAME, "EOF" },
-			{ KGSL_CMDBATCH_PWR_CONSTRAINT, "PWR_CONSTRAINT" },
-			{ KGSL_CMDBATCH_MEMLIST, "MEMLIST" })
+			{ KGSL_CONTEXT_SAVE_GMEM, "SAVE_GMEM" },
+			{ KGSL_CONTEXT_SUBMIT_IB_LIST, "IB_LIST" },
+			{ KGSL_CONTEXT_CTX_SWITCH, "CTX_SWITCH" })
 			: "None",
 		__entry->result,
 		__print_symbolic(__entry->drawctxt_type,
@@ -691,12 +690,9 @@ TRACE_EVENT(kgsl_context_create,
 		__get_str(device_name), __entry->id, __entry->flags,
 		__entry->flags ? __print_flags(__entry->flags, "|",
 			{ KGSL_CONTEXT_NO_GMEM_ALLOC , "NO_GMEM_ALLOC" },
-			{ KGSL_CONTEXT_CTX_SWITCH, "CTX_SWITCH" },
 			{ KGSL_CONTEXT_PREAMBLE, "PREAMBLE" },
-			{ KGSL_CONTEXT_PER_CONTEXT_TS, "PER_CONTEXT_TS" },
-			{ KGSL_CONTEXT_USER_GENERATED_TS, "USER_GENERATED_TS" },
-			{ KGSL_CONTEXT_NO_FAULT_TOLERANCE, "NO_GFT" },
-			{ KGSL_CONTEXT_PWR_CONSTRAINT, "PWR_CONSTRAINT" })
+			{ KGSL_CONTEXT_TRASH_STATE, "TRASH_STATE" },
+			{ KGSL_CONTEXT_PER_CONTEXT_TS, "PER_CONTEXT_TS" })
 			: "None",
 		(__entry->flags & KGSL_CONTEXT_PRIORITY_MASK) >>
 			KGSL_CONTEXT_PRIORITY_SHIFT
@@ -745,66 +741,6 @@ TRACE_EVENT(kgsl_context_destroy,
 	TP_printk(
 		"d_name=%s ctx=%u",
 		__get_str(device_name), __entry->id
-	)
-);
-
-TRACE_EVENT(kgsl_user_pwrlevel_constraint,
-
-	TP_PROTO(struct kgsl_device *device, unsigned int id, unsigned int type,
-		unsigned int sub_type),
-
-	TP_ARGS(device, id, type, sub_type),
-
-	TP_STRUCT__entry(
-		__string(device_name, device->name)
-		__field(unsigned int, id)
-		__field(unsigned int, type)
-		__field(unsigned int, sub_type)
-	),
-
-	TP_fast_assign(
-		__assign_str(device_name, device->name);
-		__entry->id = id;
-		__entry->type = type;
-		__entry->sub_type = sub_type;
-	),
-
-	TP_printk(
-		"d_name=%s ctx=%u constraint_type=%s constraint_subtype=%s",
-		__get_str(device_name), __entry->id,
-		__print_symbolic(__entry->type, KGSL_CONSTRAINT_TYPES),
-		__print_symbolic(__entry->sub_type,
-		KGSL_CONSTRAINT_PWRLEVEL_SUBTYPES)
-	)
-);
-
-TRACE_EVENT(kgsl_constraint,
-
-	TP_PROTO(struct kgsl_device *device, unsigned int type,
-		unsigned int value, unsigned int on),
-
-	TP_ARGS(device, type, value, on),
-
-	TP_STRUCT__entry(
-		__string(device_name, device->name)
-		__field(unsigned int, type)
-		__field(unsigned int, value)
-		__field(unsigned int, on)
-	),
-
-	TP_fast_assign(
-		__assign_str(device_name, device->name);
-		__entry->type = type;
-		__entry->value = value;
-		__entry->on = on;
-	),
-
-	TP_printk(
-		"d_name=%s constraint_type=%s constraint_value=%u status=%s",
-		__get_str(device_name),
-		__print_symbolic(__entry->type, KGSL_CONSTRAINT_TYPES),
-		__entry->value,
-		__entry->on ? "ON" : "OFF"
 	)
 );
 

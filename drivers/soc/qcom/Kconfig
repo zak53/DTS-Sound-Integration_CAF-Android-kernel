@@ -2,17 +2,6 @@
 
 if ARCH_MSM
 
-config CP_ACCESS64
-	depends on ARM64
-        tristate "CP 64-bit register access tool"
-        help
-          Provide support for AARCH64 CP register access using /sys
-          interface. Read and write to CP registers from userspace
-          through sysfs interface. A sys file (cp_rw) will be created under
-          /sys/devices/cpaccess/cpaccess0.
-
-          If unsure, say N.
-
 config MSM_BAM_DMUX
 	bool "BAM Data Mux Driver"
 	depends on SPS
@@ -424,6 +413,14 @@ config MAXIMUM_CURRENT_THROTTLING
 	  The maximum current throttling driver enables application to
 	  turn on/off CPU based current throttling by setting the
 	  credit/upper limit in the CPU registers.
+
+config MSM_CPU_PWR_CTL
+	bool "Cpu subsystem power control"
+	depends on SMP && (ARM || ARM64)
+	default y
+	help
+	  Provides routines to power on cpu rails and l2 cache
+	  controller during coldboot.
 
 source "drivers/soc/qcom/memshare/Kconfig"
 

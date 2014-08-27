@@ -38,7 +38,7 @@
 #define SCM_IO_DISABLE_PMIC_ARBITER	1
 #define SCM_WDOG_DEBUG_BOOT_PART	0x9
 #define SCM_DLOAD_MODE			0X10
-#define SCM_EDLOAD_MODE			0X02
+#define SCM_EDLOAD_MODE			0X01
 #define SCM_DLOAD_CMD			0x10
 
 
@@ -209,8 +209,11 @@ static void msm_restart_prepare(const char *cmd)
 			__raw_writel(0x77665503, restart_reason);
 		} else if (!strncmp(cmd, "oem-", 4)) {
 			unsigned long code;
-			code = kstrtoul(cmd + 4, 16, NULL) & 0xff;
-			__raw_writel(0x6f656d00 | code, restart_reason);
+			int ret;
+			ret = kstrtoul(cmd + 4, 16, &code);
+			if (!ret)
+				__raw_writel(0x6f656d00 | (code & 0xff),
+					     restart_reason);
 		} else if (!strncmp(cmd, "edl", 3)) {
 			enable_emergency_dload_mode();
 		} else {

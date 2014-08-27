@@ -24,7 +24,6 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
-#include <linux/uaccess.h>
 
 #include <linux/irqchip/arm-gic.h>
 

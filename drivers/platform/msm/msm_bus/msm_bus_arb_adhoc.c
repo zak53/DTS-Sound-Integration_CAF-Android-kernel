@@ -229,6 +229,10 @@ static int prune_path(struct list_head *route_list, int dest, int src)
 			kfree(del_node);
 		}
 	}
+	search_node = list_entry(route_list->next,
+				struct bus_search_type , link);
+	kfree(search_node);
+
 
 exit_prune_path:
 	return lnode_hop;
@@ -693,7 +697,7 @@ static int update_request_adhoc(uint32_t cl, unsigned int index)
 	int lnode, src, curr, dest;
 	uint64_t req_clk, req_bw, curr_clk, curr_bw;
 	struct msm_bus_client *client;
-	const char *test_cl = "test-client";
+	const char *test_cl = "Null";
 	bool log_transaction = false;
 
 	mutex_lock(&msm_bus_adhoc_lock);

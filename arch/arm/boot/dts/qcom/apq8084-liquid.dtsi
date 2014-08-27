@@ -155,17 +155,14 @@
 	qcom,mdss-dsi-bl-pmic-pwm-frequency = <50>;
 	qcom,mdss-dsi-bl-pmic-bank-select = <2>;
 	qcom,mdss-dsi-pwm-gpio = <&pma8084_gpios 7 0>;
-	qcom,cont-splash-enabled;
 };
 
 &dsi_dual_jdi_cmd_1 {
-	qcom,cont-splash-enabled;
 };
 
 
 &mdss_mdp {
 	qcom,mdss-pref-prim-intf = "dsi";
-	vdd-cx-supply = <&pma8084_s2_corner>;
 };
 
 &mdss_hdmi_tx {

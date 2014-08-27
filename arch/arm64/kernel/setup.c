@@ -68,6 +68,9 @@ EXPORT_SYMBOL(boot_reason);
 unsigned int cold_boot;
 EXPORT_SYMBOL(cold_boot);
 
+char* (*arch_read_hardware_id)(void);
+EXPORT_SYMBOL(arch_read_hardware_id);
+
 #ifdef CONFIG_COMPAT
 #define COMPAT_ELF_HWCAP_DEFAULT	\
 				(COMPAT_HWCAP_HALF|COMPAT_HWCAP_THUMB|\
@@ -113,16 +116,6 @@ void __init early_print(const char *str, ...)
 	va_end(ap);
 
 	printk("%s", buf);
-}
-
-void __init smp_setup_processor_id(void)
-{
-	/*
-	 * clear __my_cpu_offset on boot CPU to avoid hang caused by
-	 * using percpu variable early, for example, lockdep will
-	 * access percpu variable inside lock_release
-	 */
-	set_my_cpu_offset(0);
 }
 
 bool arch_match_cpu_phys_id(int cpu, u64 phys_id)
@@ -202,8 +195,12 @@ static void __init smp_build_mpidr_hash(void)
 static void __init setup_processor(void)
 {
 	struct cpu_info *cpu_info;
-	u64 features, block;
 
+	/*
+	 * locate processor in the list of supported processor
+	 * types.  The linker builds this table for us from the
+	 * entries in arch/arm/mm/proc.S
+	 */
 	cpu_info = lookup_processor_type(read_cpuid_id());
 	if (!cpu_info) {
 		printk("CPU configuration botched (ID %08x), unable to continue.\n",
@@ -218,37 +215,6 @@ static void __init setup_processor(void)
 
 	sprintf(init_utsname()->machine, ELF_PLATFORM);
 	elf_hwcap = 0;
-
-	/*
-	 * ID_AA64ISAR0_EL1 contains 4-bit wide signed feature blocks.
-	 * The blocks we test below represent incremental functionality
-	 * for non-negative values. Negative values are reserved.
-	 */
-	features = read_cpuid(ID_AA64ISAR0_EL1);
-	block = (features >> 4) & 0xf;
-	if (!(block & 0x8)) {
-		switch (block) {
-		default:
-		case 2:
-			elf_hwcap |= HWCAP_PMULL;
-		case 1:
-			elf_hwcap |= HWCAP_AES;
-		case 0:
-			break;
-		}
-	}
-
-	block = (features >> 8) & 0xf;
-	if (block && !(block & 0x8))
-		elf_hwcap |= HWCAP_SHA1;
-
-	block = (features >> 12) & 0xf;
-	if (block && !(block & 0x8))
-		elf_hwcap |= HWCAP_SHA2;
-
-	block = (features >> 16) & 0xf;
-	if (block && !(block & 0x8))
-		elf_hwcap |= HWCAP_CRC32;
 }
 
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
@@ -389,11 +355,6 @@ static const char *hwcap_str[] = {
 	"fp",
 	"asimd",
 	"evtstrm",
-	"aes",
-	"pmull",
-	"sha1",
-	"sha2",
-	"crc32",
 	NULL
 };
 
@@ -430,7 +391,10 @@ static int c_show(struct seq_file *m, void *v)
 
 	seq_puts(m, "\n");
 
-	seq_printf(m, "Hardware\t: %s\n", machine_name);
+	if (!arch_read_hardware_id)
+		seq_printf(m, "Hardware\t: %s\n", machine_name);
+	else
+		seq_printf(m, "Hardware\t: %s\n", arch_read_hardware_id());
 
 	return 0;
 }

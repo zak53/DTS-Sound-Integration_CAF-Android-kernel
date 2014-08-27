@@ -778,8 +778,6 @@ static DEFINE_CLK_BRANCH_VOTER(cxo_otg_clk, &xo_clk_src.c);
 static DEFINE_CLK_BRANCH_VOTER(cxo_dwc3_clk, &xo_clk_src.c);
 static DEFINE_CLK_BRANCH_VOTER(cxo_lpm_clk, &xo_clk_src.c);
 static DEFINE_CLK_BRANCH_VOTER(cxo_pil_lpass_clk, &xo_clk_src.c);
-static struct clk_voter branch_ce1_clk_src;
-static struct clk_voter branch_ce2_clk_src;
 
 struct clk_ops clk_ops_vote_lpass;
 
@@ -2496,7 +2494,7 @@ static struct local_vote_clk gcc_ce1_clk = {
 	.en_mask = BIT(5),
 	.base = &virt_bases[GCC_BASE],
 	.c = {
-		.parent = &branch_ce1_clk_src.c,
+		.parent = &ce1_clk_src.c,
 		.dbg_name = "gcc_ce1_clk",
 		.ops = &clk_ops_vote,
 		CLK_INIT(gcc_ce1_clk.c),
@@ -2533,7 +2531,7 @@ static struct local_vote_clk gcc_ce2_clk = {
 	.en_mask = BIT(2),
 	.base = &virt_bases[GCC_BASE],
 	.c = {
-		.parent = &branch_ce2_clk_src.c,
+		.parent = &ce2_clk_src.c,
 		.dbg_name = "gcc_ce2_clk",
 		.ops = &clk_ops_vote,
 		CLK_INIT(gcc_ce2_clk.c),
@@ -3473,6 +3471,11 @@ static struct pll_clk mmpll4_clk_src = {
 };
 
 static struct clk_freq_tbl ftbl_mmss_axi_clk[] = {
+	F_MM( 19200000,    xo,     1,   0,   0),
+	F_MM( 37500000,  gpll0,    16,   0,   0),
+	F_MM( 50000000,  gpll0,    12,   0,   0),
+	F_MM( 75000000,  gpll0,     8,   0,   0),
+	F_MM(100000000,  gpll0,     6,   0,   0),
 	F_MM(150000000,  gpll0,     4,   0,   0),
 	F_MM(333430000, mmpll1,   3.5,   0,   0),
 	F_MM(400000000, mmpll0,     2,   0,   0),
@@ -5309,15 +5312,7 @@ static struct gate_clk sata_phy_ldo = {
 	},
 };
 
-static DEFINE_CLK_VOTER(scm_ce1_clk_src,     &ce1_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(qseecom_ce1_clk_src, &ce1_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(mcd_ce1_clk_src,     &ce1_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(branch_ce1_clk_src,  &ce1_clk_src.c,  50000000);
-
-static DEFINE_CLK_VOTER(qseecom_ce2_clk_src, &ce2_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(qcedev_ce2_clk_src,  &ce2_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(qcrypto_ce2_clk_src, &ce2_clk_src.c, 100000000);
-static DEFINE_CLK_VOTER(branch_ce2_clk_src,  &ce2_clk_src.c,  50000000);
+static DEFINE_CLK_VOTER(scm_ce1_clk_src, &ce1_clk_src.c, 100000000);
 
 static DEFINE_CLK_MEASURE(l2_m_clk);
 static DEFINE_CLK_MEASURE(krait0_m_clk);
@@ -5977,13 +5972,11 @@ static struct clk_lookup apq_clocks_8084[] = {
 	CLK_LOOKUP("",	gcc_ce1_axi_clk.c,	""),
 	CLK_LOOKUP("",	ce1_clk_src.c,	""),
 	CLK_LOOKUP("",	gcc_ce1_clk.c,	""),
-	CLK_LOOKUP("",  branch_ce1_clk_src.c, ""),
 
 	CLK_LOOKUP("",	gcc_ce2_ahb_clk.c,	""),
 	CLK_LOOKUP("",	gcc_ce2_axi_clk.c,	""),
 	CLK_LOOKUP("",	ce2_clk_src.c,	""),
 	CLK_LOOKUP("",	gcc_ce2_clk.c,	""),
-	CLK_LOOKUP("",  branch_ce2_clk_src.c, ""),
 
 	CLK_LOOKUP("",	gcc_ce3_ahb_clk.c,	""),
 	CLK_LOOKUP("",	gcc_ce3_axi_clk.c,	""),
@@ -6012,31 +6005,29 @@ static struct clk_lookup apq_clocks_8084[] = {
 	CLK_LOOKUP("core_clk",     gcc_ce1_clk.c,         "qseecom"),
 	CLK_LOOKUP("iface_clk",    gcc_ce1_ahb_clk.c,     "qseecom"),
 	CLK_LOOKUP("bus_clk",      gcc_ce1_axi_clk.c,     "qseecom"),
-	CLK_LOOKUP("core_clk_src", qseecom_ce1_clk_src.c, "qseecom"),
+	CLK_LOOKUP("core_clk_src", ce1_clk_src.c,         "qseecom"),
 
 	CLK_LOOKUP("ce_drv_core_clk",     gcc_ce2_clk.c,         "qseecom"),
 	CLK_LOOKUP("ce_drv_iface_clk",    gcc_ce2_ahb_clk.c,     "qseecom"),
 	CLK_LOOKUP("ce_drv_bus_clk",      gcc_ce2_axi_clk.c,     "qseecom"),
-	CLK_LOOKUP("ce_drv_core_clk_src", qseecom_ce2_clk_src.c, "qseecom"),
+	CLK_LOOKUP("ce_drv_core_clk_src", ce2_clk_src.c,         "qseecom"),
 
 	/* GUD Clocks */
 	CLK_LOOKUP("core_clk",     gcc_ce1_clk.c,     "mcd"),
 	CLK_LOOKUP("iface_clk",    gcc_ce1_ahb_clk.c, "mcd"),
 	CLK_LOOKUP("bus_clk",      gcc_ce1_axi_clk.c, "mcd"),
-	CLK_LOOKUP("core_clk_src", mcd_ce1_clk_src.c, "mcd"),
+	CLK_LOOKUP("core_clk_src", ce1_clk_src.c,     "mcd"),
 
 	/* CRYPTO driver clocks */
 	CLK_LOOKUP("core_clk",     gcc_ce2_clk.c,     "fd440000.qcom,qcedev"),
 	CLK_LOOKUP("iface_clk",    gcc_ce2_ahb_clk.c, "fd440000.qcom,qcedev"),
 	CLK_LOOKUP("bus_clk",      gcc_ce2_axi_clk.c, "fd440000.qcom,qcedev"),
-	CLK_LOOKUP("core_clk_src", qcedev_ce2_clk_src.c,
-						"fd440000.qcom,qcedev"),
+	CLK_LOOKUP("core_clk_src", ce2_clk_src.c,     "fd440000.qcom,qcedev"),
 
 	CLK_LOOKUP("core_clk",     gcc_ce2_clk.c,     "fd440000.qcom,qcrypto"),
 	CLK_LOOKUP("iface_clk",    gcc_ce2_ahb_clk.c, "fd440000.qcom,qcrypto"),
 	CLK_LOOKUP("bus_clk",      gcc_ce2_axi_clk.c, "fd440000.qcom,qcrypto"),
-	CLK_LOOKUP("core_clk_src", qcrypto_ce2_clk_src.c,
-						"fd440000.qcom,qcrypto"),
+	CLK_LOOKUP("core_clk_src", ce2_clk_src.c,     "fd440000.qcom,qcrypto"),
 
 	/* SATA clocks */
 	CLK_LOOKUP("core_clk", gcc_sata_axi_clk.c,             "fc580000.sata"),
@@ -6099,7 +6090,6 @@ static struct clk_lookup apq_clocks_8084[] = {
 	CLK_LOOKUP("core_clk", gcc_usb30_master_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("iface_clk", gcc_sys_noc_usb3_axi_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("iface_clk", gcc_sys_noc_usb3_axi_clk.c, "msm_usb3"),
-	CLK_LOOKUP("iface_clk", gcc_sys_noc_usb3_sec_axi_clk.c, "msm_usb3_1"),
 	CLK_LOOKUP("sleep_clk", gcc_usb30_sleep_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("sleep_a_clk", gcc_usb2a_phy_sleep_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("utmi_clk",   gcc_usb30_mock_utmi_clk.c, "f9200000.ssusb"),
@@ -6493,15 +6483,13 @@ static struct clk_lookup apq_clocks_8084[] = {
 	CLK_LOOKUP("iface_clk", camss_vfe_vfe_ahb_clk.c,
 						"fda04000.qcom,cpp"),
 	/* Camera Sensor Clocks */
-	CLK_LOOKUP("cam_src_clk", mclk0_clk_src.c, "20.qcom,eeprom"),
 	CLK_LOOKUP("cam_src_clk", mclk0_clk_src.c, "0.qcom,camera"),
-	CLK_LOOKUP("cam_src_clk",	mclk1_clk_src.c, "1.qcom,camera"),
-	CLK_LOOKUP("cam_src_clk",	mclk2_clk_src.c, "2.qcom,camera"),
+	CLK_LOOKUP("",	mclk1_clk_src.c,	""),
+	CLK_LOOKUP("cam_src_clk",	mclk2_clk_src.c, "1.qcom,camera"),
 	CLK_LOOKUP("",	mclk3_clk_src.c,	""),
-	CLK_LOOKUP("cam_clk", camss_mclk0_clk.c, "20.qcom,eeprom"),
 	CLK_LOOKUP("cam_clk", camss_mclk0_clk.c, "0.qcom,camera"),
-	CLK_LOOKUP("cam_clk",	camss_mclk1_clk.c, "1.qcom,camera"),
-	CLK_LOOKUP("cam_clk", camss_mclk2_clk.c, "2.qcom,camera"),
+	CLK_LOOKUP("",	camss_mclk1_clk.c,	""),
+	CLK_LOOKUP("cam_clk", camss_mclk2_clk.c, "1.qcom,camera"),
 	CLK_LOOKUP("",	camss_mclk3_clk.c,	""),
 
 	CLK_LOOKUP("iface_clk", mdss_ahb_clk.c, "fd900000.qcom,mdss_mdp"),

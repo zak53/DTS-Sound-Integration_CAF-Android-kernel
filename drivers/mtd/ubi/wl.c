@@ -1,8 +1,5 @@
 /*
  * Copyright (c) International Business Machines Corp., 2006
- * Copyright (c) 2014, Linux Foundation. All rights reserved.
- * Linux Foundation chooses to take subject only to the GPLv2
- * license terms, and distributes only under these terms.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -105,7 +102,6 @@
 #include <linux/crc32.h>
 #include <linux/freezer.h>
 #include <linux/kthread.h>
-#include <linux/time.h>
 #include "ubi.h"
 
 /* Number of physical eraseblocks reserved for wear-leveling purposes */
@@ -291,14 +287,14 @@ static int produce_free_peb(struct ubi_device *ubi)
 }
 
 /**
- * ubi_in_wl_tree - check if wear-leveling entry is present in a WL RB-tree.
+ * in_wl_tree - check if wear-leveling entry is present in a WL RB-tree.
  * @e: the wear-leveling entry to check
  * @root: the root of the tree
  *
  * This function returns non-zero if @e is in the @root RB-tree and zero if it
  * is not.
  */
-int ubi_in_wl_tree(struct ubi_wl_entry *e, struct rb_root *root)
+static int in_wl_tree(struct ubi_wl_entry *e, struct rb_root *root)
 {
 	struct rb_node *p;
 
@@ -449,7 +445,7 @@ static struct ubi_wl_entry *find_anchor_wl_entry(struct rb_root *root)
 	return victim;
 }
 
-static int anchor_pebs_avalible(struct rb_root *root, int rd_threshold)
+static int anchor_pebs_avalible(struct rb_root *root)
 {
 	struct rb_node *p;
 	struct ubi_wl_entry *e;
@@ -560,12 +556,6 @@ static void return_unused_pool_pebs(struct ubi_device *ubi,
 
 	for (i = pool->used; i < pool->size; i++) {
 		e = ubi->lookuptbl[pool->pebs[i]];
-		/* If given PEB pending to be scrubbed - remove it */
-		if (ubi_in_wl_tree(e, &ubi->scrub)) {
-			ubi_err("PEB %d was pending scrubb", e->pnum);
-			self_check_in_wl_tree(ubi, e, &ubi->scrub);
-			rb_erase(&e->u.rb, &ubi->scrub);
-		}
 		wl_tree_add(e, &ubi->free);
 		ubi->free_count++;
 	}
@@ -605,28 +595,10 @@ static void refill_wl_pool(struct ubi_device *ubi)
 static void refill_wl_user_pool(struct ubi_device *ubi)
 {
 	struct ubi_fm_pool *pool = &ubi->fm_pool;
-	int err;
 
 	return_unused_pool_pebs(ubi, pool);
 
 	for (pool->size = 0; pool->size < pool->max_size; pool->size++) {
-retry:
-		if (!ubi->free.rb_node ||
-		   (ubi->free_count - ubi->beb_rsvd_pebs < 1)) {
-			/* There are no avaliable pebs. Try to free
-			 * PEB by means of synchronous execution of
-			 * pending works.
-			 */
-			if (ubi->works_count == 0)
-				break;
-			spin_unlock(&ubi->wl_lock);
-			err = do_work(ubi);
-			spin_lock(&ubi->wl_lock);
-			if (err < 0)
-				break;
-			goto retry;
-		}
-
 		pool->pebs[pool->size] = __wl_get_peb(ubi);
 		if (pool->pebs[pool->size] < 0)
 			break;
@@ -699,8 +671,6 @@ static struct ubi_wl_entry *get_peb_for_wl(struct ubi_device *ubi)
 
 	e = find_wl_entry(ubi, &ubi->free, WL_FREE_MAX_DIFF);
 	self_check_in_wl_tree(ubi, e, &ubi->free);
-	ubi->free_count--;
-	ubi_assert(ubi->free_count >= 0);
 	rb_erase(&e->u.rb, &ubi->free);
 
 	return e;
@@ -767,7 +737,6 @@ static int sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
 	int err;
 	struct ubi_ec_hdr *ec_hdr;
 	unsigned long long ec = e->ec;
-	struct timeval tv;
 
 	dbg_wl("erase PEB %d, old EC %llu", e->pnum, ec);
 
@@ -799,16 +768,11 @@ static int sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
 
 	ec_hdr->ec = cpu_to_be64(ec);
 
-	do_gettimeofday(&tv);
-	/* The last erase time resolution is in days */
-	ec_hdr->last_erase_time = cpu_to_be64(tv.tv_sec / NUM_SEC_IN_DAY);
 	err = ubi_io_write_ec_hdr(ubi, e->pnum, ec_hdr);
 	if (err)
 		goto out_free;
 
 	e->ec = ec;
-	e->last_erase_time = tv.tv_sec / NUM_SEC_IN_DAY;
-	e->rc = 0;
 	spin_lock(&ubi->wl_lock);
 	if (e->ec > ubi->max_ec)
 		ubi->max_ec = e->ec;
@@ -943,13 +907,6 @@ static int schedule_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
 	wl_wrk->lnum = lnum;
 	wl_wrk->torture = torture;
 
-	/* If given PEB pending to be scrubbed - remove it */
-	if (ubi_in_wl_tree(e, &ubi->scrub)) {
-		self_check_in_wl_tree(ubi, e, &ubi->scrub);
-		rb_erase(&e->u.rb, &ubi->scrub);
-		ubi_msg("PEB %d was pending scrubb",
-				e->pnum);
-	}
 	schedule_ubi_work(ubi, wl_wrk);
 	return 0;
 }
@@ -978,14 +935,6 @@ static int do_sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
 	wl_wrk->vol_id = vol_id;
 	wl_wrk->lnum = lnum;
 	wl_wrk->torture = torture;
-
-	/* If given PEB pending to be scrubbed - remove it */
-	if (ubi_in_wl_tree(e, &ubi->scrub)) {
-		self_check_in_wl_tree(ubi, e, &ubi->scrub);
-		rb_erase(&e->u.rb, &ubi->scrub);
-		ubi_msg("PEB %d was pending scrubb",
-				e->pnum);
-	}
 
 	return erase_worker(ubi, wl_wrk, 0);
 }
@@ -1025,8 +974,6 @@ int ubi_wl_put_fm_peb(struct ubi_device *ubi, struct ubi_wl_entry *fm_e,
 		ubi->lookuptbl[pnum] = e;
 	} else {
 		e->ec = fm_e->ec;
-		e->rc = fm_e->rc;
-		e->last_erase_time = fm_e->last_erase_time;
 		kfree(fm_e);
 	}
 
@@ -1091,7 +1038,7 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
 #ifdef CONFIG_MTD_UBI_FASTMAP
 	/* Check whether we need to produce an anchor PEB */
 	if (!anchor)
-		anchor = !anchor_pebs_avalible(&ubi->free, ubi->rd_threshold);
+		anchor = !anchor_pebs_avalible(&ubi->free);
 
 	if (anchor) {
 		e1 = find_anchor_wl_entry(&ubi->used);
@@ -1124,7 +1071,6 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
 
 			/* Give the unused PEB back */
 			wl_tree_add(e2, &ubi->free);
-			ubi->free_count++;
 			goto out_cancel;
 		}
 		self_check_in_wl_tree(ubi, e1, &ubi->used);
@@ -1646,15 +1592,13 @@ retry:
 		spin_unlock(&ubi->wl_lock);
 		return 0;
 	} else {
-		if (ubi_in_wl_tree(e, &ubi->used)) {
+		if (in_wl_tree(e, &ubi->used)) {
 			self_check_in_wl_tree(ubi, e, &ubi->used);
 			rb_erase(&e->u.rb, &ubi->used);
-		} else if (ubi_in_wl_tree(e, &ubi->scrub)) {
+		} else if (in_wl_tree(e, &ubi->scrub)) {
 			self_check_in_wl_tree(ubi, e, &ubi->scrub);
 			rb_erase(&e->u.rb, &ubi->scrub);
-			ubi_msg("PEB %d was pending scrubb",
-				e->pnum);
-		} else if (ubi_in_wl_tree(e, &ubi->erroneous)) {
+		} else if (in_wl_tree(e, &ubi->erroneous)) {
 			self_check_in_wl_tree(ubi, e, &ubi->erroneous);
 			rb_erase(&e->u.rb, &ubi->erroneous);
 			ubi->erroneous_peb_count -= 1;
@@ -1697,11 +1641,13 @@ int ubi_wl_scrub_peb(struct ubi_device *ubi, int pnum)
 {
 	struct ubi_wl_entry *e;
 
+	ubi_msg("schedule PEB %d for scrubbing", pnum);
+
 retry:
 	spin_lock(&ubi->wl_lock);
 	e = ubi->lookuptbl[pnum];
-	if (e == ubi->move_from || ubi_in_wl_tree(e, &ubi->scrub) ||
-				   ubi_in_wl_tree(e, &ubi->erroneous)) {
+	if (e == ubi->move_from || in_wl_tree(e, &ubi->scrub) ||
+				   in_wl_tree(e, &ubi->erroneous)) {
 		spin_unlock(&ubi->wl_lock);
 		return 0;
 	}
@@ -1719,7 +1665,7 @@ retry:
 		goto retry;
 	}
 
-	if (ubi_in_wl_tree(e, &ubi->used)) {
+	if (in_wl_tree(e, &ubi->used)) {
 		self_check_in_wl_tree(ubi, e, &ubi->used);
 		rb_erase(&e->u.rb, &ubi->used);
 	} else {
@@ -1734,7 +1680,6 @@ retry:
 		}
 	}
 
-	ubi_msg("schedule PEB %d for scrubbing", pnum);
 	wl_tree_add(e, &ubi->scrub);
 	spin_unlock(&ubi->wl_lock);
 
@@ -1928,9 +1873,7 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 	struct ubi_ainf_volume *av;
 	struct ubi_ainf_peb *aeb, *tmp;
 	struct ubi_wl_entry *e;
-	struct timeval tv;
 
-	do_gettimeofday(&tv);
 	ubi->used = ubi->erroneous = ubi->free = ubi->scrub = RB_ROOT;
 	spin_lock_init(&ubi->wl_lock);
 	mutex_init(&ubi->move_mutex);
@@ -1952,9 +1895,6 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 		INIT_LIST_HEAD(&ubi->pq[i]);
 	ubi->pq_head = 0;
 
-	ubi->rd_threshold = UBI_RD_THRESHOLD;
-	ubi->dt_threshold = UBI_DT_THRESHOLD;
-
 	list_for_each_entry_safe(aeb, tmp, &ai->erase, u.list) {
 		cond_resched();
 
@@ -1964,19 +1904,6 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 
 		e->pnum = aeb->pnum;
 		e->ec = aeb->ec;
-		e->last_erase_time = aeb->last_erase_time;
-		e->rc = aeb->rc;
-		if (!ubi->fm) {
-			if (e->rc < UBI_MAX_READCOUNTER) {
-				e->rc++;
-			} else {
-				ubi_err("read counter overflow at PEB %d, RC %d",
-					e->pnum, e->rc);
-				kmem_cache_free(ubi_wl_entry_slab, e);
-				goto out_free;
-			}
-
-		}
 		ubi_assert(!ubi_is_fm_block(ubi, e->pnum));
 		ubi->lookuptbl[e->pnum] = e;
 		if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0)) {
@@ -1997,33 +1924,11 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 
 		e->pnum = aeb->pnum;
 		e->ec = aeb->ec;
-		e->rc = aeb->rc;
-		if (!ubi->fm) {
-			if (e->rc < UBI_MAX_READCOUNTER) {
-				e->rc++;
-			} else {
-				ubi_err("rc overflow at PEB %d, RC %d",
-						e->pnum, e->rc);
-				kmem_cache_free(ubi_wl_entry_slab, e);
-				goto out_free;
-			}
-
-		}
-		e->last_erase_time = aeb->last_erase_time;
 		ubi_assert(e->ec >= 0);
 		ubi_assert(!ubi_is_fm_block(ubi, e->pnum));
 
-		/* Check last erase timestamp (in days) */
-		if (e->last_erase_time + ubi->dt_threshold <
-			(tv.tv_sec / NUM_SEC_IN_DAY)) {
-			if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0)) {
-				kmem_cache_free(ubi_wl_entry_slab, e);
-				goto out_free;
-			}
-		} else {
-			wl_tree_add(e, &ubi->free);
-			ubi->free_count++;
-		}
+		wl_tree_add(e, &ubi->free);
+		ubi->free_count++;
 
 		ubi->lookuptbl[e->pnum] = e;
 
@@ -2040,31 +1945,8 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 
 			e->pnum = aeb->pnum;
 			e->ec = aeb->ec;
-			e->rc = aeb->rc;
-			if (!ubi->fm) {
-				if (e->rc < UBI_MAX_READCOUNTER) {
-					e->rc++;
-				} else {
-					ubi_err("rc overflow at PEB %d, RC %d",
-							e->pnum, e->rc);
-					kmem_cache_free(ubi_wl_entry_slab, e);
-					goto out_free;
-				}
-			}
-			e->last_erase_time = aeb->last_erase_time;
 			ubi->lookuptbl[e->pnum] = e;
 
-			/*
-			 * Verify last erase timestamp
-			 * (in days) and read counter
-			 */
-			if (e->last_erase_time + ubi->dt_threshold <
-				(tv.tv_sec / NUM_SEC_IN_DAY) ||
-				e->rc > ubi->rd_threshold) {
-				ubi_msg("scrub PEB %d rc = %d",
-				       e->pnum, e->rc);
-				aeb->scrub = 1;
-			}
 			if (!aeb->scrub) {
 				dbg_wl("add PEB %d EC %d to the used tree",
 				       e->pnum, e->ec);
@@ -2212,7 +2094,7 @@ static int self_check_in_wl_tree(const struct ubi_device *ubi,
 	if (!ubi_dbg_chk_gen(ubi))
 		return 0;
 
-	if (ubi_in_wl_tree(e, root))
+	if (in_wl_tree(e, root))
 		return 0;
 
 	ubi_err("self-check failed for PEB %d, EC %d, RB-tree %p ",

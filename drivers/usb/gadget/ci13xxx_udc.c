@@ -75,6 +75,7 @@
  * DEFINE
  *****************************************************************************/
 
+#define DMA_ADDR_INVALID	(~(dma_addr_t)0)
 #define USB_MAX_TIMEOUT		25 /* 25msec timeout */
 #define EP_PRIME_CHECK_DELAY	(jiffies + msecs_to_jiffies(1000))
 #define MAX_PRIME_CHECK_RETRY	3 /*Wait for 3sec for EP prime failure */
@@ -841,9 +842,6 @@ static int hw_usb_reset(void)
 
 	/* ESS flushes only at end?!? */
 	hw_cwrite(CAP_ENDPTFLUSH,    ~0, ~0);   /* flush all EPs */
-
-	/* clear setup token semaphores */
-	hw_cwrite(CAP_ENDPTSETUPSTAT, 0,  0);   /* writes its content */
 
 	/* clear complete status */
 	hw_cwrite(CAP_ENDPTCOMPLETE,  0,  0);   /* writes its content */
@@ -1954,7 +1952,7 @@ static int _hardware_enqueue(struct ci13xxx_ep *mEp, struct ci13xxx_req *mReq)
 		return -EALREADY;
 
 	mReq->req.status = -EALREADY;
-	if (length && mReq->req.dma == DMA_ERROR_CODE) {
+	if (length && mReq->req.dma == DMA_ADDR_INVALID) {
 		mReq->req.dma = \
 			dma_map_single(mEp->device, mReq->req.buf,
 				       length, mEp->dir ? DMA_TO_DEVICE :
@@ -1973,7 +1971,7 @@ static int _hardware_enqueue(struct ci13xxx_ep *mEp, struct ci13xxx_req *mReq)
 				dma_unmap_single(mEp->device, mReq->req.dma,
 					length, mEp->dir ? DMA_TO_DEVICE :
 					DMA_FROM_DEVICE);
-				mReq->req.dma = DMA_ERROR_CODE;
+				mReq->req.dma = DMA_ADDR_INVALID;
 				mReq->map     = 0;
 			}
 			return -ENOMEM;
@@ -2185,7 +2183,7 @@ static int _hardware_dequeue(struct ci13xxx_ep *mEp, struct ci13xxx_req *mReq)
 	if (mReq->map) {
 		dma_unmap_single(mEp->device, mReq->req.dma, mReq->req.length,
 				 mEp->dir ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-		mReq->req.dma = DMA_ERROR_CODE;
+		mReq->req.dma = DMA_ADDR_INVALID;
 		mReq->map     = 0;
 	}
 
@@ -2317,7 +2315,7 @@ static void release_ep_request(struct ci13xxx_ep  *mEp,
 		dma_unmap_single(mEp->device, mReq->req.dma,
 			mReq->req.length,
 			mEp->dir ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-		mReq->req.dma = DMA_ERROR_CODE;
+		mReq->req.dma = DMA_ADDR_INVALID;
 		mReq->map     = 0;
 	}
 
@@ -2408,6 +2406,7 @@ static int _gadget_stop_activity(struct usb_gadget *gadget)
 	udc->configured = 0;
 	spin_unlock_irqrestore(udc->lock, flags);
 
+	gadget->xfer_isr_count = 0;
 	gadget->b_hnp_enable = 0;
 	gadget->a_hnp_support = 0;
 	gadget->host_request = 0;
@@ -3171,7 +3170,7 @@ static struct usb_request *ep_alloc_request(struct usb_ep *ep, gfp_t gfp_flags)
 	mReq = kzalloc(sizeof(struct ci13xxx_req), gfp_flags);
 	if (mReq != NULL) {
 		INIT_LIST_HEAD(&mReq->queue);
-		mReq->req.dma = DMA_ERROR_CODE;
+		mReq->req.dma = DMA_ADDR_INVALID;
 
 		mReq->ptr = dma_pool_alloc(mEp->td_pool, gfp_flags,
 					   &mReq->dma);
@@ -3388,7 +3387,7 @@ static int ep_dequeue(struct usb_ep *ep, struct usb_request *req)
 	if (mReq->map) {
 		dma_unmap_single(mEp->device, mReq->req.dma, mReq->req.length,
 				 mEp->dir ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-		mReq->req.dma = DMA_ERROR_CODE;
+		mReq->req.dma = DMA_ADDR_INVALID;
 		mReq->map     = 0;
 	}
 	req->status = -ECONNRESET;
@@ -3817,6 +3816,7 @@ static irqreturn_t udc_irq(void)
 			isr_statistics.uei++;
 		if (USBi_UI  & intr) {
 			isr_statistics.ui++;
+			udc->gadget.xfer_isr_count++;
 			isr_tr_complete_handler(udc);
 		}
 		if (USBi_SLI & intr) {

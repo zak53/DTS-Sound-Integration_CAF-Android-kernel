@@ -169,18 +169,6 @@
 #define MSM_NAND_VERSION_MINOR_MASK	0x0FFF0000
 #define MSM_NAND_VERSION_MINOR_SHIFT	16
 
-#define msm_nand_sps_get_iovec(pipe, indx, cnt, ret, label, iovec)	\
-	do {								\
-		do {							\
-			ret = sps_get_iovec((pipe), (iovec));		\
-		} while (((iovec)->addr == 0x0) && ((iovec)->size == 0x0));\
-		if (ret) {						\
-			pr_err("sps_get_iovec failed for pipe %d (ret: %d)\n",\
-					indx, ret);			\
-			goto label;					\
-		}							\
-	} while (--(cnt))
-
 /* Structure that defines a NAND SPS command element */
 struct msm_nand_sps_cmd {
 	struct sps_command_element ce;
@@ -220,7 +208,6 @@ struct msm_nand_sps_endpt {
 	struct sps_connect config;
 	struct sps_register_event event;
 	struct completion completion;
-	uint32_t index;
 };
 
 /*
@@ -428,13 +415,9 @@ static dma_addr_t msm_nand_dma_map(struct device *dev, void *addr, size_t size,
 	if (virt_addr_valid(addr))
 		page = virt_to_page(addr);
 	else {
-		page = vmalloc_to_page(addr);
-		if (!page) {
-			pr_err("%s: invalid addr 0x%lx\n",
-				   __func__, (unsigned long)addr);
-			WARN_ON(1);
+		if (WARN_ON(size + offset > PAGE_SIZE))
 			return ~0;
-		}
+		page = vmalloc_to_page(addr);
 	}
 	return dma_map_page(dev, page, offset, size, dir);
 }
@@ -652,14 +635,13 @@ static inline void msm_nand_prep_ce(struct msm_nand_sps_cmd *sps_cmd,
 static int msm_nand_flash_rd_reg(struct msm_nand_info *info, uint32_t addr,
 				uint32_t *val)
 {
-	int ret = 0, submitted_num_desc = 1;
+	int ret = 0;
 	struct msm_nand_sps_cmd *cmd;
 	struct msm_nand_chip *chip = &info->nand_chip;
 	struct {
 		struct msm_nand_sps_cmd cmd;
 		uint32_t data;
 	} *dma_buffer;
-	struct sps_iovec iovec_temp;
 
 	wait_event(chip->dma_wait_queue, (dma_buffer = msm_nand_get_dma_buffer(
 		    chip, sizeof(*dma_buffer))));
@@ -679,9 +661,7 @@ static int msm_nand_flash_rd_reg(struct msm_nand_info *info, uint32_t addr,
 		msm_nand_put_device(chip->dev);
 		goto out;
 	}
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, submitted_num_desc,
-			ret, out, &iovec_temp);
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
 	ret = msm_nand_put_device(chip->dev);
 	if (ret)
 		goto out;
@@ -701,10 +681,9 @@ static int msm_nand_flash_read_id(struct msm_nand_info *info,
 		bool read_onfi_signature,
 		uint32_t *read_id)
 {
-	int err = 0, i = 0;
+	int err = 0, i;
 	struct msm_nand_sps_cmd *cmd;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	struct msm_nand_chip *chip = &info->nand_chip;
 	uint32_t total_cnt = 4;
 	/*
@@ -764,26 +743,30 @@ static int msm_nand_flash_read_id(struct msm_nand_info *info,
 
 	mutex_lock(&info->lock);
 	err = msm_nand_get_device(chip->dev);
-	if (err)
+	if (err) {
+		mutex_unlock(&info->lock);
 		goto out;
+	}
 	err =  sps_transfer(info->sps.cmd_pipe.handle, &dma_buffer->xfer);
 	if (err) {
 		pr_err("Failed to submit commands %d\n", err);
 		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
 		goto out;
 	}
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, dma_buffer->xfer.iovec_count,
-			err, out, &iovec_temp);
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
+	err = msm_nand_put_device(chip->dev);
+	mutex_unlock(&info->lock);
+	if (err)
+		goto out;
+
 	pr_debug("Read ID register value 0x%x\n", dma_buffer->data[3]);
 	if (!read_onfi_signature)
 		pr_debug("nandid: %x maker %02x device %02x\n",
 		       dma_buffer->data[3], dma_buffer->data[3] & 0xff,
 		       (dma_buffer->data[3] >> 8) & 0xff);
 	*read_id = dma_buffer->data[3];
-	err = msm_nand_put_device(chip->dev);
 out:
-	mutex_unlock(&info->lock);
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer));
 	return err;
 }
@@ -919,12 +902,11 @@ static int msm_nand_flash_onfi_probe(struct msm_nand_info *info)
 	struct msm_nand_chip *chip = &info->nand_chip;
 	struct flash_identification *flash = &info->flash_dev;
 	uint32_t crc_chk_count = 0, page_address = 0;
-	int ret = 0, i = 0, submitted_num_desc = 1;
+	int ret = 0, i;
 
 	/* SPS parameters */
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	uint32_t rdata;
 
 	/* ONFI Identifier/Parameter Page parameters */
@@ -1063,33 +1045,34 @@ static int msm_nand_flash_onfi_probe(struct msm_nand_info *info)
 	}
 	mutex_lock(&info->lock);
 	ret = msm_nand_get_device(chip->dev);
-	if (ret)
-		goto unlock_mutex;
+	if (ret) {
+		mutex_unlock(&info->lock);
+		goto free_dma;
+	}
 	/* Submit data descriptor */
 	ret = sps_transfer_one(info->sps.data_prod.handle, dma_addr_param_info,
 			ONFI_PARAM_INFO_LENGTH, NULL, SPS_IOVEC_FLAG_INT);
 	if (ret) {
 		pr_err("Failed to submit data descriptors %d\n", ret);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
+		goto free_dma;
 	}
 	/* Submit command descriptors */
 	ret =  sps_transfer(info->sps.cmd_pipe.handle,
 			&dma_buffer->xfer);
 	if (ret) {
 		pr_err("Failed to submit commands %d\n", ret);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
+		goto free_dma;
 	}
-
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, dma_buffer->xfer.iovec_count,
-			ret, put_dev, &iovec_temp);
-	msm_nand_sps_get_iovec(info->sps.data_prod.handle,
-			info->sps.data_prod.index, submitted_num_desc,
-			ret, out, &iovec_temp);
-
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
+	wait_for_completion_io(&info->sps.data_prod.completion);
 	ret = msm_nand_put_device(chip->dev);
+	mutex_unlock(&info->lock);
 	if (ret)
-		goto unlock_mutex;
+		goto free_dma;
 
 	/* Check for flash status errors */
 	if (dma_buffer->flash_status & (FS_OP_ERR | FS_MPU_ERR)) {
@@ -1143,11 +1126,6 @@ static int msm_nand_flash_onfi_probe(struct msm_nand_info *info)
 	 */
 	if (!strncmp(onfi_param_page_ptr->device_model, "MT29F4G08ABC", 12))
 		flash->widebus  = 0;
-	goto unlock_mutex;
-put_dev:
-	msm_nand_put_device(chip->dev);
-unlock_mutex:
-	mutex_unlock(&info->lock);
 free_dma:
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer));
 	msm_nand_release_dma_buffer(chip, onfi_param_info_buf,
@@ -1365,16 +1343,14 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 	uint32_t rdata;
 	/* read_location register parameters */
 	uint32_t offset, size, last_read;
-	static uint32_t prev_rdata;
 
 	cmd = *curr_cmd;
-	if (curr_cw == args->start_sector) {
-		msm_nand_prep_ce(cmd, MSM_NAND_FLASH_CMD(info), WRITE,
-				data->cmd,
-				((curr_cw == args->start_sector) ?
-				 SPS_IOVEC_FLAG_LOCK : 0));
-		cmd++;
+	msm_nand_prep_ce(cmd, MSM_NAND_FLASH_CMD(info), WRITE, data->cmd,
+			((curr_cw == args->start_sector) ?
+			 SPS_IOVEC_FLAG_LOCK : 0));
+	cmd++;
 
+	if (curr_cw == args->start_sector) {
 		msm_nand_prep_ce(cmd, MSM_NAND_ADDR0(info), WRITE,
 				data->addr0, 0);
 		cmd++;
@@ -1398,15 +1374,10 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 		msm_nand_prep_ce(cmd, MSM_NAND_EBI2_ECC_BUF_CFG(info),
 				WRITE, data->ecc_cfg, 0);
 		cmd++;
-
-		if (!args->read) {
-			msm_nand_prep_ce(cmd, MSM_NAND_FLASH_STATUS(info),
-					WRITE, data->clrfstatus, 0);
-			cmd++;
-			goto sub_exec_cmd;
-		}
-
 	}
+
+	if (!args->read)
+		goto sub_exec_cmd;
 
 	if (ops->mode == MTD_OPS_RAW) {
 		rdata = (0 << 0) | (chip->cw_size << 16) | (1 << 31);
@@ -1414,48 +1385,35 @@ static void msm_nand_prep_rw_cmd_desc(struct mtd_oob_ops *ops,
 				rdata, 0);
 		cmd++;
 	}
-	if (ops->mode == MTD_OPS_AUTO_OOB) {
-		if (ops->datbuf) {
-			offset = 0;
-			size = (curr_cw < (args->cwperpage - 1)) ? 516 :
-				(512 - ((args->cwperpage - 1) << 2));
-			last_read = (curr_cw < (args->cwperpage - 1)) ? 1 :
-				(ops->oobbuf ? 0 : 1);
-			rdata = (offset << 0) | (size << 16) |
-				(last_read << 31);
-
-			if (prev_rdata != rdata) {
-				msm_nand_prep_ce(cmd,
-						MSM_NAND_READ_LOCATION_0(info),
-						WRITE,
-						rdata, 0);
-				cmd++;
-				prev_rdata = rdata;
-			}
-		}
-		if (curr_cw == (args->cwperpage - 1) && ops->oobbuf) {
-			offset = 512 - ((args->cwperpage - 1) << 2);
-			size = (args->cwperpage) << 2;
-			if (size > args->oob_len_cmd)
-				size = args->oob_len_cmd;
-			args->oob_len_cmd -= size;
-			last_read = 1;
-			rdata = (offset << 0) | (size << 16) |
-				(last_read << 31);
-
-			if (ops->datbuf)
-				msm_nand_prep_ce(cmd,
-						MSM_NAND_READ_LOCATION_1(info),
-						WRITE, rdata, 0);
-			else
-				msm_nand_prep_ce(cmd,
-						MSM_NAND_READ_LOCATION_0(info),
-						WRITE, rdata, 0);
-			cmd++;
-		}
+	if (ops->mode == MTD_OPS_AUTO_OOB && ops->datbuf) {
+		offset = 0;
+		size = (curr_cw < (args->cwperpage - 1)) ? 516 :
+			(512 - ((args->cwperpage - 1) << 2));
+		last_read = (curr_cw < (args->cwperpage - 1)) ? 1 :
+			(ops->oobbuf ? 0 : 1);
+		rdata = (offset << 0) | (size << 16) | (last_read << 31);
+		msm_nand_prep_ce(cmd, MSM_NAND_READ_LOCATION_0(info), WRITE,
+				rdata, 0);
+		cmd++;
 	}
-	if (curr_cw == (args->cwperpage - 1))
-		prev_rdata = 0;
+	if (ops->mode == MTD_OPS_AUTO_OOB && ops->oobbuf
+			&& (curr_cw == (args->cwperpage - 1))) {
+		offset = 512 - ((args->cwperpage - 1) << 2);
+		size = (args->cwperpage) << 2;
+		if (size > args->oob_len_cmd)
+			size = args->oob_len_cmd;
+		args->oob_len_cmd -= size;
+		last_read = 1;
+		rdata = (offset << 0) | (size << 16) | (last_read << 31);
+		if (ops->datbuf) {
+			msm_nand_prep_ce(cmd, MSM_NAND_READ_LOCATION_1(info),
+					WRITE, rdata, 0);
+		} else {
+			msm_nand_prep_ce(cmd, MSM_NAND_READ_LOCATION_0(info),
+					WRITE, rdata, 0);
+		}
+		cmd++;
+	}
 sub_exec_cmd:
 	msm_nand_prep_ce(cmd, MSM_NAND_EXEC_CMD(info), WRITE, data->exec,
 			SPS_IOVEC_FLAG_NWD);
@@ -1497,6 +1455,7 @@ static int msm_nand_submit_rw_data_desc(struct mtd_oob_ops *ops,
 		if (err)
 			goto out;
 		args->data_dma_addr_curr += sectordatasize;
+
 	} else if (ops->mode == MTD_OPS_AUTO_OOB) {
 		if (ops->datbuf) {
 			sectordatasize = (curr_cw < (args->cwperpage - 1))
@@ -1552,14 +1511,13 @@ static int msm_nand_read_oob(struct mtd_info *mtd, loff_t from,
 	struct msm_nand_info *info = mtd->priv;
 	struct msm_nand_chip *chip = &info->nand_chip;
 	uint32_t cwperpage = (mtd->writesize >> 9);
-	int err, pageerr = 0, rawerr = 0, submitted_num_desc = 0;
+	int err, pageerr = 0, rawerr = 0;
 	uint32_t n = 0, pages_read = 0;
 	uint32_t ecc_errors = 0, total_ecc_errors = 0;
 	struct msm_nand_rw_params rw_params;
 	struct msm_nand_rw_reg_data data;
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	/*
 	 * The following 6 commands will be sent only once for the first
 	 * codeword (CW) - addr0, addr1, dev0_cfg0, dev0_cfg1,
@@ -1636,44 +1594,32 @@ static int msm_nand_read_oob(struct mtd_info *mtd, loff_t from,
 		}
 		mutex_lock(&info->lock);
 		err = msm_nand_get_device(chip->dev);
-		if (err)
-			goto unlock_mutex;
+		if (err) {
+			mutex_unlock(&info->lock);
+			goto free_dma;
+		}
 		/* Submit data descriptors */
 		for (n = rw_params.start_sector; n < cwperpage; n++) {
 			err = msm_nand_submit_rw_data_desc(ops,
 						&rw_params, info, n);
 			if (err) {
 				pr_err("Failed to submit data descs %d\n", err);
-				panic("error in nand driver\n");
-				goto put_dev;
+				msm_nand_put_device(chip->dev);
+				mutex_unlock(&info->lock);
+				goto free_dma;
 			}
 		}
-		if (ops->mode == MTD_OPS_RAW) {
-			submitted_num_desc = cwperpage - rw_params.start_sector;
-		} else if (ops->mode == MTD_OPS_AUTO_OOB) {
-			if (ops->datbuf)
-				submitted_num_desc = cwperpage -
-							rw_params.start_sector;
-			if (ops->oobbuf)
-				submitted_num_desc++;
-		}
-
 		/* Submit command descriptors */
 		err =  sps_transfer(info->sps.cmd_pipe.handle,
 				&dma_buffer->xfer);
 		if (err) {
 			pr_err("Failed to submit commands %d\n", err);
-			goto put_dev;
+			msm_nand_put_device(chip->dev);
+			mutex_unlock(&info->lock);
+			goto free_dma;
 		}
-
-		msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-				info->sps.cmd_pipe.index,
-				dma_buffer->xfer.iovec_count,
-				err, put_dev, &iovec_temp);
-		msm_nand_sps_get_iovec(info->sps.data_prod.handle,
-				info->sps.data_prod.index, submitted_num_desc,
-				err, put_dev, &iovec_temp);
-
+		wait_for_completion_io(&info->sps.cmd_pipe.completion);
+		wait_for_completion_io(&info->sps.data_prod.completion);
 		err = msm_nand_put_device(chip->dev);
 		mutex_unlock(&info->lock);
 		if (err)
@@ -1779,11 +1725,6 @@ static int msm_nand_read_oob(struct mtd_info *mtd, loff_t from,
 		pages_read++;
 		rw_params.page++;
 	}
-	goto free_dma;
-put_dev:
-	msm_nand_put_device(chip->dev);
-unlock_mutex:
-	mutex_unlock(&info->lock);
 free_dma:
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer));
 	if (ops->oobbuf)
@@ -1897,7 +1838,6 @@ static int msm_nand_read(struct mtd_info *mtd, loff_t from, size_t len,
 	ops.retlen = 0;
 	ops.ooblen = 0;
 	ops.oobbuf = NULL;
-	*retlen = 0;
 
 	if (!(from & (mtd->writesize - 1)) && !(len % mtd->writesize)) {
 		/*
@@ -1909,7 +1849,7 @@ static int msm_nand_read(struct mtd_info *mtd, loff_t from, size_t len,
 			ops.len = mtd->writesize;
 
 			for (;;) {
-				ops.datbuf = (uint8_t *)buf;
+				ops.datbuf = buf;
 				ret = msm_nand_read_oob(mtd, from, &ops);
 				if (ret < 0)
 					break;
@@ -1932,13 +1872,13 @@ static int msm_nand_read(struct mtd_info *mtd, loff_t from, size_t len,
 			}
 		} else {
 			ops.len = len;
-			ops.datbuf = (uint8_t *)buf;
+			ops.datbuf = buf;
 			ret =  msm_nand_read_oob(mtd, from, &ops);
 			*retlen = ops.retlen;
 		}
 	} else {
 		ops.len = len;
-		ops.datbuf = (uint8_t *)buf;
+		ops.datbuf = buf;
 		ret = msm_nand_read_partial_page(mtd, from, &ops);
 		*retlen = ops.retlen;
 	}
@@ -1957,12 +1897,11 @@ static int msm_nand_write_oob(struct mtd_info *mtd, loff_t to,
 	struct msm_nand_chip *chip = &info->nand_chip;
 	uint32_t cwperpage = (mtd->writesize >> 9);
 	uint32_t n, flash_sts, pages_written = 0;
-	int err = 0, submitted_num_desc = 0;
+	int err = 0;
 	struct msm_nand_rw_params rw_params;
 	struct msm_nand_rw_reg_data data;
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	/*
 	 * The following 7 commands will be sent only once :
 	 * For first codeword (CW) - addr0, addr1, dev0_cfg0, dev0_cfg1,
@@ -2011,16 +1950,15 @@ static int msm_nand_write_oob(struct mtd_info *mtd, loff_t to,
 				&dma_buffer->data.flash_status[n]), 0);
 			cmd++;
 
+			msm_nand_prep_ce(cmd, MSM_NAND_FLASH_STATUS(info),
+				WRITE, data.clrfstatus, 0);
+			cmd++;
+
 			if (n == (cwperpage - 1)) {
 				msm_nand_prep_ce(cmd,
-						MSM_NAND_FLASH_STATUS(info),
-						WRITE, data.clrfstatus, 0);
-				cmd++;
-				msm_nand_prep_ce(cmd,
-						MSM_NAND_READ_STATUS(info),
-						WRITE, data.clrrstatus,
-						SPS_IOVEC_FLAG_UNLOCK
-						| SPS_IOVEC_FLAG_INT);
+					MSM_NAND_READ_STATUS(info), WRITE,
+					data.clrrstatus, SPS_IOVEC_FLAG_UNLOCK
+					| SPS_IOVEC_FLAG_INT);
 				cmd++;
 			}
 		}
@@ -2041,43 +1979,32 @@ static int msm_nand_write_oob(struct mtd_info *mtd, loff_t to,
 		}
 		mutex_lock(&info->lock);
 		err = msm_nand_get_device(chip->dev);
-		if (err)
-			goto unlock_mutex;
+		if (err) {
+			mutex_unlock(&info->lock);
+			goto free_dma;
+		}
 		/* Submit data descriptors */
 		for (n = 0; n < cwperpage; n++) {
 			err = msm_nand_submit_rw_data_desc(ops,
 						&rw_params, info, n);
 			if (err) {
 				pr_err("Failed to submit data descs %d\n", err);
-				panic("Error in nand driver\n");
-				goto put_dev;
+				msm_nand_put_device(chip->dev);
+				mutex_unlock(&info->lock);
+				goto free_dma;
 			}
 		}
-		if (ops->mode == MTD_OPS_RAW) {
-			submitted_num_desc = n;
-		} else if (ops->mode == MTD_OPS_AUTO_OOB) {
-			if (ops->datbuf)
-				submitted_num_desc = n;
-			if (ops->oobbuf)
-				submitted_num_desc++;
-		}
-
 		/* Submit command descriptors */
 		err =  sps_transfer(info->sps.cmd_pipe.handle,
 				&dma_buffer->xfer);
 		if (err) {
 			pr_err("Failed to submit commands %d\n", err);
-			goto put_dev;
+			msm_nand_put_device(chip->dev);
+			mutex_unlock(&info->lock);
+			goto free_dma;
 		}
-
-		msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-				info->sps.cmd_pipe.index,
-				dma_buffer->xfer.iovec_count,
-				err, put_dev, &iovec_temp);
-		msm_nand_sps_get_iovec(info->sps.data_cons.handle,
-				info->sps.data_cons.index, submitted_num_desc,
-				err, put_dev, &iovec_temp);
-
+		wait_for_completion_io(&info->sps.cmd_pipe.completion);
+		wait_for_completion_io(&info->sps.data_cons.completion);
 		err = msm_nand_put_device(chip->dev);
 		mutex_unlock(&info->lock);
 		if (err)
@@ -2108,11 +2035,6 @@ static int msm_nand_write_oob(struct mtd_info *mtd, loff_t to,
 		pages_written++;
 		rw_params.page++;
 	}
-	goto free_dma;
-put_dev:
-	msm_nand_put_device(chip->dev);
-unlock_mutex:
-	mutex_unlock(&info->lock);
 free_dma:
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer));
 	if (ops->oobbuf)
@@ -2211,14 +2133,13 @@ struct msm_nand_erase_reg_data {
  */
 static int msm_nand_erase(struct mtd_info *mtd, struct erase_info *instr)
 {
-	int i = 0, err = 0;
+	int i, err = 0;
 	struct msm_nand_info *info = mtd->priv;
 	struct msm_nand_chip *chip = &info->nand_chip;
 	uint32_t page = 0;
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
 	struct msm_nand_erase_reg_data data;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	uint32_t total_cnt = 9;
 	/*
 	 * The following 9 commands are required to erase a page -
@@ -2300,20 +2221,22 @@ static int msm_nand_erase(struct mtd_info *mtd, struct erase_info *instr)
 	}
 	mutex_lock(&info->lock);
 	err = msm_nand_get_device(chip->dev);
-	if (err)
-		goto unlock_mutex;
-
+	if (err) {
+		mutex_unlock(&info->lock);
+		goto free_dma;
+	}
 	err =  sps_transfer(info->sps.cmd_pipe.handle, &dma_buffer->xfer);
 	if (err) {
 		pr_err("Failed to submit commands %d\n", err);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
+		goto free_dma;
 	}
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, dma_buffer->xfer.iovec_count,
-			err, put_dev, &iovec_temp);
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
 	err = msm_nand_put_device(chip->dev);
+	mutex_unlock(&info->lock);
 	if (err)
-		goto unlock_mutex;
+		goto free_dma;
 
 	/*  Check for flash status errors */
 	if (dma_buffer->flash_status & (FS_OP_ERR |
@@ -2334,11 +2257,7 @@ static int msm_nand_erase(struct mtd_info *mtd, struct erase_info *instr)
 		instr->fail_addr = 0xffffffff;
 		mtd_erase_callback(instr);
 	}
-	goto unlock_mutex;
-put_dev:
-	msm_nand_put_device(chip->dev);
-unlock_mutex:
-	mutex_unlock(&info->lock);
+free_dma:
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer));
 out:
 	return err;
@@ -2365,13 +2284,12 @@ static int msm_nand_block_isbad(struct mtd_info *mtd, loff_t ofs)
 {
 	struct msm_nand_info *info = mtd->priv;
 	struct msm_nand_chip *chip = &info->nand_chip;
-	int i = 0, ret = 0, bad_block = 0, submitted_num_desc = 1;
+	int i, ret = 0, bad_block = 0;
 	uint8_t *buf;
 	uint32_t page = 0, rdata, cwperpage;
 	struct msm_nand_sps_cmd *cmd, *curr_cmd;
 	struct msm_nand_blk_isbad_data data;
 	struct sps_iovec *iovec;
-	struct sps_iovec iovec_temp;
 	uint32_t total_cnt = 9;
 	/*
 	 * The following 9 commands are required to check bad block -
@@ -2474,22 +2392,20 @@ static int msm_nand_block_isbad(struct mtd_info *mtd, loff_t ofs)
 
 	if (ret) {
 		pr_err("Failed to submit data desc %d\n", ret);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
+		goto free_dma;
 	}
 	/* Submit command descriptor */
 	ret =  sps_transfer(info->sps.cmd_pipe.handle, &dma_buffer->xfer);
 	if (ret) {
 		pr_err("Failed to submit commands %d\n", ret);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		mutex_unlock(&info->lock);
+		goto free_dma;
 	}
-
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, dma_buffer->xfer.iovec_count,
-			ret, put_dev, &iovec_temp);
-	msm_nand_sps_get_iovec(info->sps.data_prod.handle,
-			info->sps.data_prod.index, submitted_num_desc,
-			ret, put_dev, &iovec_temp);
-
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
+	wait_for_completion_io(&info->sps.data_prod.completion);
 	ret = msm_nand_put_device(chip->dev);
 	mutex_unlock(&info->lock);
 	if (ret)
@@ -2510,10 +2426,6 @@ static int msm_nand_block_isbad(struct mtd_info *mtd, loff_t ofs)
 		if (buf[0] != 0xFF)
 			bad_block = 1;
 	}
-	goto free_dma;
-put_dev:
-	msm_nand_put_device(chip->dev);
-	mutex_unlock(&info->lock);
 free_dma:
 	msm_nand_release_dma_buffer(chip, dma_buffer, sizeof(*dma_buffer) + 4);
 out:
@@ -2780,8 +2692,7 @@ static int msm_nand_init_endpoint(struct msm_nand_info *info,
 		sps_config->dest_pipe_index = pipe_index;
 	}
 
-	sps_config->options = SPS_O_AUTO_ENABLE | SPS_O_POLL |
-				SPS_O_ACK_TRANSFERS;
+	sps_config->options = SPS_O_AUTO_ENABLE | SPS_O_DESC_DONE;
 
 	if (pipe_index == SPS_DATA_PROD_PIPE_INDEX ||
 			pipe_index == SPS_DATA_CONS_PIPE_INDEX)
@@ -2815,8 +2726,10 @@ static int msm_nand_init_endpoint(struct msm_nand_info *info,
 		goto free_endpoint;
 	}
 
-	sps_event->options = SPS_O_EOT;
+	init_completion(&end_point->completion);
 	sps_event->mode = SPS_TRIGGER_WAIT;
+	sps_event->options = SPS_O_DESC_DONE;
+	sps_event->xfer_done = &end_point->completion;
 	sps_event->user = (void *)info;
 
 	rc = sps_register_event(pipe_handle, sps_event);
@@ -2824,7 +2737,6 @@ static int msm_nand_init_endpoint(struct msm_nand_info *info,
 		pr_err("sps_register_event() failed %d\n", rc);
 		goto sps_disconnect;
 	}
-	end_point->index = pipe_index;
 	end_point->handle = pipe_handle;
 	pr_debug("pipe handle 0x%x for pipe %d\n", (uint32_t)pipe_handle,
 			pipe_index);
@@ -2928,8 +2840,7 @@ static int msm_nand_enable_dma(struct msm_nand_info *info)
 {
 	struct msm_nand_sps_cmd *sps_cmd;
 	struct msm_nand_chip *chip = &info->nand_chip;
-	int ret, submitted_num_desc = 1;
-	struct sps_iovec iovec_temp;
+	int ret;
 
 	wait_event(chip->dma_wait_queue,
 		   (sps_cmd = msm_nand_get_dma_buffer(chip, sizeof(*sps_cmd))));
@@ -2949,12 +2860,10 @@ static int msm_nand_enable_dma(struct msm_nand_info *info)
 			sps_cmd->flags);
 	if (ret) {
 		pr_err("Failed to submit command: %d\n", ret);
-		goto put_dev;
+		msm_nand_put_device(chip->dev);
+		goto out;
 	}
-	msm_nand_sps_get_iovec(info->sps.cmd_pipe.handle,
-			info->sps.cmd_pipe.index, submitted_num_desc,
-			ret, put_dev, &iovec_temp);
-put_dev:
+	wait_for_completion_io(&info->sps.cmd_pipe.completion);
 	ret = msm_nand_put_device(chip->dev);
 out:
 	mutex_unlock(&info->lock);

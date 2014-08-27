@@ -29,9 +29,8 @@
 
 	tpiu: tpiu@fc320000 {
 		compatible = "arm,coresight-tpiu";
-		reg = <0xfc320000 0x1000>,
-		      <0xfd512000 0x1000>;
-		reg-names = "tpiu-base", "nidnt-base";
+		reg = <0xfc320000 0x1000>;
+		reg-names = "tpiu-base";
 
 		coresight-id = <1>;
 		coresight-name = "coresight-tpiu";
@@ -47,7 +46,9 @@
 		qcom,vdd-io-voltage-level = <2950000 2950000>;
 		qcom,vdd-io-current-level = <200 22000>;
 
-		qcom,nidnt;
+		qcom,nidntsw;
+		qcom,nidnt-swduart;
+		qcom,nidnt-swdtrc;
 	};
 
 	replicator: replicator@fc324000 {

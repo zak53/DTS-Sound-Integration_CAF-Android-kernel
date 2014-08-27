@@ -628,14 +628,11 @@ int kgsl_cff_dump_enable_set(void *data, u64 val)
 		if (!device->cff_dump_enable) {
 			device->cff_dump_enable = 1;
 			/*
-			 * force device to slumber so that we ensure that the
+			 * put device to slumber so that we ensure that the
 			 * start opcode in CFF is present
 			 */
 			kgsl_mutex_lock(&device->mutex, &device->mutex_owner);
-			ret = kgsl_pwrctrl_change_state(device,
-				KGSL_STATE_SUSPEND);
-			ret |= kgsl_pwrctrl_change_state(device,
-				KGSL_STATE_SLUMBER);
+			ret = kgsl_pwrctrl_slumber(device);
 			if (ret)
 				device->cff_dump_enable = 0;
 			kgsl_mutex_unlock(&device->mutex, &device->mutex_owner);
@@ -711,11 +708,12 @@ static int kgsl_cffdump_capture_adreno_ib_cff(struct kgsl_device *device,
  */
 int kgsl_cffdump_capture_ib_desc(struct kgsl_device *device,
 				struct kgsl_context *context,
-				struct kgsl_cmdbatch *cmdbatch)
+				struct kgsl_ibdesc *ibdesc,
+				unsigned int numibs)
 {
 	int ret = 0;
 	unsigned int ptbase;
-	struct kgsl_ibdesc_node *ibdesc;
+	int i;
 
 	if (!device->cff_dump_enable)
 		return 0;
@@ -726,15 +724,15 @@ int kgsl_cffdump_capture_ib_desc(struct kgsl_device *device,
 		ret = -EINVAL;
 		goto done;
 	}
-	list_for_each_entry(ib, &cmdbatch->ibdesclist, node) {
+	for (i = 0; i < numibs; i++) {
 		ret = kgsl_cffdump_capture_adreno_ib_cff(
-			device, ptbase, ibdesc->gpuaddr,
-			ibdesc->sizedwords);
+			device, ptbase, ibdesc[i].gpuaddr,
+			ibdesc[i].sizedwords);
 		if (ret) {
 			KGSL_DRV_ERR(device,
 			"Fail cff capture, IB %lx, size %zx\n",
-			ibdesc->gpuaddr,
-			ibdesc->sizedwords << 2);
+			ibdesc[i].gpuaddr,
+			ibdesc[i].sizedwords << 2);
 			break;
 		}
 	}

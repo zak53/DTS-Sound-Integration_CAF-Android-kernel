@@ -68,8 +68,7 @@ static struct mdss_dsi_event dsi_event;
 
 static int dsi_event_thread(void *data);
 
-void mdss_dsi_ctrl_init(struct device *ctrl_dev,
-			struct mdss_dsi_ctrl_pdata *ctrl)
+void mdss_dsi_ctrl_init(struct mdss_dsi_ctrl_pdata *ctrl)
 {
 	if (ctrl->panel_data.panel_info.pdest == DISPLAY_1) {
 		mdss_dsi0_hw.ptr = (void *)(ctrl);
@@ -98,8 +97,9 @@ void mdss_dsi_ctrl_init(struct device *ctrl_dev,
 	spin_lock_init(&ctrl->mdp_lock);
 	mutex_init(&ctrl->mutex);
 	mutex_init(&ctrl->cmd_mutex);
-	mdss_dsi_buf_alloc(ctrl_dev, &ctrl->tx_buf, SZ_4K);
-	mdss_dsi_buf_alloc(ctrl_dev, &ctrl->rx_buf, SZ_4K);
+	mdss_dsi_buf_alloc(&ctrl->tx_buf, SZ_4K);
+	mdss_dsi_buf_alloc(&ctrl->rx_buf, SZ_4K);
+	mdss_dsi_buf_alloc(&ctrl->status_buf, SZ_4K);
 	ctrl->cmdlist_commit = mdss_dsi_cmdlist_commit;
 
 
@@ -613,6 +613,82 @@ void mdss_dsi_cmd_bta_sw_trigger(struct mdss_panel_data *pdata)
 	pr_debug("%s: BTA done, status = %d\n", __func__, status);
 }
 
+static int mdss_dsi_read_status(struct mdss_dsi_ctrl_pdata *ctrl)
+{
+	struct dcs_cmd_req cmdreq;
+
+	memset(&cmdreq, 0, sizeof(cmdreq));
+	cmdreq.cmds = ctrl->status_cmds.cmds;
+	cmdreq.cmds_cnt = ctrl->status_cmds.cmd_cnt;
+	cmdreq.flags = CMD_REQ_COMMIT | CMD_CLK_CTRL | CMD_REQ_RX;
+	cmdreq.rlen = 0;
+	cmdreq.cb = NULL;
+	cmdreq.rbuf = ctrl->status_buf.data;
+
+	return mdss_dsi_cmdlist_put(ctrl, &cmdreq);
+}
+
+
+/**
+ * mdss_dsi_reg_status_check() - Check dsi panel status through reg read
+ * @ctrl_pdata: pointer to the dsi controller structure
+ *
+ * This function can be used to check the panel status through reading the
+ * status register from the panel.
+ *
+ * Return: positive value if the panel is in good state, negative value or
+ * zero otherwise.
+ */
+int mdss_dsi_reg_status_check(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	int ret = 0;
+
+	if (ctrl_pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return 0;
+	}
+
+	pr_debug("%s: Checking Register status\n", __func__);
+
+	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+
+	if (ctrl_pdata->status_cmds.link_state == DSI_HS_MODE)
+		mdss_dsi_set_tx_power_mode(0, &ctrl_pdata->panel_data);
+
+	ret = mdss_dsi_read_status(ctrl_pdata);
+
+	if (ctrl_pdata->status_cmds.link_state == DSI_HS_MODE)
+		mdss_dsi_set_tx_power_mode(1, &ctrl_pdata->panel_data);
+
+	if (ret == 0) {
+		if (ctrl_pdata->status_buf.data[0] !=
+						ctrl_pdata->status_value) {
+			pr_err("%s: Read back value from panel is incorrect\n",
+								__func__);
+			ret = -EINVAL;
+		} else {
+			ret = 1;
+		}
+	} else {
+		pr_err("%s: Read status register returned error\n", __func__);
+	}
+
+	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 0);
+	pr_debug("%s: Read register done with ret: %d\n", __func__, ret);
+
+	return ret;
+}
+
+/**
+ * mdss_dsi_bta_status_check() - Check dsi panel status through bta check
+ * @ctrl_pdata: pointer to the dsi controller structure
+ *
+ * This function can be used to check status of the panel using bta check
+ * for the panel.
+ *
+ * Return: positive value if the panel is in good state, negative value or
+ * zero otherwise.
+ */
 int mdss_dsi_bta_status_check(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 {
 	int ret = 0;
@@ -881,7 +957,7 @@ int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 
 	ctrl_restore = __mdss_dsi_cmd_mode_config(ctrl, 1);
 
-	if (rlen == 0) {
+	if (rlen <= 2) {
 		short_response = 1;
 		rx_byte = 4;
 	} else {
@@ -1035,7 +1111,7 @@ static int mdss_dsi_cmd_dma_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 
 
 	if (is_mdss_iommu_attached()) {
-		int ret = msm_iommu_map_contig_buffer(tp->dmap,
+		ret = msm_iommu_map_contig_buffer(tp->dmap,
 					mdss_get_iommu_domain(domain), 0,
 					size, SZ_4K, 0, &(addr));
 		if (IS_ERR_VALUE(ret)) {
@@ -1244,7 +1320,7 @@ int mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 {
 	struct dcs_cmd_req *req;
 	int ret = -EINVAL;
-
+	int rc = 0;
 	mutex_lock(&ctrl->cmd_mutex);
 	req = mdss_dsi_cmdlist_get(ctrl);
 
@@ -1267,19 +1343,24 @@ int mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 	 * also, axi bus bandwidth need since dsi controller will
 	 * fetch dcs commands from axi bus
 	 */
-	mdss_bus_bandwidth_ctrl(1);
+	mdss_bus_scale_set_quota(MDSS_HW_DSI0, SZ_1M, SZ_1M);
 
 	pr_debug("%s:  from_mdp=%d pid=%d\n", __func__, from_mdp, current->pid);
 	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 1);
 
+	rc = mdss_iommu_ctrl(1);
+	if (IS_ERR_VALUE(rc)) {
+		pr_err("IOMMU attach failed\n");
+		mutex_unlock(&ctrl->cmd_mutex);
+		return rc;
+	}
 	if (req->flags & CMD_REQ_RX)
 		ret = mdss_dsi_cmdlist_rx(ctrl, req);
 	else
 		ret = mdss_dsi_cmdlist_tx(ctrl, req);
-
+	mdss_iommu_ctrl(0);
 	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 0);
-	mdss_bus_bandwidth_ctrl(0);
-
+	mdss_bus_scale_set_quota(MDSS_HW_DSI0, 0, 0);
 need_lock:
 
 	if (from_mdp) /* from pipe_commit */
@@ -1486,6 +1567,7 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 	u32 isr;
 	struct mdss_dsi_ctrl_pdata *ctrl =
 			(struct mdss_dsi_ctrl_pdata *)ptr;
+	struct mdss_dsi_ctrl_pdata *mctrl = NULL;
 
 	if (!ctrl->ctrl_base) {
 		pr_err("%s:%d DSI base adr no Initialized",
@@ -1495,6 +1577,20 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 
 	isr = MIPI_INP(ctrl->ctrl_base + 0x0110);/* DSI_INTR_CTRL */
 	MIPI_OUTP(ctrl->ctrl_base + 0x0110, isr);
+
+	if (mdss_dsi_is_slave_ctrl(ctrl)) {
+		mctrl = mdss_dsi_get_master_ctrl();
+		if (mctrl) {
+			u32 isr0;
+			isr0 = MIPI_INP(mctrl->ctrl_base + 0x0110);
+			if (isr0 & DSI_INTR_CMD_DMA_DONE)
+				MIPI_OUTP(mctrl->ctrl_base + 0x0110,
+					DSI_INTR_CMD_DMA_DONE);
+		} else {
+			pr_warn("%s: Unable to get master control\n",
+				__func__);
+		}
+	}
 
 	pr_debug("%s: ndx=%d isr=%x\n", __func__, ctrl->ndx, isr);
 
@@ -1513,13 +1609,10 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 
 	if (isr & DSI_INTR_CMD_DMA_DONE) {
 		MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, isr, 0x98);
-		/* at broadcast mode, only slave's irq enabled */
-		if (!mdss_dsi_is_master_ctrl(ctrl)) {
-			spin_lock(&ctrl->mdp_lock);
-			mdss_dsi_disable_irq_nosync(ctrl, DSI_CMD_TERM);
-			complete(&ctrl->dma_comp);
-			spin_unlock(&ctrl->mdp_lock);
-		}
+		spin_lock(&ctrl->mdp_lock);
+		mdss_dsi_disable_irq_nosync(ctrl, DSI_CMD_TERM);
+		complete(&ctrl->dma_comp);
+		spin_unlock(&ctrl->mdp_lock);
 	}
 
 	if (isr & DSI_INTR_CMD_MDP_DONE) {

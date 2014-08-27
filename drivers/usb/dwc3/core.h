@@ -194,7 +194,6 @@
 
 /* Global USB2 PHY Configuration Register */
 #define DWC3_GUSB2PHYCFG_PHYSOFTRST	(1 << 31)
-#define DWC3_GUSB2PHYCFG_ENBLSLPM	(1 << 8)
 #define DWC3_GUSB2PHYCFG_SUSPHY		(1 << 6)
 
 /* Global USB3 PIPE Control Register */
@@ -446,35 +445,6 @@ struct dwc3_event_buffer {
 	struct dwc3		*dwc;
 };
 
-struct dwc3_gadget_events {
-	unsigned int	disconnect;
-	unsigned int	reset;
-	unsigned int	connect;
-	unsigned int	wakeup;
-	unsigned int	link_status_change;
-	unsigned int	eopf;
-	unsigned int	suspend;
-	unsigned int	sof;
-	unsigned int	erratic_error;
-	unsigned int	overflow;
-	unsigned int	vendor_dev_test_lmp;
-	unsigned int	cmdcmplt;
-	unsigned int	unknown_event;
-};
-
-struct dwc3_ep_events {
-	unsigned int	xfercomplete;
-	unsigned int	xfernotready;
-	unsigned int	control_data;
-	unsigned int	control_status;
-	unsigned int	xferinprogress;
-	unsigned int	rxtxfifoevent;
-	unsigned int	streamevent;
-	unsigned int	epcmdcomplete;
-	unsigned int	cmdcmplt;
-	unsigned int	unknown_event;
-};
-
 #define DWC3_EP_FLAG_STALLED	(1 << 0)
 #define DWC3_EP_FLAG_WEDGED	(1 << 1)
 
@@ -505,7 +475,6 @@ struct dwc3_ep_events {
  * @name: a human readable name e.g. ep1out-bulk
  * @direction: true for TX, false for RX
  * @stream_capable: true when streams are enabled
- * @dbg_ep_events: different events counter for endpoint
  */
 struct dwc3_ep {
 	struct usb_ep		endpoint;
@@ -542,7 +511,6 @@ struct dwc3_ep {
 
 	unsigned		direction:1;
 	unsigned		stream_capable:1;
-	struct dwc3_ep_events	dbg_ep_events;
 };
 
 enum dwc3_phy {
@@ -866,8 +834,6 @@ struct dwc3 {
 	bool			core_reset_after_phy_init;
 	bool			err_evt_seen;
 	bool			hsphy_auto_suspend_disable;
-	bool			enable_suspend_event;
-	struct dwc3_gadget_events	dbg_gadget_events;
 };
 
 /* -------------------------------------------------------------------------- */

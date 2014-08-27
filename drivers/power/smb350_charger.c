@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2013 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/debugfs.h>
+#include <linux/workqueue.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/power_supply.h>
@@ -89,21 +90,38 @@
 #define CMD_A_VOLATILE_WR_PERM		BIT(7)
 #define CHG_CTRL_CURR_TERM_END_CHG	BIT(6)
 
-struct smb350_chg {
+enum smb350_chg_status {
+	SMB_CHG_STATUS_NONE		= 0,
+	SMB_CHG_STATUS_PRE_CHARGE	= 1,
+	SMB_CHG_STATUS_FAST_CHARGE	= 2,
+	SMB_CHG_STATUS_TAPER_CHARGE	= 3,
+};
+
+static const char * const smb350_chg_status[] = {
+	"none",
+	"pre-charge",
+	"fast-charge",
+	"taper-charge"
+};
+
+struct smb350_device {
+	/* setup */
 	int			chg_current_ma;
 	int			term_current_ma;
 	int			chg_en_n_gpio;
-	int			chg_shdn_n_gpio;
+	int			chg_susp_n_gpio;
+	int			stat_gpio;
 	int			irq;
-	int			fake_battery_soc;
-	int			version;
+	/* internal */
+	enum smb350_chg_status	chg_status;
 	struct i2c_client	*client;
+	struct delayed_work	irq_work;
 	struct dentry		*dent;
+	struct wake_lock	chg_wake_lock;
 	struct power_supply	dc_psy;
-	struct power_supply	batt_psy;
 };
 
-static struct smb350_chg *the_chip;
+static struct smb350_device *smb350_dev;
 
 struct debug_reg {
 	char	*name;
@@ -226,13 +244,72 @@ static bool smb350_is_charger_present(struct i2c_client *client)
 	return true;
 }
 
-static void smb350_enable_charging(struct smb350_chg *chip, bool enable)
+static int smb350_get_prop_charge_type(struct smb350_device *dev)
+{
+	int status_b;
+	enum smb350_chg_status status;
+	int chg_type = POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
+	bool chg_enabled;
+	bool charger_err;
+	struct i2c_client *client = dev->client;
+
+	status_b = smb350_read_reg(client, STATUS_B_REG);
+	if (status_b < 0) {
+		pr_err("failed to read STATUS_B_REG.\n");
+		return POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
+	}
+
+	chg_enabled = (bool) (status_b & 0x01);
+	charger_err = (bool) (status_b & (1<<6));
+
+	if (!chg_enabled) {
+		pr_warn("Charging not enabled.\n");
+		/* release the wake-lock when DC power removed */
+		if (wake_lock_active(&dev->chg_wake_lock))
+			wake_unlock(&dev->chg_wake_lock);
+		return POWER_SUPPLY_CHARGE_TYPE_NONE;
+	}
+
+	if (charger_err) {
+		pr_warn("Charger error detected.\n");
+		return POWER_SUPPLY_CHARGE_TYPE_NONE;
+	}
+
+	status = (status_b >> 1) & 0x3;
+
+	if (status == SMB_CHG_STATUS_NONE)
+		chg_type = POWER_SUPPLY_CHARGE_TYPE_NONE;
+	else if (status == SMB_CHG_STATUS_FAST_CHARGE) /* constant current */
+		chg_type = POWER_SUPPLY_CHARGE_TYPE_FAST;
+	else if (status == SMB_CHG_STATUS_TAPER_CHARGE) /* constant voltage */
+		chg_type = POWER_SUPPLY_CHARGE_TYPE_FAST;
+	else if (status == SMB_CHG_STATUS_PRE_CHARGE)
+		chg_type = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
+
+	pr_debug("smb-chg-status=%d=%s.\n", status, smb350_chg_status[status]);
+
+	if (dev->chg_status != status) { /* Status changed */
+		if (status == SMB_CHG_STATUS_NONE) {
+			pr_debug("Charging stopped.\n");
+			wake_unlock(&dev->chg_wake_lock);
+		} else {
+			pr_debug("Charging started.\n");
+			wake_lock(&dev->chg_wake_lock);
+		}
+	}
+
+	dev->chg_status = status;
+
+	return chg_type;
+}
+
+static void smb350_enable_charging(struct smb350_device *dev, bool enable)
 {
 	int val = !enable; /* active low */
 
 	pr_debug("enable=%d.\n", enable);
-	if (gpio_is_valid(chip->chg_en_n_gpio))
-		gpio_set_value_cansleep(chip->chg_en_n_gpio, val);
+
+	gpio_set_value_cansleep(dev->chg_en_n_gpio, val);
 }
 
 /* When the status bit of a certain condition is read,
@@ -243,44 +320,27 @@ static int smb350_clear_irq(struct i2c_client *client)
 	int ret;
 
 	ret = smb350_read_reg(client, IRQ_STATUS_A_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ A\n");
+	if (ret < 0)
 		return ret;
-	}
 	ret = smb350_read_reg(client, IRQ_STATUS_B_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ B\n");
+	if (ret < 0)
 		return ret;
-	}
 	ret = smb350_read_reg(client, IRQ_STATUS_C_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ C\n");
+	if (ret < 0)
 		return ret;
-	}
 	ret = smb350_read_reg(client, IRQ_STATUS_D_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ D\n");
+	if (ret < 0)
 		return ret;
-	}
 	ret = smb350_read_reg(client, IRQ_STATUS_E_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ E\n");
+	if (ret < 0)
 		return ret;
-	}
 	ret = smb350_read_reg(client, IRQ_STATUS_F_REG);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ F\n");
+	if (ret < 0)
 		return ret;
-	}
 
 	return 0;
 }
 
-/*
- * The STAT pin is low when charging and high when not charging.
- * When the smb350 start/stop charging the STAT pin triggers an interrupt.
- * Interrupt is triggered on both rising or falling edge.
- */
 /*
  * Do the IRQ work from a thread context rather than interrupt context.
  * Read status registers to clear interrupt source.
@@ -292,197 +352,46 @@ static int smb350_clear_irq(struct i2c_client *client)
  * 4. Temperture too hot/cold
  * 5. Charging timeout expired.
  */
-static irqreturn_t smb350_stat_handler(int irq, void *dev_id)
+static void smb350_irq_worker(struct work_struct *work)
 {
 	int ret = 0;
-	struct smb350_chg *chip = dev_id;
+	struct smb350_device *dev =
+		container_of(work, struct smb350_device, irq_work.work);
 
-	ret = smb350_clear_irq(chip->client);
-	if (ret < 0) {
-		pr_err("Couldn't clear IRQ ret = %d\n", ret);
-	} else {
+	ret = smb350_clear_irq(dev->client);
+	if (ret == 0) { /* Cleared ok */
+		/* Notify Battery-psy about status changed */
 		pr_debug("Notify power_supply_changed.\n");
-		power_supply_changed(&chip->dc_psy);
+		power_supply_changed(&dev->dc_psy);
 	}
+}
+
+/*
+ * The STAT pin is low when charging and high when not charging.
+ * When the smb350 start/stop charging the STAT pin triggers an interrupt.
+ * Interrupt is triggered on both rising or falling edge.
+ */
+static irqreturn_t smb350_irq(int irq, void *dev_id)
+{
+	struct smb350_device *dev = dev_id;
+
+	pr_debug("\n");
+
+	/* I2C transfers API should not run in interrupt context */
+	schedule_delayed_work(&dev->irq_work, msecs_to_jiffies(100));
+
 	return IRQ_HANDLED;
-}
-
-static enum power_supply_property pm_power_batt_props[] = {
-	POWER_SUPPLY_PROP_STATUS,
-	POWER_SUPPLY_PROP_PRESENT,
-	POWER_SUPPLY_PROP_CHARGING_ENABLED,
-	POWER_SUPPLY_PROP_CHARGE_TYPE,
-	POWER_SUPPLY_PROP_CAPACITY,
-	POWER_SUPPLY_PROP_HEALTH,
-	POWER_SUPPLY_PROP_TECHNOLOGY,
-};
-
-#define CHG_STAT_MASK		0x06
-#define CHG_STAT_SHIFT		1
-static int smb350_get_battery_status(struct smb350_chg *chip)
-{
-	int reg;
-
-	reg = smb350_read_reg(chip->client, STATUS_B_REG);
-	if (reg < 0)
-		return POWER_SUPPLY_STATUS_DISCHARGING;
-
-	if (reg & CHG_STAT_MASK)
-		return POWER_SUPPLY_STATUS_CHARGING;
-
-	return POWER_SUPPLY_STATUS_DISCHARGING;
-}
-
-#define BATTERY_MISSING_BIT	BIT(4)
-static int smb350_battery_present(struct smb350_chg *chip)
-{
-	int reg;
-
-	reg = smb350_read_reg(chip->client, IRQ_STATUS_B_REG);
-	if (reg < 0)
-		return true;
-
-	if (reg & BATTERY_MISSING_BIT)
-		return false;
-
-	return false;
-}
-
-static int smb350_get_charge_type(struct smb350_chg *chip)
-{
-	int type;
-	int reg;
-
-	reg = smb350_read_reg(chip->client, STATUS_B_REG);
-	if (reg < 0)
-		return POWER_SUPPLY_CHARGE_TYPE_NONE;
-
-	type = (reg & CHG_STAT_MASK) >> CHG_STAT_SHIFT;
-	switch (type) {
-	case 0:
-		return POWER_SUPPLY_CHARGE_TYPE_NONE;
-	case 1:
-		return POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
-	case 2:
-		return POWER_SUPPLY_CHARGE_TYPE_FAST;
-	case 3:
-		return POWER_SUPPLY_CHARGE_TYPE_FAST;
-	}
-
-	return POWER_SUPPLY_CHARGE_TYPE_NONE;
-}
-
-static int smb350_get_capacity(struct smb350_chg *chip)
-{
-	return 75;
-}
-
-#define HOT_HARD_LIMIT_BIT	BIT(6)
-#define COLD_HARD_LIMIT_BIT	BIT(4)
-#define HOT_SOFT_LIMIT_BIT	BIT(2)
-#define COLD_SOFT_LIMIT_BIT	BIT(0)
-static int smb350_get_health(struct smb350_chg *chip)
-{
-	int reg;
-
-	reg = smb350_read_reg(chip->client, IRQ_STATUS_A_REG);
-	if (reg & HOT_HARD_LIMIT_BIT)
-		return POWER_SUPPLY_HEALTH_OVERHEAT;
-	else if (reg & COLD_HARD_LIMIT_BIT)
-		return POWER_SUPPLY_HEALTH_COLD;
-	else if (reg & HOT_SOFT_LIMIT_BIT)
-		return POWER_SUPPLY_HEALTH_WARM;
-	else if (reg & COLD_SOFT_LIMIT_BIT)
-		return POWER_SUPPLY_HEALTH_COOL;
-	return POWER_SUPPLY_HEALTH_GOOD;
-}
-
-static int smb350_batt_get_property(struct power_supply *psy,
-			       enum power_supply_property psp,
-			       union power_supply_propval *val)
-{
-	int ret = 0;
-	struct smb350_chg *chip = container_of(psy,
-						 struct smb350_chg,
-						 batt_psy);
-	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = smb350_get_battery_status(chip);
-		break;
-	case POWER_SUPPLY_PROP_PRESENT:
-		val->intval = smb350_battery_present(chip);
-		break;
-	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
-		val->intval = 1;
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_TYPE:
-		val->intval = smb350_get_charge_type(chip);
-		break;
-	case POWER_SUPPLY_PROP_CAPACITY:
-		val->intval = smb350_get_capacity(chip);
-		break;
-	case POWER_SUPPLY_PROP_HEALTH:
-		val->intval = smb350_get_health(chip);
-		break;
-	case POWER_SUPPLY_PROP_TECHNOLOGY:
-		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
-		break;
-	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:
-		val->intval = 0;
-		break;
-	default:
-		pr_err("Invalid prop = %d.\n", psp);
-		ret = -EINVAL;
-		break;
-	}
-
-	return ret;
-}
-
-static int smb350_batt_set_property(struct power_supply *psy,
-			       enum power_supply_property psp,
-			       const union power_supply_propval *val)
-{
-	int ret = 0;
-	struct smb350_chg *chip =
-		container_of(psy, struct smb350_chg, batt_psy);
-
-	switch (psp) {
-	case POWER_SUPPLY_PROP_CAPACITY:
-		chip->fake_battery_soc = val->intval;
-		power_supply_changed(&chip->batt_psy);
-		break;
-	default:
-		pr_err("Invalid prop = %d.\n", psp);
-		ret = -EINVAL;
-	}
-
-	return ret;
-}
-
-static int smb350_battery_is_writeable(struct power_supply *psy,
-				       enum power_supply_property prop)
-{
-	int rc;
-
-	switch (prop) {
-	case POWER_SUPPLY_PROP_CAPACITY:
-		rc = 1;
-		break;
-	default:
-		rc = 0;
-		break;
-	}
-	return rc;
 }
 
 static enum power_supply_property pm_power_props[] = {
 	/* real time */
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
 	/* fixed */
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
 };
 
 static char *pm_power_supplied_to[] = {
@@ -494,10 +403,10 @@ static int smb350_get_property(struct power_supply *psy,
 			       union power_supply_propval *val)
 {
 	int ret = 0;
-	struct smb350_chg *chip = container_of(psy,
-						 struct smb350_chg,
+	struct smb350_device *dev = container_of(psy,
+						 struct smb350_device,
 						 dc_psy);
-	struct i2c_client *client = chip->client;
+	struct i2c_client *client = dev->client;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_PRESENT:
@@ -506,11 +415,17 @@ static int smb350_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_ONLINE:
 		val->intval = smb350_is_dc_present(client);
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+		val->intval = smb350_get_prop_charge_type(dev);
+		break;
 	case POWER_SUPPLY_PROP_MODEL_NAME:
 		val->strval = SMB350_NAME;
 		break;
 	case POWER_SUPPLY_PROP_MANUFACTURER:
 		val->strval = "Summit Microelectronics";
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		val->intval = dev->chg_current_ma;
 		break;
 	default:
 		pr_err("Invalid prop = %d.\n", psp);
@@ -526,8 +441,8 @@ static int smb350_set_property(struct power_supply *psy,
 			       const union power_supply_propval *val)
 {
 	int ret = 0;
-	struct smb350_chg *chip =
-		container_of(psy, struct smb350_chg, dc_psy);
+	struct smb350_device *dev =
+		container_of(psy, struct smb350_device, dc_psy);
 
 	switch (psp) {
 	/*
@@ -537,7 +452,7 @@ static int smb350_set_property(struct power_supply *psy,
 	 *  when charge-current reaching Termination-Current.
 	 */
 	case POWER_SUPPLY_PROP_ONLINE:
-		smb350_enable_charging(chip, val->intval);
+		smb350_enable_charging(dev, val->intval);
 		break;
 	default:
 		pr_err("Invalid prop = %d.\n", psp);
@@ -593,7 +508,7 @@ static int smb350_set_reg(void *data, u64 val)
 {
 	u32 addr = (u32) data;
 	int ret;
-	struct i2c_client *client = the_chip->client;
+	struct i2c_client *client = smb350_dev->client;
 
 	ret = smb350_write_reg(client, addr, (u8) val);
 
@@ -604,7 +519,7 @@ static int smb350_get_reg(void *data, u64 *val)
 {
 	u32 addr = (u32) data;
 	int ret;
-	struct i2c_client *client = the_chip->client;
+	struct i2c_client *client = smb350_dev->client;
 
 	ret = smb350_read_reg(client, addr);
 	if (ret < 0)
@@ -617,12 +532,11 @@ static int smb350_get_reg(void *data, u64 *val)
 
 DEFINE_SIMPLE_ATTRIBUTE(reg_fops, smb350_get_reg, smb350_set_reg, "0x%02llx\n");
 
-static int smb350_create_debugfs_entries(struct smb350_chg *chip)
+static int smb350_create_debugfs_entries(struct smb350_device *dev)
 {
 	int i;
-
-	chip->dent = debugfs_create_dir(SMB350_NAME, NULL);
-	if (IS_ERR(chip->dent)) {
+	dev->dent = debugfs_create_dir(SMB350_NAME, NULL);
+	if (IS_ERR(dev->dent)) {
 		pr_err("smb350 driver couldn't create debugfs dir\n");
 		return -EFAULT;
 	}
@@ -632,7 +546,7 @@ static int smb350_create_debugfs_entries(struct smb350_chg *chip)
 		u32 reg = smb350_debug_regs[i].reg;
 		struct dentry *file;
 
-		file = debugfs_create_file(name, 0644, chip->dent,
+		file = debugfs_create_file(name, 0644, dev->dent,
 					(void *) reg, &reg_fops);
 		if (IS_ERR(file)) {
 			pr_err("debugfs_create_file %s failed.\n", name);
@@ -643,30 +557,12 @@ static int smb350_create_debugfs_entries(struct smb350_chg *chip)
 	return 0;
 }
 
-static int smb350_hw_init(struct smb350_chg *chip)
+static int smb350_set_volatile_params(struct smb350_device *dev)
 {
 	int ret;
-	struct i2c_client *client = chip->client;
+	struct i2c_client *client = dev->client;
 
 	pr_debug("\n");
-
-	smb350_enable_charging(chip, true);
-	msleep(100);
-
-	if (gpio_is_valid(chip->chg_shdn_n_gpio)) {
-		gpio_set_value_cansleep(chip->chg_shdn_n_gpio, 1); /* Normal */
-		msleep(100); /* Allow the device to exist shutdown */
-	}
-
-	/* I2C transaction allowed only after device exit suspend */
-	ret = smb350_read_reg(client, I2C_SLAVE_ADDR_REG);
-	if ((ret>>1) != client->addr) {
-		pr_err("No device.\n");
-		return -ENODEV;
-	}
-
-	chip->version = smb350_read_reg(client, HW_VERSION_REG);
-	chip->version &= 0x0F; /* bits 0..3 */
 
 	ret = smb350_write_reg(client, CMD_A_REG, CMD_A_VOLATILE_WR_PERM);
 	if (ret) {
@@ -674,11 +570,9 @@ static int smb350_hw_init(struct smb350_chg *chip)
 		return ret;
 	}
 
-	/*
-	 * Disable SMB350 pulse-IRQ mechanism,
+	/* Disable SMB350 pulse-IRQ mechanism,
 	 * we use interrupts based on charging-status-transition
 	 */
-
 	/* Enable STATUS output (regardless of IRQ-pulses) */
 	smb350_masked_write(client, CMD_A_REG, BIT(0), 0);
 
@@ -702,62 +596,45 @@ static int smb350_hw_init(struct smb350_chg *chip)
 	/* Enable charging/not-charging status output via STAT pin */
 	smb350_masked_write(client, STAT_TIMER_REG, BIT(5), 0);
 
+	/* Disable Automatic Recharge */
+	smb350_masked_write(client, CHG_CTRL_REG, BIT(7), 1);
+
 	/* Set fast-charge current */
-	if (chip->chg_current_ma) {
-		ret = smb350_set_chg_current(client, chip->chg_current_ma);
-		if (ret) {
-			pr_err("Failed to set FAST_CHG_CURRENT ret=%d\n", ret);
-			return ret;
-		}
+	ret = smb350_set_chg_current(client, dev->chg_current_ma);
+	if (ret) {
+		pr_err("Failed to set FAST_CHG_CURRENT ret=%d\n", ret);
+		return ret;
 	}
 
-	if (chip->term_current_ma > 0) {
+	if (dev->term_current_ma > 0) {
 		/* Enable Current Termination */
 		smb350_masked_write(client, CHG_CTRL_REG, BIT(6), 0);
 
 		/* Set Termination current */
-		smb350_set_term_current(client, chip->term_current_ma);
+		smb350_set_term_current(client, dev->term_current_ma);
 	} else {
 		/* Disable Current Termination */
 		smb350_masked_write(client, CHG_CTRL_REG, BIT(6), 1);
 	}
-	return 0;
-}
-
-static int smb350_register_batt_psy(struct smb350_chg *chip)
-{
-	int ret;
-
-	chip->batt_psy.name = "battery";
-	chip->batt_psy.type = POWER_SUPPLY_TYPE_BATTERY;
-	chip->batt_psy.properties = pm_power_batt_props;
-	chip->batt_psy.num_properties = ARRAY_SIZE(pm_power_batt_props);
-	chip->batt_psy.get_property = smb350_batt_get_property;
-	chip->batt_psy.set_property = smb350_batt_set_property;
-	chip->batt_psy.property_is_writeable = smb350_battery_is_writeable;
-	ret = power_supply_register(&chip->client->dev, &chip->batt_psy);
-	if (ret) {
-		pr_err("Couldn't register power_supply ret=%d.\n", ret);
-		return ret;
-	}
 
 	return 0;
 }
 
-static int smb350_register_psy(struct smb350_chg *chip)
+static int smb350_register_psy(struct smb350_device *dev)
 {
 	int ret;
 
-	chip->dc_psy.name = "dc";
-	chip->dc_psy.type = POWER_SUPPLY_TYPE_MAINS;
-	chip->dc_psy.supplied_to = pm_power_supplied_to;
-	chip->dc_psy.num_supplicants = ARRAY_SIZE(pm_power_supplied_to);
-	chip->dc_psy.properties = pm_power_props;
-	chip->dc_psy.num_properties = ARRAY_SIZE(pm_power_props);
-	chip->dc_psy.get_property = smb350_get_property;
-	chip->dc_psy.set_property = smb350_set_property;
+	dev->dc_psy.name = "dc";
+	dev->dc_psy.type = POWER_SUPPLY_TYPE_MAINS;
+	dev->dc_psy.supplied_to = pm_power_supplied_to;
+	dev->dc_psy.num_supplicants = ARRAY_SIZE(pm_power_supplied_to);
+	dev->dc_psy.properties = pm_power_props;
+	dev->dc_psy.num_properties = ARRAY_SIZE(pm_power_props);
+	dev->dc_psy.get_property = smb350_get_property;
+	dev->dc_psy.set_property = smb350_set_property;
 
-	ret = power_supply_register(&chip->client->dev, &chip->dc_psy);
+	ret = power_supply_register(&dev->client->dev,
+				&dev->dc_psy);
 	if (ret) {
 		pr_err("failed to register power_supply. ret=%d.\n", ret);
 		return ret;
@@ -766,40 +643,17 @@ static int smb350_register_psy(struct smb350_chg *chip)
 	return 0;
 }
 
-static int smb350_parse_dt(struct smb350_chg *chip)
-{
-	int rc;
-	struct device_node *node = chip->client->dev.of_node;
-
-	if (!node) {
-		pr_err("No DT data Failing Probe\n");
-		return -EINVAL;
-	}
-
-	chip->chg_en_n_gpio =
-		of_get_named_gpio(node, "summit,chg-en-n-gpio", 0);
-	pr_debug("chg_en_n_gpio = %d.\n", chip->chg_en_n_gpio);
-
-	chip->chg_shdn_n_gpio =
-		of_get_named_gpio(node,
-				  "summit,chg-shdn-n-gpio", 0);
-	pr_debug("chg_shdn_n_gpio = %d.\n", chip->chg_shdn_n_gpio);
-
-	rc = of_property_read_u32(node, "summit,chg-current-ma",
-				   &(chip->chg_current_ma));
-	pr_debug("chg_current_ma = %d.\n", chip->chg_current_ma);
-
-	rc = of_property_read_u32(node, "summit,term-current-ma",
-				   &(chip->term_current_ma));
-	pr_debug("term_current_ma = %d.\n", chip->term_current_ma);
-	return 0;
-}
-
 static int smb350_probe(struct i2c_client *client,
 				  const struct i2c_device_id *id)
 {
 	int ret = 0;
-	struct smb350_chg *chip;
+	const struct smb350_platform_data *pdata;
+	struct device_node *dev_node = client->dev.of_node;
+	struct smb350_device *dev;
+	u8 version;
+
+	/* STAT pin change on start/stop charging */
+	u32 irq_flags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
 
 	if (!i2c_check_functionality(client->adapter,
 				I2C_FUNC_SMBUS_BYTE_DATA)) {
@@ -807,112 +661,166 @@ static int smb350_probe(struct i2c_client *client,
 		return -EIO;
 	}
 
-	chip = devm_kzalloc(&client->dev, sizeof(*chip), GFP_KERNEL);
-	if (!chip) {
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev) {
 		pr_err("alloc fail.\n");
 		return -ENOMEM;
 	}
 
-	chip->fake_battery_soc = 75;
+	smb350_dev = dev;
+	dev->client = client;
 
-	chip->client = client;
-	ret = smb350_parse_dt(chip);
-	if (ret < 0) {
-		pr_err("Couldn't to parse dt ret = %d\n", ret);
-		return ret;
-	}
+	if (dev_node) {
+		dev->chg_en_n_gpio =
+			of_get_named_gpio(dev_node, "summit,chg-en-n-gpio", 0);
+		pr_debug("chg_en_n_gpio = %d.\n", dev->chg_en_n_gpio);
 
-	chip->irq = client->irq;
-	pr_debug("irq#=%d.\n", chip->irq);
+		dev->chg_susp_n_gpio =
+			of_get_named_gpio(dev_node,
+					  "summit,chg-susp-n-gpio", 0);
+		pr_debug("chg_susp_n_gpio = %d.\n", dev->chg_susp_n_gpio);
 
-	if (gpio_is_valid(chip->chg_shdn_n_gpio)) {
-		ret = gpio_request(chip->chg_shdn_n_gpio, "smb350_suspend");
+		dev->stat_gpio =
+			of_get_named_gpio(dev_node, "summit,stat-gpio", 0);
+		pr_debug("stat_gpio = %d.\n", dev->stat_gpio);
+
+		ret = of_property_read_u32(dev_node, "summit,chg-current-ma",
+					   &(dev->chg_current_ma));
+		pr_debug("chg_current_ma = %d.\n", dev->chg_current_ma);
 		if (ret) {
-			pr_err("gpio_request failed for %d ret=%d\n",
-				chip->chg_shdn_n_gpio, ret);
+			pr_err("Unable to read chg_current.\n");
 			return ret;
 		}
-	}
-
-	if (gpio_is_valid(chip->chg_en_n_gpio)) {
-		ret = gpio_request(chip->chg_en_n_gpio, "smb350_chg_enable");
+		ret = of_property_read_u32(dev_node, "summit,term-current-ma",
+					   &(dev->term_current_ma));
+		pr_debug("term_current_ma = %d.\n", dev->term_current_ma);
 		if (ret) {
-			pr_err("gpio_request failed for %d ret=%d\n",
-				chip->chg_en_n_gpio, ret);
-			goto free_shdn_gpio;
+			pr_err("Unable to read term_current_ma.\n");
+			return ret;
 		}
+	} else {
+		pdata = client->dev.platform_data;
+
+		if (pdata == NULL) {
+			pr_err("no platform data.\n");
+			return -EINVAL;
+		}
+
+		dev->chg_en_n_gpio = pdata->chg_en_n_gpio;
+		dev->chg_susp_n_gpio = pdata->chg_susp_n_gpio;
+		dev->stat_gpio = pdata->stat_gpio;
+
+		dev->chg_current_ma = pdata->chg_current_ma;
+		dev->term_current_ma = pdata->term_current_ma;
 	}
 
-	i2c_set_clientdata(client, chip);
-
-	ret = smb350_hw_init(chip);
-	if (ret < 0) {
-		pr_err("Couldn't initialize hw ret = %d\n", ret);
-		goto free_en_gpio;
-	}
-
-	ret = smb350_register_batt_psy(chip);
-	if (ret < 0) {
-		pr_err("Couldn't register batt psy ret = %d\n", ret);
-		goto free_en_gpio;
-	}
-
-	ret = smb350_register_psy(chip);
-	if (ret < 0) {
-		pr_err("Couldn't register dc psy ret = %d\n", ret);
-		goto unregister_batt;
-	}
-
-	ret = smb350_create_debugfs_entries(chip);
-	if (ret < 0) {
-		pr_err("Couldn't create debugfs entries ret = %d\n", ret);
-		goto unregister_dc;
-	}
-
-	ret = devm_request_threaded_irq(&client->dev, chip->irq,
-		NULL, smb350_stat_handler,
-		IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-		"smb350_irq", chip);
+	ret = gpio_request(dev->stat_gpio, "smb350_stat");
 	if (ret) {
-		pr_err("request_irq %d failed.ret=%d\n", chip->irq, ret);
-		goto remove_debugfs;
+		pr_err("gpio_request failed for %d ret=%d\n",
+		       dev->stat_gpio, ret);
+		goto err_stat_gpio;
+	}
+	dev->irq = gpio_to_irq(dev->stat_gpio);
+	pr_debug("irq#=%d.\n", dev->irq);
+
+	ret = gpio_request(dev->chg_susp_n_gpio, "smb350_suspend");
+	if (ret) {
+		pr_err("gpio_request failed for %d ret=%d\n",
+			dev->chg_susp_n_gpio, ret);
+		goto err_susp_gpio;
 	}
 
-	the_chip = chip;
-	pr_info("HW Version = 0x%X.\n", chip->version);
+	ret = gpio_request(dev->chg_en_n_gpio, "smb350_charger_enable");
+	if (ret) {
+		pr_err("gpio_request failed for %d ret=%d\n",
+			dev->chg_en_n_gpio, ret);
+		goto err_en_gpio;
+	}
+
+	i2c_set_clientdata(client, dev);
+
+	/* Disable battery charging by default on power up.
+	 * Battery charging is enabled by BMS or Battery-Gauge
+	 * by using the set_property callback.
+	 */
+	smb350_enable_charging(dev, false);
+	msleep(100);
+	gpio_set_value_cansleep(dev->chg_susp_n_gpio, 1); /* Normal */
+	msleep(100); /* Allow the device to exist shutdown */
+
+	/* I2C transaction allowed only after device exit suspend */
+	ret = smb350_read_reg(client, I2C_SLAVE_ADDR_REG);
+	if ((ret>>1) != client->addr) {
+		pr_err("No device.\n");
+		ret = -ENODEV;
+		goto err_no_dev;
+	}
+
+	version = smb350_read_reg(client, HW_VERSION_REG);
+	version &= 0x0F; /* bits 0..3 */
+
+	ret = smb350_set_volatile_params(dev);
+	if (ret)
+		goto err_set_params;
+
+	ret = smb350_register_psy(dev);
+	if (ret)
+		goto err_set_params;
+
+	ret = smb350_create_debugfs_entries(dev);
+	if (ret)
+		goto err_debugfs;
+
+	INIT_DELAYED_WORK(&dev->irq_work, smb350_irq_worker);
+	wake_lock_init(&dev->chg_wake_lock,
+		       WAKE_LOCK_SUSPEND, SMB350_NAME);
+
+	ret = request_irq(dev->irq, smb350_irq, irq_flags,
+			  "smb350_irq", dev);
+	if (ret) {
+		pr_err("request_irq %d failed.ret=%d\n", dev->irq, ret);
+		goto err_irq;
+	}
+
+	pr_info("HW Version = 0x%X.\n", version);
 
 	return 0;
 
-remove_debugfs:
-	debugfs_remove_recursive(chip->dent);
-unregister_dc:
-	power_supply_unregister(&chip->dc_psy);
-unregister_batt:
-	power_supply_unregister(&chip->batt_psy);
-free_en_gpio:
-	if (gpio_is_valid(chip->chg_en_n_gpio))
-		gpio_free(chip->chg_en_n_gpio);
-free_shdn_gpio:
-	if (gpio_is_valid(chip->chg_shdn_n_gpio))
-		gpio_free(chip->chg_shdn_n_gpio);
+err_irq:
+err_debugfs:
+	if (dev->dent)
+		debugfs_remove_recursive(dev->dent);
+err_no_dev:
+err_set_params:
+	gpio_free(dev->chg_en_n_gpio);
+err_en_gpio:
+	gpio_free(dev->chg_susp_n_gpio);
+err_susp_gpio:
+	gpio_free(dev->stat_gpio);
+err_stat_gpio:
+	kfree(smb350_dev);
+	smb350_dev = NULL;
+
+	pr_info("FAIL.\n");
 
 	return ret;
 }
 
 static int smb350_remove(struct i2c_client *client)
 {
-	struct smb350_chg *chip = i2c_get_clientdata(client);
+	struct smb350_device *dev = i2c_get_clientdata(client);
 
-	debugfs_remove_recursive(chip->dent);
-	power_supply_unregister(&chip->dc_psy);
-	power_supply_unregister(&chip->batt_psy);
-	if (gpio_is_valid(chip->chg_en_n_gpio))
-		gpio_free(chip->chg_en_n_gpio);
-	if (gpio_is_valid(chip->chg_shdn_n_gpio))
-		gpio_free(chip->chg_shdn_n_gpio);
-	if (chip->irq)
-		free_irq(chip->irq, chip);
-	the_chip = NULL;
+	power_supply_unregister(&dev->dc_psy);
+	gpio_free(dev->chg_en_n_gpio);
+	gpio_free(dev->chg_susp_n_gpio);
+	if (dev->stat_gpio)
+		gpio_free(dev->stat_gpio);
+	if (dev->irq)
+		free_irq(dev->irq, dev);
+	if (dev->dent)
+		debugfs_remove_recursive(dev->dent);
+	kfree(smb350_dev);
+	smb350_dev = NULL;
 
 	return 0;
 }

@@ -21,7 +21,7 @@
 #define MSM_VDEC_DVC_NAME "msm_vdec_8974"
 #define MIN_NUM_OUTPUT_BUFFERS 4
 #define MAX_NUM_OUTPUT_BUFFERS VIDEO_MAX_FRAME
-#define DEFAULT_VIDEO_CONCEAL_COLOR_BLACK 0x8080
+#define DEFAULT_VIDEO_CONCEAL_COLOR_BLACK 0x8010
 #define MB_SIZE_IN_PIXEL (16 * 16)
 
 #define TZ_DYNAMIC_BUFFER_FEATURE_ID 12
@@ -760,7 +760,7 @@ int msm_vdec_release_buf(struct msm_vidc_inst *inst,
 {
 	int rc = 0;
 	struct vidc_buffer_addr_info buffer_info;
-	struct msm_vidc_core *core;
+	struct msm_vidc_core *core = inst->core;
 	int extra_idx = 0;
 	int i;
 	struct hfi_device *hdev;
@@ -769,7 +769,7 @@ int msm_vdec_release_buf(struct msm_vidc_inst *inst,
 		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
 		return -EINVAL;
 	}
-	core = inst->core;
+
 	hdev = inst->core->device;
 
 	if (inst->state == MSM_VIDC_CORE_INVALID ||
@@ -1020,26 +1020,6 @@ int msm_vdec_g_fmt(struct msm_vidc_inst *inst, struct v4l2_format *f)
 				(__u16)inst->prop.width[CAPTURE_PORT];
 			f->fmt.pix_mp.plane_fmt[0].reserved[0] =
 				(__u16)inst->prop.height[CAPTURE_PORT];
-		}
-
-		if (msm_comm_get_stream_output_mode(inst) ==
-			HAL_VIDEO_DECODER_SECONDARY) {
-			if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-				f->fmt.pix_mp.height =
-					inst->prop.height[CAPTURE_PORT];
-				f->fmt.pix_mp.width =
-					inst->prop.width[CAPTURE_PORT];
-			} else if (f->type ==
-					V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-				f->fmt.pix_mp.height =
-					inst->prop.height[OUTPUT_PORT];
-				f->fmt.pix_mp.width =
-					inst->prop.width[OUTPUT_PORT];
-				f->fmt.pix_mp.plane_fmt[0].bytesperline =
-					(__u16)inst->prop.width[OUTPUT_PORT];
-				f->fmt.pix_mp.plane_fmt[0].reserved[0] =
-					(__u16)inst->prop.height[OUTPUT_PORT];
-			}
 		}
 	} else {
 		dprintk(VIDC_ERR,
@@ -1408,6 +1388,70 @@ static int msm_vdec_queue_setup(struct vb2_queue *q,
 	return rc;
 }
 
+static int msm_vdec_queue_output_buffers(struct msm_vidc_inst *inst)
+{
+	struct internal_buf *binfo;
+	struct hfi_device *hdev;
+	struct msm_smem *handle;
+	struct vidc_frame_data frame_data = {0};
+	struct hal_buffer_requirements *output_buf, *extradata_buf;
+	int rc = 0;
+
+	if (!inst || !inst->core || !inst->core->device) {
+		dprintk(VIDC_ERR, "%s invalid parameters\n", __func__);
+		return -EINVAL;
+	}
+
+	hdev = inst->core->device;
+
+	output_buf = get_buff_req_buffer(inst, HAL_BUFFER_OUTPUT);
+	if (!output_buf) {
+		dprintk(VIDC_DBG,
+			"This output buffer not required, buffer_type: %x\n",
+			HAL_BUFFER_OUTPUT);
+		return 0;
+	}
+	dprintk(VIDC_DBG,
+		"output: num = %d, size = %d\n",
+		output_buf->buffer_count_actual,
+		output_buf->buffer_size);
+
+	extradata_buf = get_buff_req_buffer(inst, HAL_BUFFER_EXTRADATA_OUTPUT);
+	if (!extradata_buf) {
+		dprintk(VIDC_DBG,
+			"This extradata buffer not required, buffer_type: %x\n",
+			HAL_BUFFER_EXTRADATA_OUTPUT);
+		return 0;
+	}
+
+	hdev = inst->core->device;
+
+	mutex_lock(&inst->lock);
+	if (!list_empty(&inst->outputbufs)) {
+		list_for_each_entry(binfo, &inst->outputbufs, list) {
+			if (!binfo) {
+				dprintk(VIDC_ERR, "Invalid parameter\n");
+				mutex_unlock(&inst->lock);
+				return -EINVAL;
+			}
+			handle = binfo->handle;
+			frame_data.alloc_len = output_buf->buffer_size;
+			frame_data.filled_len = 0;
+			frame_data.offset = 0;
+			frame_data.device_addr = handle->device_addr;
+			frame_data.flags = 0;
+			frame_data.extradata_addr = handle->device_addr +
+				output_buf->buffer_size;
+			frame_data.buffer_type = HAL_BUFFER_OUTPUT;
+			rc = call_hfi_op(hdev, session_ftb,
+					(void *) inst->session, &frame_data);
+			binfo->buffer_ownership = FIRMWARE;
+		}
+	}
+	mutex_unlock(&inst->lock);
+	return 0;
+}
+
 static inline int start_streaming(struct msm_vidc_inst *inst)
 {
 	int rc = 0;
@@ -1458,7 +1502,7 @@ static inline int start_streaming(struct msm_vidc_inst *inst)
 	}
 	if (msm_comm_get_stream_output_mode(inst) ==
 		HAL_VIDEO_DECODER_SECONDARY) {
-		rc = msm_comm_queue_output_buffers(inst);
+		rc = msm_vdec_queue_output_buffers(inst);
 		if (rc) {
 			dprintk(VIDC_ERR,
 				"Failed to queue output buffers: %d\n", rc);
@@ -1577,13 +1621,12 @@ static void msm_vdec_buf_queue(struct vb2_buffer *vb)
 int msm_vdec_cmd(struct msm_vidc_inst *inst, struct v4l2_decoder_cmd *dec)
 {
 	int rc = 0;
-	struct msm_vidc_core *core;
+	struct msm_vidc_core *core = inst->core;
 
 	if (!dec || !inst || !inst->core) {
 		dprintk(VIDC_ERR, "%s invalid params\n", __func__);
 		return -EINVAL;
 	}
-	core = inst->core;
 	switch (dec->cmd) {
 	case V4L2_DEC_QCOM_CMD_FLUSH:
 		if (core->state != VIDC_CORE_INVALID &&

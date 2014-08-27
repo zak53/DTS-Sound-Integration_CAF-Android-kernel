@@ -29,6 +29,7 @@
 int mdss_pll_resource_enable(struct mdss_pll_resources *pll_res, bool enable)
 {
 	int rc = 0;
+	int changed = 0;
 	if (!pll_res) {
 		pr_err("Invalid input parameters\n");
 		return -EINVAL;
@@ -44,11 +45,27 @@ int mdss_pll_resource_enable(struct mdss_pll_resources *pll_res, bool enable)
 		return rc;
 	}
 
-	rc = mdss_pll_util_resource_enable(pll_res, enable);
-	if (rc)
-		pr_err("Resource update failed rc=%d\n", rc);
-	else
-		pll_res->resource_enable = enable;
+	if (enable) {
+		if (pll_res->resource_ref_cnt == 0)
+			changed++;
+		pll_res->resource_ref_cnt++;
+	} else {
+		if (pll_res->resource_ref_cnt) {
+			pll_res->resource_ref_cnt--;
+			if (pll_res->resource_ref_cnt == 0)
+				changed++;
+		} else {
+			pr_err("PLL Resources already OFF\n");
+		}
+	}
+
+	if (changed) {
+		rc = mdss_pll_util_resource_enable(pll_res, enable);
+		if (rc)
+			pr_err("Resource update failed rc=%d\n", rc);
+		else
+			pll_res->resource_enable = enable;
+	}
 
 	return rc;
 }
@@ -113,6 +130,9 @@ static int mdss_pll_resource_parse(struct platform_device *pdev,
 	if (!strcmp(compatible_stream, "qcom,mdss_dsi_pll_8916")) {
 		pll_res->pll_interface_type = MDSS_DSI_PLL_LPM;
 		pll_res->target_id = MDSS_PLL_TARGET_8916;
+	} else if (!strcmp(compatible_stream, "qcom,mdss_dsi_pll_8939")) {
+		pll_res->pll_interface_type = MDSS_DSI_PLL_LPM;
+		pll_res->target_id = MDSS_PLL_TARGET_8939;
 	} else if (!strcmp(compatible_stream, "qcom,mdss_dsi_pll_8974")) {
 		pll_res->pll_interface_type = MDSS_DSI_PLL_HPM;
 		pll_res->target_id = MDSS_PLL_TARGET_8974;
@@ -288,6 +308,7 @@ static int mdss_pll_remove(struct platform_device *pdev)
 static const struct of_device_id mdss_pll_dt_match[] = {
 	{.compatible = "qcom,mdss_dsi_pll_8974"},
 	{.compatible = "qcom,mdss_dsi_pll_8916"},
+	{.compatible = "qcom,mdss_dsi_pll_8939"},
 	{.compatible = "qcom,mdss_edp_pll"},
 	{.compatible = "qcom,mdss_hdmi_pll"},
 	{}

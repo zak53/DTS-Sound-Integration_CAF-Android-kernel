@@ -67,15 +67,12 @@ static int get_device_address(struct smem_client *smem_client,
 		return -EINVAL;
 	}
 
-	if (is_iommu_present(smem_client->res)) {
-		rc = msm_smem_get_domain_partition(smem_client, flags,
-				buffer_type, &domain, &partition);
-		if (rc) {
-			dprintk(VIDC_ERR,
-					"Failed to get domain and partition: %d\n",
-					rc);
-			goto mem_domain_get_failed;
-		}
+	rc = msm_smem_get_domain_partition(smem_client, flags, buffer_type,
+			&domain, &partition);
+	if (rc) {
+		dprintk(VIDC_ERR, "Failed to get domain and partition: %d\n",
+				rc);
+		goto mem_domain_get_failed;
 	}
 
 	if (flags & SMEM_SECURE) {
@@ -235,7 +232,7 @@ static int alloc_ion_mem(struct smem_client *client, size_t size, u32 align,
 	mem->buffer_type = buffer_type;
 	if (map_kernel) {
 		mem->kvaddr = ion_map_kernel(client->clnt, hndl);
-		if (!mem->kvaddr) {
+		if (IS_ERR(mem->kvaddr) || !mem->kvaddr) {
 			dprintk(VIDC_ERR,
 				"Failed to map shared mem in kernel\n");
 			rc = -EIO;

@@ -130,7 +130,7 @@ config KLM
 
 config MSM_AVTIMER
 	tristate "Avtimer Driver"
-	depends on MSM_QDSP6_APRV2
+	depends on MSM_QDSP6_APRV2 || MSM_QDSP6_APRV3
 	help
 		This driver gets the Q6 out of power collapsed state and
 		exposes ioctl control to read avtimer tick.
@@ -182,11 +182,5 @@ config BUS_TOPOLOGY_ADHOC
 		Adhoc bus topology driver allows one to many connections and maintains
 		directionality of connections by explicitly listing device connections
 		thus avoiding illegal routes.
-
-config MSM_UIM_HSL
-	tristate "User Indentification Module (UIM) on UART High Speed"
-	help
-	  If you say yes to this option, support will be included for the
-	  built-in UIM interface on Qualcomm MSM family processors.
 
 endmenu

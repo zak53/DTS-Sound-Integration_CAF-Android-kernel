@@ -41,6 +41,7 @@
 #else
 #define CDBG(fmt, args...) do { } while (0)
 #endif
+
 static struct msm_isp_bufq *msm_isp_get_bufq(
 	struct msm_isp_buf_mgr *buf_mgr,
 	uint32_t bufq_handle)
@@ -115,31 +116,19 @@ static int msm_isp_free_buf_handle(struct msm_isp_buf_mgr *buf_mgr,
 	return 0;
 }
 
-static void msm_isp_copy_planes_from_v4l2_buffer(
-	struct msm_isp_qbuf_buffer *qbuf_buf,
-	const struct v4l2_buffer *v4l2_buf)
-{
-	int i;
-	qbuf_buf->num_planes = v4l2_buf->length;
-	for (i = 0; i < qbuf_buf->num_planes; i++) {
-		qbuf_buf->planes[i].addr = v4l2_buf->m.planes[i].m.userptr;
-		qbuf_buf->planes[i].offset = v4l2_buf->m.planes[i].data_offset;
-	}
-}
-
-static int msm_isp_prepare_isp_buf(struct msm_isp_buf_mgr *buf_mgr,
+static int msm_isp_prepare_v4l2_buf(struct msm_isp_buf_mgr *buf_mgr,
 	struct msm_isp_buffer *buf_info,
-	struct msm_isp_qbuf_buffer *qbuf_buf)
+	struct v4l2_buffer *v4l2_buf)
 {
 	int i, rc = -1;
 	struct msm_isp_buffer_mapped_info *mapped_info;
 	struct buffer_cmd *buf_pending = NULL;
 
-	for (i = 0; i < qbuf_buf->num_planes; i++) {
+	for (i = 0; i < v4l2_buf->length; i++) {
 		mapped_info = &buf_info->mapped_info[i];
 		mapped_info->handle =
 		ion_import_dma_buf(buf_mgr->client,
-			qbuf_buf->planes[i].addr);
+			v4l2_buf->m.planes[i].m.userptr);
 		if (IS_ERR_OR_NULL(mapped_info->handle)) {
 			pr_err("%s: buf has null/error ION handle %p\n",
 				__func__, mapped_info->handle);
@@ -154,7 +143,7 @@ static int msm_isp_prepare_isp_buf(struct msm_isp_buf_mgr *buf_mgr,
 			ion_free(buf_mgr->client, mapped_info->handle);
 			goto ion_map_error;
 		}
-		mapped_info->paddr += qbuf_buf->planes[i].offset;
+		mapped_info->paddr += v4l2_buf->m.planes[i].data_offset;
 		CDBG("%s: plane: %d addr:%lu\n",
 			__func__, i, mapped_info->paddr);
 
@@ -167,7 +156,7 @@ static int msm_isp_prepare_isp_buf(struct msm_isp_buf_mgr *buf_mgr,
 		buf_pending->mapped_info = mapped_info;
 		list_add_tail(&buf_pending->list, &buf_mgr->buffer_q);
 	}
-	buf_info->num_planes = qbuf_buf->num_planes;
+	buf_info->num_planes = v4l2_buf->length;
 	return 0;
 ion_map_error:
 	for (--i; i >= 0; i--) {
@@ -216,7 +205,8 @@ static int msm_isp_buf_prepare(struct msm_isp_buf_mgr *buf_mgr,
 	unsigned long flags;
 	struct msm_isp_bufq *bufq = NULL;
 	struct msm_isp_buffer *buf_info = NULL;
-	struct msm_isp_qbuf_buffer buf;
+	struct v4l2_buffer *buf = NULL;
+	struct v4l2_plane *plane = NULL;
 
 	buf_info = msm_isp_get_buf_ptr(buf_mgr,
 		info->handle, info->buf_idx);
@@ -247,20 +237,37 @@ static int msm_isp_buf_prepare(struct msm_isp_buf_mgr *buf_mgr,
 	spin_unlock_irqrestore(&bufq->bufq_lock, flags);
 
 	if (vb2_buf) {
-		msm_isp_copy_planes_from_v4l2_buffer(&buf, &vb2_buf->v4l2_buf);
+		buf = &vb2_buf->v4l2_buf;
 		buf_info->vb2_buf = vb2_buf;
 	} else {
-		buf = info->buffer;
+		buf = &info->buffer;
+		plane =
+			kzalloc(sizeof(struct v4l2_plane) * buf->length,
+				GFP_KERNEL);
+		if (!plane) {
+			pr_err("%s: Cannot alloc plane: %d\n",
+			__func__, buf_info->state);
+			return rc;
+		}
+		if (copy_from_user(plane,
+				(void __user *)(buf->m.planes),
+			sizeof(struct v4l2_plane) * buf->length)) {
+			kfree(plane);
+			return rc;
+		}
+		buf->m.planes = plane;
 	}
 
-	rc = msm_isp_prepare_isp_buf(buf_mgr, buf_info, &buf);
+	rc = msm_isp_prepare_v4l2_buf(buf_mgr, buf_info, buf);
 	if (rc < 0) {
 		pr_err("%s: Prepare buffer error\n", __func__);
+		kfree(plane);
 		return rc;
 	}
 	spin_lock_irqsave(&bufq->bufq_lock, flags);
 	buf_info->state = MSM_ISP_BUFFER_STATE_PREPARED;
 	spin_unlock_irqrestore(&bufq->bufq_lock, flags);
+	kfree(plane);
 	return rc;
 }
 
@@ -278,6 +285,10 @@ static int msm_isp_buf_unprepare(struct msm_isp_buf_mgr *buf_mgr,
 
 	for (i = 0; i < bufq->num_bufs; i++) {
 		buf_info = msm_isp_get_buf_ptr(buf_mgr, buf_handle, i);
+		if (!buf_info) {
+			pr_err("%s: buf not found\n", __func__);
+			return rc;
+		}
 		if (buf_info->state == MSM_ISP_BUFFER_STATE_UNUSED ||
 				buf_info->state ==
 					MSM_ISP_BUFFER_STATE_INITIALIZED)
@@ -650,11 +661,19 @@ static int msm_isp_buf_enqueue(struct msm_isp_buf_mgr *buf_mgr,
 	if (buf_state == MSM_ISP_BUFFER_STATE_DIVERTED) {
 		buf_info = msm_isp_get_buf_ptr(buf_mgr,
 						info->handle, info->buf_idx);
+		if (!buf_info) {
+			pr_err("%s: buf not found\n", __func__);
+			return rc;
+		}
 		if (info->dirty_buf) {
 			rc = msm_isp_put_buf(buf_mgr,
 				info->handle, info->buf_idx);
 		} else {
 			bufq = msm_isp_get_bufq(buf_mgr, info->handle);
+			if (!bufq) {
+				pr_err("%s: Invalid bufq\n", __func__);
+				return rc;
+			}
 			if (BUF_SRC(bufq->stream_id))
 				pr_err("%s: Invalid native buffer state\n",
 					__func__);
@@ -665,6 +684,10 @@ static int msm_isp_buf_enqueue(struct msm_isp_buf_mgr *buf_mgr,
 		}
 	} else {
 		bufq = msm_isp_get_bufq(buf_mgr, info->handle);
+		if (!bufq) {
+			pr_err("%s: Invalid bufq\n", __func__);
+			return rc;
+			}
 		if (MSM_ISP_BUFFER_SRC_HAL != BUF_SRC(bufq->stream_id)) {
 			rc = msm_isp_put_buf(buf_mgr,
 					info->handle, info->buf_idx);
@@ -848,7 +871,6 @@ static int msm_isp_init_isp_buf_mgr(
 	}
 	buf_mgr->client = msm_ion_client_create(-1, ctx_name);
 	buf_mgr->buf_handle_cnt = 0;
-	buf_mgr->pagefault_debug = 0;
 	return 0;
 bufq_error:
 	return rc;
@@ -863,7 +885,6 @@ static int msm_isp_deinit_isp_buf_mgr(
 	ion_client_destroy(buf_mgr->client);
 	kfree(buf_mgr->bufq);
 	buf_mgr->num_buf_q = 0;
-	buf_mgr->pagefault_debug = 0;
 	msm_isp_detach_ctx(buf_mgr);
 	return 0;
 }
@@ -891,48 +912,6 @@ int msm_isp_proc_buf_cmd(struct msm_isp_buf_mgr *buf_mgr,
 	return 0;
 }
 
-int msm_isp_buf_mgr_debug(struct msm_isp_buf_mgr *buf_mgr)
-{
-	struct msm_isp_buffer *bufs = NULL;
-	uint32_t i = 0, j = 0, k = 0, rc = 0;
-	if (!buf_mgr) {
-		pr_err_ratelimited("%s: %d] NULL buf_mgr\n",
-			__func__, __LINE__);
-		return -EINVAL;
-	}
-	for (i = 0; i < BUF_MGR_NUM_BUF_Q; i++) {
-		if (buf_mgr->bufq[i].bufq_handle != 0) {
-			pr_err("%s:%d handle %x\n", __func__, i,
-				buf_mgr->bufq[i].bufq_handle);
-			pr_err("%s:%d session_id %d, stream_id %x,",
-				__func__, i, buf_mgr->bufq[i].session_id,
-				buf_mgr->bufq[i].stream_id);
-			pr_err("num_bufs %d, handle %x, type %d\n",
-				buf_mgr->bufq[i].num_bufs,
-				buf_mgr->bufq[i].bufq_handle,
-				buf_mgr->bufq[i].buf_type);
-			for (j = 0; j < buf_mgr->bufq[i].num_bufs; j++) {
-				bufs = &buf_mgr->bufq[i].bufs[j];
-				pr_err("%s:%d buf_idx %d, frame_id %d,",
-					__func__, j, bufs->buf_idx,
-					bufs->frame_id);
-				pr_err("num_planes %d, state %d\n",
-					bufs->num_planes, bufs->state);
-				for (k = 0; k < bufs->num_planes; k++) {
-					pr_err("%s:%d paddr %x, len %lu,",
-						__func__, k, (unsigned int)
-						bufs->mapped_info[k].paddr,
-						bufs->mapped_info[k].len);
-					pr_err(" ion handle %p\n",
-						bufs->mapped_info[k].handle);
-				}
-			}
-		}
-	}
-	buf_mgr->pagefault_debug = 1;
-	return rc;
-}
-
 static struct msm_isp_buf_ops isp_buf_ops = {
 	.request_buf = msm_isp_request_bufq,
 	.enqueue_buf = msm_isp_buf_enqueue,
@@ -947,7 +926,6 @@ static struct msm_isp_buf_ops isp_buf_ops = {
 	.register_ctx = msm_isp_register_ctx,
 	.buf_mgr_init = msm_isp_init_isp_buf_mgr,
 	.buf_mgr_deinit = msm_isp_deinit_isp_buf_mgr,
-	.buf_mgr_debug = msm_isp_buf_mgr_debug,
 };
 
 int msm_isp_create_isp_buf_mgr(
@@ -978,7 +956,6 @@ int msm_isp_create_isp_buf_mgr(
 	buf_mgr->vb2_ops = vb2_ops;
 	buf_mgr->init_done = 1;
 	buf_mgr->open_count = 0;
-	buf_mgr->pagefault_debug = 0;
 	return 0;
 iommu_domain_error:
 	return rc;

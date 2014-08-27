@@ -326,7 +326,7 @@
 	android_usb: android_usb@fe8050c8 {
 		compatible = "qcom,android-usb";
 		reg = <0xfe8050c8 0xc8>;
-		qcom,android-usb-swfi-latency = <1>;
+		qcom,pm-qos-latency = <2 1001 12701>;
 		qcom,streaming-func = "rndis";
 		qcom,android-usb-uicc-nluns = /bits/ 8 <1>;
 	};
@@ -423,8 +423,8 @@
 			qcom,smd-edge = <0>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x1000>;
+			qcom,pil-string = "modem";
 			interrupts = <0 25 1>;
-			label = "modem";
 		};
 
 		qcom,smsm-modem {
@@ -440,8 +440,8 @@
 			qcom,smd-edge = <1>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x100>;
+			qcom,pil-string = "adsp";
 			interrupts = <0 156 1>;
-			label = "adsp";
 		};
 
 		qcom,smsm-adsp {
@@ -457,8 +457,8 @@
 			qcom,smd-edge = <6>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x20000>;
+			qcom,pil-string = "wcnss";
 			interrupts = <0 142 1>;
-			label = "wcnss";
 		};
 
 		qcom,smsm-wcnss {
@@ -475,9 +475,7 @@
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x1>;
 			interrupts = <0 168 1>;
-			label = "rpm";
 			qcom,irq-no-suspend;
-			qcom,not-loadable;
 		};
 	};
 
@@ -514,25 +512,37 @@
 		cpu-vdd-supply = <&apc_vreg_corner>;
 	};
 
-	qcom,cpubw {
-		compatible = "qcom,cpubw";
-		qcom,cpu-mem-ports = <1 512>;
+	cpubw: qcom,cpubw {
+		compatible = "qcom,devbw";
+		governor = "cpufreq";
+		qcom,src-dst-ports = <1 512>;
+		qcom,active-only;
 		qcom,bw-tbl =
 			<  762 /* 100 MHz */ >,
 			< 1525 /* 200 MHz */ >,
 			< 2540 /* 333 MHz */ >;
 	};
 
+	devfreq-cpufreq {
+		cpubw-cpufreq {
+			target-dev = <&cpubw>;
+			cpu-to-dev-map =
+				<  384000  762 >,
+				<  787200 1525 >,
+				< 1190400 2540 >;
+		};
+	};
+
 	qcom,msm-cpufreq@0 {
 		reg = <0 4>;
 		compatible = "qcom,msm-cpufreq";
 		qcom,cpufreq-table =
-			<  300000  762 >,
-			<  384000  762 >,
-			<  600000 1525 >,
-			<  787200 1525 >,
-			<  998400 2540 >,
-			< 1190400 2540 >;
+			<  300000 >,
+			<  384000 >,
+			<  600000 >,
+			<  787200 >,
+			<  998400 >,
+			< 1190400 >;
 	};
 
 	spmi_bus: qcom,spmi@fc4c0000 {
@@ -657,10 +667,10 @@
 		interrupts = <0 149 1>;
 
 		vdd_pronto_pll-supply = <&pm8110_l10>;
-		proxy-reg-names = "vdd_pronto_pll";
-		vdd_pronto_pll-uV-uA = <1800000 18000>;
+		qcom,proxy-reg-names = "vdd_pronto_pll";
+		qcom,vdd_pronto_pll-uV-uA = <1800000 18000>;
 		clock-names = "xo";
-		proxy-clock-names = "xo";
+		qcom,proxy-clock-names = "xo";
 
 		qcom,pas-id = <6>;
 		qcom,proxy-timeout-ms = <10000>;
@@ -910,11 +920,11 @@
 		interrupts = <0 162 1>;
 
 		vdd_cx-supply = <&pm8110_s1_corner>;
-		proxy-reg-names = "vdd_cx";
-		vdd_cx-uV-uA = <7 100000>;
+		qcom,proxy-reg-names = "vdd_cx";
+		qcom,vdd_cx-uV-uA = <7 100000>;
 		clock-names = "bus_clk", "xo";
-		active-clock-names = "bus_clk";
-		proxy-clock-names = "xo";
+		qcom,active-clock-names = "bus_clk";
+		qcom,proxy-clock-names = "xo";
 
 		qcom,pas-id = <1>;
 		qcom,proxy-timeout-ms = <10000>;
@@ -1103,12 +1113,6 @@
 		compatible = "arm,cortex-a7-pmu";
 		qcom,irq-is-percpu;
 		interrupts = <1 7 0xf00>;
-	};
-
-	bimc_sharedmem {
-		compatible = "qcom,sharedmem-uio";
-		reg = <0xfc380000 0x00100000>;
-		reg-names = "bimc";
 	};
 };
 

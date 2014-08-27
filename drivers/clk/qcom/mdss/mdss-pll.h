@@ -31,6 +31,7 @@ enum {
 enum {
 	MDSS_PLL_TARGET_8974,
 	MDSS_PLL_TARGET_8916,
+	MDSS_PLL_TARGET_8939,
 };
 
 struct mdss_pll_resources {
@@ -59,6 +60,9 @@ struct mdss_pll_resources {
 
 	/* HW recommended delay during configuration of vco clock rate */
 	u32		vco_delay;
+
+	/* Ref-count of the PLL resources */
+	u32		resource_ref_cnt;
 
 	/*
 	 * Keep track to resource status to avoid updating same status for the

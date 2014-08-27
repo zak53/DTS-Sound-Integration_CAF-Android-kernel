@@ -768,10 +768,7 @@ static void ecm_qc_suspend(struct usb_function *f)
 		return;
 	}
 
-	pr_debug("%s(): remote_wakeup:%d\n:", __func__,
-			f->config->cdev->gadget->remote_wakeup);
-	if (f->config->cdev->gadget->remote_wakeup ||
-			(f->config->cdev->gadget->speed == USB_SPEED_SUPER)) {
+	if (f->config->cdev->gadget->remote_wakeup) {
 		bam_data_suspend(ECM_QC_ACTIVE_PORT);
 	} else {
 		/*
@@ -799,8 +796,7 @@ static void ecm_qc_resume(struct usb_function *f)
 		return;
 	}
 
-	if (f->config->cdev->gadget->remote_wakeup ||
-			(f->config->cdev->gadget->speed == USB_SPEED_SUPER)) {
+	if (f->config->cdev->gadget->remote_wakeup) {
 		bam_data_resume(ECM_QC_ACTIVE_PORT);
 	} else {
 		/* Restore endpoint descriptors info. */
@@ -1016,6 +1012,8 @@ ecm_qc_unbind(struct usb_configuration *c, struct usb_function *f)
 
 	DBG(c->cdev, "ecm unbind\n");
 
+	bam_data_destroy(0);
+
 	if (gadget_is_superspeed(c->cdev->gadget))
 		usb_free_descriptors(f->ss_descriptors);
 	if (gadget_is_dualspeed(c->cdev->gadget))
@@ -1031,7 +1029,6 @@ ecm_qc_unbind(struct usb_configuration *c, struct usb_function *f)
 		ecm_ipa_cleanup(ipa_params.private);
 
 	kfree(ecm);
-	bam_work_destroy();
 }
 
 /**

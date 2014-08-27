@@ -136,6 +136,7 @@ static int ion_secure_cma_add_to_pool(
 	}
 
 	dma_set_attr(DMA_ATTR_NO_KERNEL_MAPPING, &attrs);
+	dma_set_attr(DMA_ATTR_SKIP_ZEROING, &attrs);
 
 	cpu_addr = dma_alloc_attrs(sheap->dev, len, &handle, GFP_KERNEL,
 								&attrs);
@@ -511,12 +512,6 @@ static int ion_secure_cma_allocate(struct ion_heap *heap,
 
 	if (ION_IS_CACHED(flags)) {
 		pr_err("%s: cannot allocate cached memory from secure heap %s\n",
-			__func__, heap->name);
-		return -ENOMEM;
-	}
-
-	if (!IS_ALIGNED(len, SZ_1M)) {
-		pr_err("%s: length of allocation from %s must be a multiple of 1MB\n",
 			__func__, heap->name);
 		return -ENOMEM;
 	}

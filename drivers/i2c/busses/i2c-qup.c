@@ -65,7 +65,6 @@ enum {
 	QUP_IN_FIFO_BASE        = 0x218,
 	QUP_I2C_CLK_CTL         = 0x400,
 	QUP_I2C_STATUS          = 0x404,
-	QUP_I2C_MASTER_BUS_CLR  = 0x40C,
 };
 
 /* QUP States and reset values */
@@ -135,7 +134,8 @@ enum {
 enum msm_i2c_state {
 	MSM_I2C_PM_ACTIVE,
 	MSM_I2C_PM_SUSPENDED,
-	MSM_I2C_PM_SYS_SUSPENDED,
+	MSM_I2C_SYS_SUSPENDING,
+	MSM_I2C_SYS_SUSPENDED,
 };
 #define QUP_MAX_CLK_STATE_RETRIES	300
 #define DEFAULT_CLK_RATE		(19200000)
@@ -143,12 +143,13 @@ enum msm_i2c_state {
 #define QUP_OUT_FIFO_NOT_EMPTY		0x10
 #define I2C_GPIOS_DT_CNT		(2)		/* sda and scl */
 
-/* Register:QUP_I2C_MASTER_CLK_CTL field setters */
-#define QUP_I2C_SCL_NOISE_REJECTION(reg_val, noise_rej_val) \
-		(((reg_val) & ~(0x3 << 24)) | (((noise_rej_val) & 0x3) << 24))
-#define QUP_I2C_SDA_NOISE_REJECTION(reg_val, noise_rej_val) \
-		(((reg_val) & ~(0x3 << 26)) | (((noise_rej_val) & 0x3) << 26))
 static char const * const i2c_rsrcs[] = {"i2c_clk", "i2c_sda"};
+
+static struct gpiomux_setting recovery_config = {
+	.func = GPIOMUX_FUNC_GPIO,
+	.drv = GPIOMUX_DRV_8MA,
+	.pull = GPIOMUX_PULL_NONE,
+};
 
 /**
  * qup_i2c_clk_path_vote: data to use bus scaling driver for clock path vote
@@ -561,6 +562,11 @@ static void i2c_qup_pm_resume_clk(struct qup_i2c_dev *dev)
 
 static void i2c_qup_suspend(struct qup_i2c_dev *dev)
 {
+	if (dev->pwr_state != MSM_I2C_PM_ACTIVE) {
+		dev_err(dev->dev, "attempt to suspend when not active\n");
+		return;
+	}
+
 	if (!dev->pdata->clk_ctl_xfer)
 		i2c_qup_pm_suspend_clk(dev);
 
@@ -569,32 +575,11 @@ static void i2c_qup_suspend(struct qup_i2c_dev *dev)
 	i2c_qup_gpio_free(dev);
 }
 
-static void i2c_qup_sys_suspend(struct qup_i2c_dev *dev)
-{
-	enum msm_i2c_state prev_pwr_state = dev->pwr_state;
-
-	/* wait for ongoing transfer to complete */
-	mutex_lock(&dev->mlock);
-	dev->pwr_state = MSM_I2C_PM_SYS_SUSPENDED;
-	mutex_unlock(&dev->mlock);
-
-	if (prev_pwr_state == MSM_I2C_PM_ACTIVE) {
-		i2c_qup_suspend(dev);
-		/*
-		 * Synchronize runtime-pm and system-pm states:
-		 * at this point we are already suspended. However, the
-		 * runtime-PM framework still thinks that we are active.
-		 * The three calls below let the runtime-PM know that we are
-		 * suspended already without re-invoking the suspend callback
-		 */
-		pm_runtime_disable(dev->dev);
-		pm_runtime_set_suspended(dev->dev);
-		pm_runtime_enable(dev->dev);
-	}
-}
-
 static void i2c_qup_resume(struct qup_i2c_dev *dev)
 {
+	if (dev->pwr_state == MSM_I2C_PM_ACTIVE)
+		return;
+
 	i2c_qup_gpio_request(dev);
 
 	i2c_qup_clk_path_postponed_register(dev);
@@ -906,75 +891,113 @@ qup_set_wr_mode(struct qup_i2c_dev *dev, int rem)
 	return ret;
 }
 
-static int qup_i2c_reset(struct qup_i2c_dev *dev)
-{
-	int ret;
 
-	/* sw reset */
-	writel_relaxed(1, dev->base + QUP_SW_RESET);
-	ret = qup_i2c_poll_state(dev, QUP_RESET_STATE, false);
-	if (ret) {
-		dev_err(dev->dev, "QUP Busy:Trying to recover\n");
-		return ret;
+static void qup_i2c_recover_bus_busy(struct qup_i2c_dev *dev)
+{
+	int i;
+	int gpio_clk;
+	int gpio_dat;
+	bool gpio_clk_status = false;
+	uint32_t status = readl_relaxed(dev->base + QUP_I2C_STATUS);
+	struct gpiomux_setting old_gpio_setting[ARRAY_SIZE(i2c_rsrcs)];
+
+	if (dev->pdata->msm_i2c_config_gpio)
+		return;
+
+	if (!(status & (I2C_STATUS_BUS_ACTIVE)) ||
+		(status & (I2C_STATUS_BUS_MASTER)))
+		return;
+
+	gpio_clk = dev->i2c_gpios[0];
+	gpio_dat = dev->i2c_gpios[1];
+
+	if ((gpio_clk == -1) && (gpio_dat == -1)) {
+		dev_err(dev->dev, "Recovery failed due to undefined GPIO's\n");
+		return;
 	}
 
-	/* Initialize QUP registers */
-	writel_relaxed(0, dev->base + QUP_CONFIG);
-	writel_relaxed(QUP_OPERATIONAL_RESET, dev->base + QUP_OPERATIONAL);
-	writel_relaxed(QUP_STATUS_ERROR_FLAGS, dev->base + QUP_ERROR_FLAGS_EN);
-
-	writel_relaxed(I2C_MINI_CORE | I2C_N_VAL, dev->base + QUP_CONFIG);
-
-	/* Initialize I2C mini core registers */
-	writel_relaxed(0, dev->base + QUP_I2C_CLK_CTL);
-	writel_relaxed(QUP_I2C_STATUS_RESET, dev->base + QUP_I2C_STATUS);
-
-	/* Make sure QUP I2C core reset registers are written */
-	wmb();
-	return ret;
-}
-
-static int qup_i2c_recover_bus_busy(struct qup_i2c_dev *dev)
-{
-	int ret;
-	u32 status;
-	ulong min_sleep_usec;
-
 	disable_irq(dev->err_irq);
-	dev_info(dev->dev, "Executing bus recovery procedure (9 clk pulse)\n");
+	for (i = 0; i < ARRAY_SIZE(i2c_rsrcs); ++i) {
+		if (msm_gpiomux_write(dev->i2c_gpios[i], GPIOMUX_ACTIVE,
+				&recovery_config, &old_gpio_setting[i])) {
+			dev_err(dev->dev, "GPIO pins have no active setting\n");
+			goto recovery_end;
+		}
+	}
 
-	qup_i2c_reset(dev);
+	dev_warn(dev->dev, "i2c_scl: %d, i2c_sda: %d\n",
+		 gpio_get_value(gpio_clk), gpio_get_value(gpio_dat));
 
-	ret = qup_update_state(dev, QUP_RUN_STATE);
-	if (ret < 0) {
-		dev_err(dev->dev, "error: bus clear fail to set run state\n");
+	for (i = 0; i < 9; i++) {
+		if (gpio_get_value(gpio_dat) && gpio_clk_status)
+			break;
+		gpio_direction_output(gpio_clk, 0);
+		udelay(5);
+		gpio_direction_output(gpio_dat, 0);
+		udelay(5);
+		gpio_direction_input(gpio_clk);
+		udelay(5);
+		if (!gpio_get_value(gpio_clk))
+			udelay(20);
+		if (!gpio_get_value(gpio_clk))
+			usleep_range(10000, 10000);
+		gpio_clk_status = gpio_get_value(gpio_clk);
+		gpio_direction_input(gpio_dat);
+		udelay(5);
+	}
+
+	/* Configure ALT funciton to QUP I2C*/
+	for (i = 0; i < ARRAY_SIZE(i2c_rsrcs); ++i) {
+		msm_gpiomux_write(dev->i2c_gpios[i], GPIOMUX_ACTIVE,
+				&old_gpio_setting[i], NULL);
+	}
+
+	udelay(10);
+
+	status = readl_relaxed(dev->base + QUP_I2C_STATUS);
+	if (!(status & I2C_STATUS_BUS_ACTIVE)) {
+		dev_info(dev->dev, "Bus busy cleared after %d clock cycles, "
+			 "status %x\n",
+			 i, status);
 		goto recovery_end;
 	}
 
-	writel_relaxed(dev->clk_ctl, dev->base + QUP_I2C_CLK_CTL);
-
-	/* Make sure QUP I2C core reset registers are written */
-	wmb();
-
-	writel_relaxed(0x1, dev->base + QUP_I2C_MASTER_BUS_CLR);
-
-	/*
-	 * wait for bus clear (9 clock pulse cycles) to complete.
-	 * min_time = 9 clock *10  (1000% margin)
-	 * max_time = 10* min_time
-	 */
-	min_sleep_usec =
-		max_t(ulong, (9 * 10 * USEC_PER_SEC) / dev->pdata->clk_freq,
-			100);
-	usleep_range(min_sleep_usec, min_sleep_usec * 10);
-
-	status = readl_relaxed(dev->base + QUP_I2C_STATUS);
-	dev_info(dev->dev, "Bus recovery %s\n",
-		(status & I2C_STATUS_BUS_ACTIVE) ? "fail" : "success");
+	dev_warn(dev->dev, "Bus still busy, status %x\n", status);
 
 recovery_end:
 	enable_irq(dev->err_irq);
-	return ret;
+}
+
+static void i2c_qup_dump_gpio_conf(struct qup_i2c_dev *dev, int gpio_num,
+		const char *gpio_name, enum msm_gpiomux_setting setting,
+		const char *setting_name)
+{
+	struct gpiomux_setting cur_conf;
+	if (msm_gpiomux_write(gpio_num, setting, NULL, &cur_conf)) {
+		dev_err(dev->dev, "error reading %s-gpio:#%d %s setting\n",
+					gpio_name, gpio_num, setting_name);
+		return;
+	}
+	dev_info(dev->dev,
+		"dump %s-gpio:#%d state:%s func:%d drv:%d pull:%d dir:%d\n",
+		gpio_name, gpio_num, setting_name, cur_conf.func, cur_conf.drv,
+		cur_conf.pull, cur_conf.dir);
+
+	if (msm_gpiomux_write(gpio_num, setting, &cur_conf, NULL))
+		dev_err(dev->dev, "error restoring %s-gpio:#%d %s setting\n",
+					gpio_name, gpio_num, setting_name);
+}
+
+static void i2c_qup_dump_gpios(struct qup_i2c_dev *dev)
+{
+	i2c_qup_dump_gpio_conf(dev, dev->i2c_gpios[0], i2c_rsrcs[0],
+						GPIOMUX_ACTIVE, "active");
+	i2c_qup_dump_gpio_conf(dev, dev->i2c_gpios[0], i2c_rsrcs[0],
+						GPIOMUX_SUSPENDED, "suspended");
+	i2c_qup_dump_gpio_conf(dev, dev->i2c_gpios[1], i2c_rsrcs[1],
+						GPIOMUX_ACTIVE, "active");
+	i2c_qup_dump_gpio_conf(dev, dev->i2c_gpios[1], i2c_rsrcs[1],
+						GPIOMUX_SUSPENDED, "suspended");
 }
 
 static int
@@ -999,9 +1022,9 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 	 * we are in suspended state
 	 */
 	mutex_lock(&dev->mlock);
-	if (dev->pwr_state == MSM_I2C_PM_SYS_SUSPENDED) {
+	if (dev->pwr_state >= MSM_I2C_SYS_SUSPENDING) {
 		dev_err(dev->dev,
-			"xfer not allowed when systems is suspended. slv-addr:0x%x\n",
+			"xfer not allowed when systems is suspendeding. slv-addr:0x%x\n",
 			msgs->addr);
 		mutex_unlock(&dev->mlock);
 		return -EIO;
@@ -1038,10 +1061,6 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 				/ dev->pdata->clk_freq) / 2) - 3;
 		hs_div = 3;
 		dev->clk_ctl = ((hs_div & 0x7) << 8) | (fs_div & 0xff);
-		dev->clk_ctl = QUP_I2C_SCL_NOISE_REJECTION(
-				dev->clk_ctl, dev->pdata->noise_rjct_scl);
-		dev->clk_ctl = QUP_I2C_SDA_NOISE_REJECTION(
-				dev->clk_ctl, dev->pdata->noise_rjct_sda);
 		fifo_reg = readl_relaxed(dev->base + QUP_IO_MODE);
 		if (fifo_reg & 0x3)
 			dev->out_blk_sz = (fifo_reg & 0x3) * 16;
@@ -1066,14 +1085,29 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 				dev->out_blk_sz, dev->out_fifo_sz);
 	}
 
-	if (qup_i2c_reset(dev))
-		dev_err(dev->dev, "warning: QUP reset before a xfer failed\n");
+	writel_relaxed(1, dev->base + QUP_SW_RESET);
+	ret = qup_i2c_poll_state(dev, QUP_RESET_STATE, false);
+	if (ret) {
+		dev_err(dev->dev, "QUP Busy:Trying to recover\n");
+		goto out_err;
+	}
 
 	if (dev->num_irqs == 3) {
 		enable_irq(dev->in_irq);
 		enable_irq(dev->out_irq);
 	}
 	enable_irq(dev->err_irq);
+
+	/* Initialize QUP registers */
+	writel_relaxed(0, dev->base + QUP_CONFIG);
+	writel_relaxed(QUP_OPERATIONAL_RESET, dev->base + QUP_OPERATIONAL);
+	writel_relaxed(QUP_STATUS_ERROR_FLAGS, dev->base + QUP_ERROR_FLAGS_EN);
+
+	writel_relaxed(I2C_MINI_CORE | I2C_N_VAL, dev->base + QUP_CONFIG);
+
+	/* Initialize I2C mini core registers */
+	writel_relaxed(0, dev->base + QUP_I2C_CLK_CTL);
+	writel_relaxed(QUP_I2C_STATUS_RESET, dev->base + QUP_I2C_STATUS);
 
 	while (rem) {
 		bool filled = false;
@@ -1203,10 +1237,16 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 				dev_err(dev->dev,
 					"Transaction timed out, SL-AD = 0x%x\n",
 					dev->msg->addr);
+				i2c_qup_dump_gpios(dev);
 
 				dev_err(dev->dev, "I2C Status: %x\n", istatus);
 				dev_err(dev->dev, "QUP Status: %x\n", qstatus);
 				dev_err(dev->dev, "OP Flags: %x\n", op_flgs);
+				writel_relaxed(1, dev->base + QUP_SW_RESET);
+				/* Make sure that the write has gone through
+				 * before returning from the function
+				 */
+				mb();
 				ret = -ETIMEDOUT;
 				goto out_err;
 			}
@@ -1221,9 +1261,11 @@ timeout_err:
 				} else if (dev->err < 0) {
 					dev_err(dev->dev,
 					"QUP data xfer error %d\n", dev->err);
+					i2c_qup_dump_gpios(dev);
 					ret = dev->err;
 					goto out_err;
 				} else if (dev->err > 0) {
+					i2c_qup_dump_gpios(dev);
 					/*
 					 * ISR returns +ve error if error code
 					 * is I2C related, e.g. unexpected start
@@ -1344,9 +1386,7 @@ int msm_i2c_rsrcs_dt_to_pdata_map(struct platform_device *pdev,
 	{"qcom,scl-gpio",      gpios,               DT_OPTIONAL,  DT_GPIO, -1},
 	{"qcom,sda-gpio",      gpios + 1,           DT_OPTIONAL,  DT_GPIO, -1},
 	{"qcom,clk-ctl-xfer", &pdata->clk_ctl_xfer, DT_OPTIONAL,  DT_BOOL, -1},
-	{"qcom,noise-rjct-scl", &pdata->noise_rjct_scl, DT_OPTIONAL, DT_U32, 0},
-	{"qcom,noise-rjct-sda", &pdata->noise_rjct_sda, DT_OPTIONAL, DT_U32, 0},
-	{NULL,                                    NULL,           0,      0, 0},
+	{NULL,                 NULL,                0,            0,        0},
 	};
 
 	for (itr = map; itr->dt_name ; ++itr) {
@@ -1726,7 +1766,12 @@ qup_i2c_remove(struct platform_device *pdev)
 {
 	struct qup_i2c_dev *dev = platform_get_drvdata(pdev);
 
-	i2c_qup_sys_suspend(dev);
+	/* Grab mutex to ensure ongoing transaction is over */
+	mutex_lock(&dev->mlock);
+	dev->pwr_state = MSM_I2C_SYS_SUSPENDING;
+	mutex_unlock(&dev->mlock);
+	i2c_qup_suspend(dev);
+	dev->pwr_state = MSM_I2C_SYS_SUSPENDED;
 	mutex_destroy(&dev->mlock);
 	platform_set_drvdata(pdev, NULL);
 	if (dev->num_irqs == 3) {
@@ -1785,8 +1830,26 @@ static int i2c_qup_pm_suspend_sys_noirq(struct device *device)
 	struct platform_device *pdev = to_platform_device(device);
 	struct qup_i2c_dev *dev = platform_get_drvdata(pdev);
 
-	i2c_qup_sys_suspend(dev);
-	dev_dbg(device, "system suspend\n");
+	if (dev->pwr_state == MSM_I2C_PM_ACTIVE) {
+		dev_dbg(device, "system suspend\n");
+		i2c_qup_suspend(dev);
+		/*
+		 * Synchronize runtime-pm and system-pm states:
+		 * at this point we are already suspended. However, the
+		 * runtime-PM framework still thinks that we are active.
+		 * The three calls below let the runtime-PM know that we are
+		 * suspended already without re-invoking the suspend callback
+		 */
+		pm_runtime_disable(device);
+		pm_runtime_set_suspended(device);
+		pm_runtime_enable(device);
+	}
+	/*
+	 * Conceptually, here we are in runtime-suspended state and
+	 * transitioning to sys-suspend state (in reality both suspends are the
+	 * same).
+	 */
+	dev->pwr_state = MSM_I2C_SYS_SUSPENDED;
 	return 0;
 }
 

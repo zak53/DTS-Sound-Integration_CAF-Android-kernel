@@ -181,6 +181,8 @@ struct audio_client {
 	int					   stream_id;
 	/* audio cache operations fptr*/
 	int (*fptr_cache_ops)(struct audio_buffer *abuff, int cache_op);
+	atomic_t               unmap_cb_success;
+	atomic_t               reset;
 };
 
 void q6asm_audio_client_free(struct audio_client *ac);
@@ -244,6 +246,8 @@ int q6asm_memory_map(struct audio_client *ac, phys_addr_t buf_add,
 
 int q6asm_memory_unmap(struct audio_client *ac, phys_addr_t buf_add,
 							int dir);
+
+int q6asm_unmap_cal_blocks(void);
 
 int q6asm_map_rtac_block(struct rtac_cal_block_data *cal_block);
 
@@ -402,8 +406,5 @@ int q6asm_send_meta_data(struct audio_client *ac, uint32_t initial_samples,
 /* Send the stream meta data to remove initial and trailing silence */
 int q6asm_stream_send_meta_data(struct audio_client *ac, uint32_t stream_id,
 		uint32_t initial_samples, uint32_t trailing_samples);
-
-/* Get current ASM topology */
-int q6asm_get_asm_topology(void);
 
 #endif /* __Q6_ASM_H__ */

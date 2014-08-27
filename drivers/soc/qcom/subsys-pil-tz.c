@@ -328,11 +328,11 @@ static int of_read_regs(struct device *dev, struct reg_info **regs_ref,
 
 		/*
 		 * Read the voltage and current values for the corresponding
-		 * regulator. The device tree property name is "regulator_name"
-		 * + "-uV-uA".
+		 * regulator. The device tree property name is "qcom," +
+		 *  "regulator_name" + "-uV-uA".
 		 */
 		rc = snprintf(reg_uV_uA_name, ARRAY_SIZE(reg_uV_uA_name),
-			 "%s-uV-uA", reg_name);
+			 "qcom,%s-uV-uA", reg_name);
 		if (rc < strlen(reg_name) + 6) {
 			dev_err(dev, "Failed to hold reg_uV_uA_name\n");
 			return -EINVAL;
@@ -385,28 +385,28 @@ static int piltz_resc_init(struct platform_device *pdev, struct pil_tz_data *d)
 	int len, count, rc;
 	struct device *dev = &pdev->dev;
 
-	count = of_read_clocks(dev, &d->clks, "active-clock-names");
+	count = of_read_clocks(dev, &d->clks, "qcom,active-clock-names");
 	if (count < 0) {
 		dev_err(dev, "Failed to setup clocks.\n");
 		return count;
 	}
 	d->clk_count = count;
 
-	count = of_read_clocks(dev, &d->proxy_clks, "proxy-clock-names");
+	count = of_read_clocks(dev, &d->proxy_clks, "qcom,proxy-clock-names");
 	if (count < 0) {
 		dev_err(dev, "Failed to setup proxy clocks.\n");
 		return count;
 	}
 	d->proxy_clk_count = count;
 
-	count = of_read_regs(dev, &d->regs, "active-reg-names");
+	count = of_read_regs(dev, &d->regs, "qcom,active-reg-names");
 	if (count < 0) {
 		dev_err(dev, "Failed to setup regulators.\n");
 		return count;
 	}
 	d->reg_count = count;
 
-	count = of_read_regs(dev, &d->proxy_regs, "proxy-reg-names");
+	count = of_read_regs(dev, &d->proxy_regs, "qcom,proxy-reg-names");
 	if (count < 0) {
 		dev_err(dev, "Failed to setup proxy regulators.\n");
 		return count;
@@ -528,9 +528,6 @@ static int pil_make_proxy_vote(struct pil_desc *pil)
 	struct pil_tz_data *d = desc_to_data(pil);
 	int rc;
 
-	if (d->subsys_desc.no_auth)
-		return 0;
-
 	rc = enable_regulators(pil->dev, d->proxy_regs, d->proxy_reg_count);
 	if (rc)
 		return rc;
@@ -561,9 +558,6 @@ static void pil_remove_proxy_vote(struct pil_desc *pil)
 {
 	struct pil_tz_data *d = desc_to_data(pil);
 
-	if (d->subsys_desc.no_auth)
-		return;
-
 	if (d->bus_client)
 		msm_bus_scale_client_update_request(d->bus_client, 0);
 
@@ -585,16 +579,15 @@ static int pil_init_image_trusted(struct pil_desc *pil,
 	dma_addr_t mdata_phys;
 	int ret;
 	DEFINE_DMA_ATTRS(attrs);
-
-	if (d->subsys_desc.no_auth)
-		return 0;
+	struct device dev = {0};
 
 	ret = scm_pas_enable_bw();
 	if (ret)
 		return ret;
-
+	dev.coherent_dma_mask =
+		DMA_BIT_MASK(sizeof(dma_addr_t) * 8);
 	dma_set_attr(DMA_ATTR_STRONGLY_ORDERED, &attrs);
-	mdata_buf = dma_alloc_attrs(pil->dev, size, &mdata_phys, GFP_KERNEL,
+	mdata_buf = dma_alloc_attrs(&dev, size, &mdata_phys, GFP_KERNEL,
 					&attrs);
 	if (!mdata_buf) {
 		pr_err("scm-pas: Allocation for metadata failed.\n");
@@ -610,7 +603,7 @@ static int pil_init_image_trusted(struct pil_desc *pil,
 	ret = scm_call(SCM_SVC_PIL, PAS_INIT_IMAGE_CMD, &request,
 			sizeof(request), &scm_ret, sizeof(scm_ret));
 
-	dma_free_attrs(pil->dev, size, mdata_buf, mdata_phys, &attrs);
+	dma_free_attrs(&dev, size, mdata_buf, mdata_phys, &attrs);
 	scm_pas_disable_bw();
 	if (ret)
 		return ret;
@@ -629,9 +622,6 @@ static int pil_mem_setup_trusted(struct pil_desc *pil, phys_addr_t addr,
 	u32 scm_ret = 0;
 	int ret;
 
-	if (d->subsys_desc.no_auth)
-		return 0;
-
 	request.proc = d->pas_id;
 	request.start_addr = addr;
 	request.len = size;
@@ -647,12 +637,8 @@ static int pil_auth_and_reset(struct pil_desc *pil)
 {
 	struct pil_tz_data *d = desc_to_data(pil);
 	int rc;
-	u32 proc, scm_ret = 0;
+	u32 proc = d->pas_id, scm_ret = 0;
 
-	if (d->subsys_desc.no_auth)
-		return 0;
-
-	proc = d->pas_id;
 	rc = enable_regulators(pil->dev, d->regs, d->reg_count);
 	if (rc)
 		return rc;
@@ -683,13 +669,9 @@ err_clks:
 static int pil_shutdown_trusted(struct pil_desc *pil)
 {
 	struct pil_tz_data *d = desc_to_data(pil);
-	u32 proc, scm_ret = 0;
+	u32 proc = d->pas_id, scm_ret = 0;
 	int rc;
 
-	if (d->subsys_desc.no_auth)
-		return 0;
-
-	proc = d->pas_id;
 	rc = enable_regulators(pil->dev, d->proxy_regs, d->proxy_reg_count);
 	if (rc)
 		return rc;
@@ -861,8 +843,15 @@ static int pil_tz_driver_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, d);
 
-	if (of_property_read_bool(pdev->dev.of_node, "qcom,pil-no-auth"))
-		d->subsys_desc.no_auth = true;
+	rc = piltz_resc_init(pdev, d);
+	if (rc)
+		return -ENOENT;
+
+	rc = of_property_read_u32(pdev->dev.of_node, "qcom,pas-id", &d->pas_id);
+	if (rc) {
+		dev_err(&pdev->dev, "Failed to find the pas_id.\n");
+		return rc;
+	}
 
 	rc = of_property_read_string(pdev->dev.of_node, "qcom,firmware-name",
 				      &d->desc.name);
@@ -892,19 +881,7 @@ static int pil_tz_driver_probe(struct platform_device *pdev)
 	if (!rc)
 		d->desc.proxy_timeout = proxy_timeout;
 
-	if (!d->subsys_desc.no_auth) {
-		rc = piltz_resc_init(pdev, d);
-		if (rc)
-			return -ENOENT;
-
-		rc = of_property_read_u32(pdev->dev.of_node, "qcom,pas-id",
-								&d->pas_id);
-		if (rc) {
-			dev_err(&pdev->dev, "Failed to find the pas_id.\n");
-			return rc;
-		}
-		scm_pas_init(MSM_BUS_MASTER_CRYPTO_CORE0);
-	}
+	scm_pas_init(MSM_BUS_MASTER_CRYPTO_CORE0);
 
 	rc = pil_desc_init(&d->desc);
 	if (rc)

@@ -127,9 +127,6 @@
 #define IPA_IOC_WRITE_QMAPID32  _IOWR(IPA_IOC_MAGIC, \
 				IPA_IOCTL_WRITE_QMAPID, \
 				compat_uptr_t)
-#define IPA_IOC_MDFY_FLT_RULE32 _IOWR(IPA_IOC_MAGIC, \
-					IPA_IOCTL_MDFY_FLT_RULE, \
-					compat_uptr_t)
 
 /**
  * struct ipa_ioc_nat_alloc_mem32 - nat table memory allocation
@@ -435,35 +432,6 @@ static long ipa_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		if (ipa_del_flt_rule((struct ipa_ioc_del_flt_rule *)param)) {
-			retval = -EFAULT;
-			break;
-		}
-		if (copy_to_user((u8 *)arg, param, pyld_sz)) {
-			retval = -EFAULT;
-			break;
-		}
-		break;
-
-	case IPA_IOC_MDFY_FLT_RULE:
-		if (copy_from_user(header, (u8 *)arg,
-					sizeof(struct ipa_ioc_mdfy_flt_rule))) {
-			retval = -EFAULT;
-			break;
-		}
-		pyld_sz =
-		   sizeof(struct ipa_ioc_mdfy_flt_rule) +
-		   ((struct ipa_ioc_mdfy_flt_rule *)header)->num_rules *
-		   sizeof(struct ipa_flt_rule_mdfy);
-		param = kzalloc(pyld_sz, GFP_KERNEL);
-		if (!param) {
-			retval = -ENOMEM;
-			break;
-		}
-		if (copy_from_user(param, (u8 *)arg, pyld_sz)) {
-			retval = -EFAULT;
-			break;
-		}
-		if (ipa_mdfy_flt_rule((struct ipa_ioc_mdfy_flt_rule *)param)) {
 			retval = -EFAULT;
 			break;
 		}
@@ -1410,9 +1378,6 @@ ret:
 	case IPA_IOC_WRITE_QMAPID32:
 		cmd = IPA_IOC_WRITE_QMAPID;
 		break;
-	case IPA_IOC_MDFY_FLT_RULE32:
-		cmd = IPA_IOC_MDFY_FLT_RULE;
-		break;
 	case IPA_IOC_COMMIT_HDR:
 	case IPA_IOC_RESET_HDR:
 	case IPA_IOC_COMMIT_RT:
@@ -2223,10 +2188,11 @@ static int ipa_init(const struct ipa_plat_drv_res *resource_p,
 	ipa_ctx->ipa_active_clients.cnt = 1;
 
 	/* wlan related member */
-	memset(&ipa_ctx->wc_memb, 0, sizeof(ipa_ctx->wc_memb));
-	spin_lock_init(&ipa_ctx->wc_memb.wlan_spinlock);
-	spin_lock_init(&ipa_ctx->wc_memb.ipa_tx_mul_spinlock);
-	INIT_LIST_HEAD(&ipa_ctx->wc_memb.wlan_comm_desc_list);
+	spin_lock_init(&ipa_ctx->wlan_spinlock);
+	spin_lock_init(&ipa_ctx->ipa_tx_mul_spinlock);
+	ipa_ctx->wlan_comm_cnt = 0;
+	INIT_LIST_HEAD(&ipa_ctx->wlan_comm_desc_list);
+	memset(&ipa_ctx->wstats, 0, sizeof(struct ipa_wlan_stats));
 	/*
 	 * setup an empty routing table in system memory, this will be used
 	 * to delete a routing table cleanly and safely

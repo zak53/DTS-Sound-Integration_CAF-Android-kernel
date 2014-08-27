@@ -22,7 +22,6 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/version.h>
-#include <linux/switch.h>
 
 #include "mdss_panel.h"
 #include "mdss_wb.h"

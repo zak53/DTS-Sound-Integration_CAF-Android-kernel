@@ -259,15 +259,9 @@ int kgsl_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 	else {
 		/* Change the power level */
 		kgsl_pwrctrl_pwrlevel_change(device, level);
-		if (pwr->constraint.type != KGSL_CONSTRAINT_NONE) {
-			/* Trace the constraint being un-set by the driver */
-			trace_kgsl_constraint(device,
-				pwr->constraint.type,
-				level,
-				0);
-			/*Invalidate the constraint set */
-			pwr->constraint.type = KGSL_CONSTRAINT_NONE;
-		}
+
+		/*Invalidate the constraint set */
+		pwr->constraint.type = KGSL_CONSTRAINT_NONE;
 		pwr->constraint.expires = 0;
 
 		*freq = kgsl_pwrctrl_active_freq(pwr);
@@ -439,7 +433,7 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 	for (i = 0; i < (pwr->num_pwrlevels - 1); i++)
 		pwrscale->freq_table[out++] = pwr->pwrlevels[i].gpu_freq;
 
-	profile->max_state = pwr->num_pwrlevels - 2;
+	profile->max_state = out;
 	/* link storage array to the devfreq profile pointer */
 	profile->freq_table = pwrscale->freq_table;
 

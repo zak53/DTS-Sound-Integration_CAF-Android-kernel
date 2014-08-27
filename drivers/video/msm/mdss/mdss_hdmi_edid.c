@@ -12,9 +12,7 @@
 
 #include <linux/io.h>
 #include <linux/types.h>
-#include <linux/stat.h>
-#include <linux/slab.h>
-#include <linux/device.h>
+#include <mach/board.h>
 #include "mdss_hdmi_edid.h"
 
 #define DBC_START_OFFSET 4

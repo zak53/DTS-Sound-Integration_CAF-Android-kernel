@@ -39,6 +39,15 @@
 	(((reg >= 0x200) && (reg <= 0x4FF)) ? 1 : 0)
 #define MSM8X16_WCD_IS_TOMBAK_REG(reg) \
 	(((reg >= 0x000) && (reg <= 0x1FF)) ? 1 : 0)
+/*
+ * MCLK activity indicators during suspend and resume call
+ */
+#define MCLK_SUS_DIS	1
+#define MCLK_SUS_RSC	2
+#define MCLK_SUS_NO_ACT	3
+
+#define NUM_DECIMATORS	2
+
 extern const u8 msm8x16_wcd_reg_readable[MSM8X16_WCD_CACHE_SIZE];
 extern const u8 msm8x16_wcd_reg_readonly[MSM8X16_WCD_CACHE_SIZE];
 extern const u8 msm8x16_wcd_reset_reg_defaults[MSM8X16_WCD_CACHE_SIZE];
@@ -98,6 +107,26 @@ enum {
 	MSM8X16_WCD_NUM_IRQS,
 };
 
+enum wcd_notify_event {
+	WCD_EVENT_INVALID,
+	/* events for micbias ON and OFF */
+	WCD_EVENT_PRE_MICBIAS_2_OFF,
+	WCD_EVENT_POST_MICBIAS_2_OFF,
+	WCD_EVENT_PRE_MICBIAS_2_ON,
+	WCD_EVENT_POST_MICBIAS_2_ON,
+	/* events for PA ON and OFF */
+	WCD_EVENT_PRE_HPHL_PA_ON,
+	WCD_EVENT_POST_HPHL_PA_OFF,
+	WCD_EVENT_PRE_HPHR_PA_ON,
+	WCD_EVENT_POST_HPHR_PA_OFF,
+	WCD_EVENT_LAST,
+};
+
+enum {
+	ON_DEMAND_MICBIAS = 0,
+	ON_DEMAND_SUPPLIES_MAX,
+};
+
 /*
  * The delay list is per codec HW specification.
  * Please add delay in the list in the future instead
@@ -119,11 +148,14 @@ struct msm8x16_wcd_regulator {
 
 struct msm8916_asoc_mach_data {
 	int codec_type;
+	int ext_pa;
 	int us_euro_gpio;
+	int mclk_freq;
+	int lb_mode;
 	atomic_t mclk_rsc_ref;
-	atomic_t dis_work_mclk;
+	atomic_t mclk_enabled;
 	struct mutex cdc_mclk_mutex;
-	struct delayed_work enable_mclk_work;
+	struct delayed_work disable_mclk_work;
 	struct afe_digital_clk_cfg digital_cdc_clk;
 };
 
@@ -163,6 +195,31 @@ struct msm8x16_wcd {
 	char __iomem *dig_base;
 };
 
+struct on_demand_supply {
+	struct regulator *supply;
+	atomic_t ref;
+};
+
+struct msm8x16_wcd_priv {
+	struct snd_soc_codec *codec;
+	u16 pmic_rev;
+	u32 adc_count;
+	u32 rx_bias_count;
+	s32 dmic_1_2_clk_cnt;
+	u32 mute_mask;
+	bool mclk_enabled;
+	bool clock_active;
+	bool config_mode_active;
+	bool spk_boost_set;
+	bool ear_pa_boost_set;
+	bool dec_active[NUM_DECIMATORS];
+	struct on_demand_supply on_demand_list[ON_DEMAND_SUPPLIES_MAX];
+	/* mbhc module */
+	struct wcd_mbhc mbhc;
+	struct blocking_notifier_head notifier;
+
+};
+
 extern int msm8x16_wcd_mclk_enable(struct snd_soc_codec *codec, int mclk_enable,
 			     bool dapm);
 
@@ -170,6 +227,12 @@ extern int msm8x16_wcd_hs_detect(struct snd_soc_codec *codec,
 		    struct wcd_mbhc_config *mbhc_cfg);
 
 extern void msm8x16_wcd_hs_detect_exit(struct snd_soc_codec *codec);
+
+extern int msm8x16_register_notifier(struct snd_soc_codec *codec,
+				     struct notifier_block *nblock);
+
+extern int msm8x16_unregister_notifier(struct snd_soc_codec *codec,
+				     struct notifier_block *nblock);
 
 #endif
 

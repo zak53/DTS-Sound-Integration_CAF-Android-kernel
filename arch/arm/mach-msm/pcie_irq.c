@@ -24,8 +24,6 @@
 #include <linux/pci.h>
 #include <mach/irqs.h>
 #include <linux/irqdomain.h>
-#include <linux/gpio.h>
-#include <linux/delay.h>
 #include "pcie.h"
 
 /* Any address will do here, as it won't be dereferenced */
@@ -39,265 +37,40 @@
 
 #define PCIE20_MSI_CTRL_MAX 8
 
-#define LINKDOWN_INIT_WAITING_US_MIN    995
-#define LINKDOWN_INIT_WAITING_US_MAX    1005
-#define LINKDOWN_WAITING_US_MIN         4900
-#define LINKDOWN_WAITING_US_MAX         5100
-#define LINKDOWN_WAITING_COUNT          200
-
-static int msm_pcie_recover_link(struct msm_pcie_dev_t *dev)
-{
-	int ret;
-
-	ret = msm_pcie_enable(dev, PM_PIPE_CLK | PM_CLK | PM_VREG);
-
-	if (!ret) {
-		PCIE_DBG("Recover config space of RC%d and its EP\n",
-				dev->rc_idx);
-		PCIE_DBG("Recover RC%d\n", dev->rc_idx);
-		msm_pcie_cfg_recover(dev, true);
-		PCIE_DBG("Recover EP of RC%d\n", dev->rc_idx);
-		msm_pcie_cfg_recover(dev, false);
-		dev->shadow_en = true;
-
-		if ((dev->link_status == MSM_PCIE_LINK_ENABLED) &&
-			dev->event_reg && dev->event_reg->callback &&
-			(dev->event_reg->events & MSM_PCIE_EVENT_LINKUP)) {
-			struct msm_pcie_notify *notify =
-					&dev->event_reg->notify;
-			notify->event = MSM_PCIE_EVENT_LINKUP;
-			notify->user = dev->event_reg->user;
-			PCIE_DBG("Linkup callback for RC%d\n", dev->rc_idx);
-			dev->event_reg->callback(notify);
-		}
-	}
-
-	return ret;
-}
-
 static void handle_wake_func(struct work_struct *work)
 {
 	int ret;
 	struct msm_pcie_dev_t *dev = container_of(work, struct msm_pcie_dev_t,
 					handle_wake_work);
 
-	PCIE_DBG("PCIe: Wake work for RC%d\n", dev->rc_idx);
-
-	mutex_lock(&dev->recovery_lock);
+	PCIE_DBG("Wake work for RC %d\n", dev->rc_idx);
 
 	if (!dev->enumerated) {
 		ret = msm_pcie_enumerate(dev->rc_idx);
 		if (ret) {
 			pr_err(
-				"PCIe: failed to enable RC%d upon wake request from the device.\n",
+				"PCIe: failed to enable RC %d upon wake request from the device.\n",
 				dev->rc_idx);
-			goto out;
-		}
-
-		if ((dev->link_status == MSM_PCIE_LINK_ENABLED) &&
-			dev->event_reg && dev->event_reg->callback &&
-			(dev->event_reg->events & MSM_PCIE_EVENT_LINKUP)) {
-			struct msm_pcie_notify *notify =
-					&dev->event_reg->notify;
-			notify->event = MSM_PCIE_EVENT_LINKUP;
-			notify->user = dev->event_reg->user;
-			PCIE_DBG(
-				"PCIe: Linkup callback for RC%d after enumeration is successful in wake IRQ handling\n",
-				dev->rc_idx);
-			dev->event_reg->callback(notify);
+			return;
 		}
 	} else {
-		int waiting_cycle = 0;
-		usleep_range(LINKDOWN_INIT_WAITING_US_MIN,
-				LINKDOWN_INIT_WAITING_US_MAX);
-		while ((dev->handling_linkdown > 0) &&
-			(waiting_cycle++ < LINKDOWN_WAITING_COUNT)) {
-			usleep_range(LINKDOWN_WAITING_US_MIN,
-				LINKDOWN_WAITING_US_MAX);
-		}
-
-		if (waiting_cycle == LINKDOWN_WAITING_COUNT)
-			pr_err(
-				"PCIe: Linkdown handling for RC%d is not finished after max waiting time.\n",
-				dev->rc_idx);
-
-		if (dev->link_status == MSM_PCIE_LINK_ENABLED) {
-			PCIE_DBG(
-				"PCIe: The link status of RC%d is up. Check if it is really up.\n",
-					dev->rc_idx);
-
-			if (msm_pcie_confirm_linkup(dev)) {
-				PCIE_DBG(
-					"PCIe: The link status of RC%d is really up; so ignore wake IRQ.\n",
-					dev->rc_idx);
-				goto out;
-			} else {
-				dev->link_status = MSM_PCIE_LINK_DISABLED;
-				pr_err(
-					"PCIe: The link of RC%d is actually down; start recovering link.\n",
-					dev->rc_idx);
-				msm_pcie_disable(dev, PM_EXPT | PM_PIPE_CLK |
-							PM_CLK | PM_VREG);
-				ret = msm_pcie_recover_link(dev);
-				if (ret) {
-					pr_err(
-						"PCIe:failed to recover link for RC%d after receive wake IRQ.\n",
-						dev->rc_idx);
-					goto out;
-				}
-			}
-		} else {
-			PCIE_DBG("PCIe: The link status of RC%d is down.\n",
-					dev->rc_idx);
-
-			if (dev->recovery_pending) {
-				static u32 retries = 1;
-				PCIE_DBG(
-					"PCIe: Start recovering link for RC%d after receive wake IRQ.\n",
-					dev->rc_idx);
-				ret = msm_pcie_recover_link(dev);
-				if (ret) {
-					pr_err(
-						"PCIe:failed to enable link for RC%d in No. %d try after receive wake IRQ.\n",
-						dev->rc_idx, retries++);
-					goto out;
-				} else {
-					dev->recovery_pending = false;
-					PCIE_DBG(
-						"PCIe: Successful recovery for RC%d in No. %d try.\n",
-						dev->rc_idx, retries);
-					retries = 1;
-				}
-			} else {
-				PCIE_DBG(
-					"PCIe: No pending recovery for RC%d; so ignore wake IRQ.\n",
-					dev->rc_idx);
-				goto out;
-			}
-		}
+		pr_err("PCIe: %s: RC %d has already been enumerated.\n",
+			__func__, dev->rc_idx);
 	}
-
-out:
-	mutex_unlock(&dev->recovery_lock);
 }
 
 static irqreturn_t handle_wake_irq(int irq, void *data)
 {
 	struct msm_pcie_dev_t *dev = data;
 
-	dev->wake_counter++;
-	PCIE_DBG("PCIe: No. %ld wake IRQ for RC%d\n",
-			dev->wake_counter, dev->rc_idx);
-
-	PCIE_DBG("PCIe WAKE is asserted by Endpoint of RC%d\n", dev->rc_idx);
+	PCIE_DBG("PCIe WAKE is asserted by Endpoint of RC %d\n", dev->rc_idx);
 
 	if (!dev->enumerated) {
-		PCIE_DBG("Start enumeating RC%d\n", dev->rc_idx);
+		PCIE_DBG("Start enumeating RC %d\n", dev->rc_idx);
 		schedule_work(&dev->handle_wake_work);
 	} else {
-		PCIE_DBG("Wake up RC%d\n", dev->rc_idx);
 		__pm_stay_awake(&dev->ws);
 		__pm_relax(&dev->ws);
-
-		schedule_work(&dev->handle_wake_work);
-	}
-
-	return IRQ_HANDLED;
-}
-
-static void handle_linkdown_func(struct work_struct *work)
-{
-	int ret;
-	struct msm_pcie_dev_t *dev = container_of(work, struct msm_pcie_dev_t,
-					handle_linkdown_work);
-
-	PCIE_DBG("PCIe: Linkdown work for RC%d\n", dev->rc_idx);
-
-	mutex_lock(&dev->linkdown_lock);
-
-	if (dev->event_reg && dev->event_reg->callback &&
-		(dev->event_reg->events & MSM_PCIE_EVENT_LINKDOWN)) {
-		struct msm_pcie_notify *notify = &dev->event_reg->notify;
-		notify->event = MSM_PCIE_EVENT_LINKDOWN;
-		notify->user = dev->event_reg->user;
-		PCIE_DBG("PCIe: Linkdown callback for RC%d\n", dev->rc_idx);
-		dev->event_reg->callback(notify);
-
-		if (dev->link_status == MSM_PCIE_LINK_DISABLED) {
-			PCIE_DBG(
-				"PCIe: Client of RC%d does not enable link in callback; so disable the link\n",
-				dev->rc_idx);
-			dev->recovery_pending = true;
-			msm_pcie_disable(dev,
-				PM_EXPT | PM_PIPE_CLK | PM_CLK | PM_VREG);
-		} else {
-			PCIE_DBG(
-				"PCIe: Client of RC%d has enabled link in callback; so recover config space\n",
-				dev->rc_idx);
-			PCIE_DBG("PCIe: Recover RC%d\n", dev->rc_idx);
-			msm_pcie_cfg_recover(dev, true);
-			PCIE_DBG("PCIe: Recover EP of RC%d\n", dev->rc_idx);
-			msm_pcie_cfg_recover(dev, false);
-			dev->shadow_en = true;
-
-			if ((dev->link_status == MSM_PCIE_LINK_ENABLED) &&
-				dev->event_reg && dev->event_reg->callback &&
-				(dev->event_reg->events &
-					MSM_PCIE_EVENT_LINKUP)) {
-				struct msm_pcie_notify *notify =
-						&dev->event_reg->notify;
-				notify->event = MSM_PCIE_EVENT_LINKUP;
-				notify->user = dev->event_reg->user;
-				PCIE_DBG("PCIe: Linkup callback for RC%d\n",
-						dev->rc_idx);
-				dev->event_reg->callback(notify);
-			}
-		}
-	} else {
-		PCIE_DBG(
-			"PCIe: No registration for linkdown of RC%d; so recover the link by RC\n",
-			dev->rc_idx);
-
-		msm_pcie_disable(dev, PM_EXPT | PM_PIPE_CLK | PM_CLK | PM_VREG);
-		ret = msm_pcie_recover_link(dev);
-
-		if (ret) {
-			pr_err(
-				"PCIe:failed to enable RC%d again upon linkdown.\n",
-				dev->rc_idx);
-			goto out;
-		}
-	}
-
-out:
-	dev->handling_linkdown--;
-	if (dev->handling_linkdown < 0)
-		pr_err("PCIe:handling_linkdown for RC%d is %d\n",
-			dev->rc_idx, dev->handling_linkdown);
-	mutex_unlock(&dev->linkdown_lock);
-}
-
-static irqreturn_t handle_linkdown_irq(int irq, void *data)
-{
-	struct msm_pcie_dev_t *dev = data;
-
-	dev->linkdown_counter++;
-	dev->handling_linkdown++;
-	PCIE_DBG("PCIe: No. %ld linkdown IRQ for RC%d: handling_linkdown:%d\n",
-		dev->linkdown_counter, dev->rc_idx, dev->handling_linkdown);
-
-	if (!dev->enumerated || dev->link_status != MSM_PCIE_LINK_ENABLED) {
-		PCIE_DBG(
-			"PCIe:Linkdown IRQ for RC%d when the link is not enabled\n",
-			dev->rc_idx);
-	} else {
-		dev->link_status = MSM_PCIE_LINK_DISABLED;
-		dev->shadow_en = false;
-		/* assert PERST */
-		gpio_set_value(dev->gpio[MSM_PCIE_GPIO_PERST].num,
-				dev->gpio[MSM_PCIE_GPIO_PERST].on);
-		pr_err("PCIe link is down for RC%d\n", dev->rc_idx);
-		schedule_work(&dev->handle_linkdown_work);
 	}
 
 	return IRQ_HANDLED;
@@ -338,7 +111,7 @@ void msm_pcie_config_msi_controller(struct msm_pcie_dev_t *dev)
 {
 	int i;
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	/* program MSI controller and enable all interrupts */
 	writel_relaxed(MSM_PCIE_MSI_PHY, dev->dm_core + PCIE20_MSI_CTRL_ADDR);
@@ -370,7 +143,7 @@ void msm_pcie_destroy_irq(unsigned int irq, struct msm_pcie_dev_t *pcie_dev)
 		pos = irq - irq_find_mapping(dev->irq_domain, 0);
 	}
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	if (!dev->msi_gicm_addr)
 		dynamic_irq_cleanup(irq);
@@ -426,7 +199,7 @@ static int msm_pcie_create_irq(struct msm_pcie_dev_t *dev)
 {
 	int irq, pos;
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 again:
 	pos = find_first_zero_bit(dev->msi_irq_in_use, PCIE_MSI_NR_IRQS);
@@ -455,7 +228,7 @@ static int arch_setup_msi_irq_default(struct pci_dev *pdev,
 	struct msi_msg msg;
 	struct msm_pcie_dev_t *dev = PCIE_BUS_PRIV_DATA(pdev);
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	irq = msm_pcie_create_irq(dev);
 
@@ -481,7 +254,7 @@ static int msm_pcie_create_irq_qgic(struct msm_pcie_dev_t *dev)
 {
 	int irq, pos;
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 again:
 	pos = find_first_zero_bit(dev->msi_irq_in_use, PCIE_MSI_NR_IRQS);
@@ -498,8 +271,7 @@ again:
 
 	irq = dev->msi_gicm_base + pos;
 	if (!irq) {
-		pr_err("PCIe: RC%d failed to create QGIC MSI IRQ.\n",
-			dev->rc_idx);
+		pr_err("PCIe: failed to create QGIC MSI IRQ.\n");
 		return -EINVAL;
 	}
 
@@ -513,7 +285,7 @@ static int arch_setup_msi_irq_qgic(struct pci_dev *pdev,
 	struct msi_msg msg;
 	struct msm_pcie_dev_t *dev = PCIE_BUS_PRIV_DATA(pdev);
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	for (index = 0; index < nvec; index++) {
 		irq = msm_pcie_create_irq_qgic(dev);
@@ -542,7 +314,7 @@ int arch_setup_msi_irq(struct pci_dev *pdev, struct msi_desc *desc)
 {
 	struct msm_pcie_dev_t *dev = PCIE_BUS_PRIV_DATA(pdev);
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	if (dev->msi_gicm_addr)
 		return arch_setup_msi_irq_qgic(pdev, desc, 1);
@@ -572,7 +344,7 @@ int arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 	int ret;
 	struct msm_pcie_dev_t *pcie_dev = PCIE_BUS_PRIV_DATA(dev);
 
-	PCIE_DBG("RC%d\n", pcie_dev->rc_idx);
+	PCIE_DBG("\n");
 
 	if (type != PCI_CAP_ID_MSI || nvec > 32)
 		return -ENOSPC;
@@ -602,7 +374,6 @@ int arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 static int msm_pcie_msi_map(struct irq_domain *domain, unsigned int irq,
 	   irq_hw_number_t hwirq)
 {
-	PCIE_DBG("\n");
 	irq_set_chip_and_handler (irq, &pcie_msi_chip, handle_simple_irq);
 	irq_set_chip_data(irq, domain->host_data);
 	set_irq_flags(irq, IRQF_VALID);
@@ -619,30 +390,16 @@ int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
 	int msi_start =  0;
 	struct device *pdev = &dev->pdev->dev;
 
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	wakeup_source_init(&dev->ws, "pcie_wakeup_source");
-
-	/* register handler for linkdown interrupt */
-	rc = devm_request_irq(pdev,
-		dev->irq[MSM_PCIE_INT_LINK_DOWN].num, handle_linkdown_irq,
-		IRQF_TRIGGER_RISING, dev->irq[MSM_PCIE_INT_LINK_DOWN].name,
-		dev);
-	if (rc) {
-		pr_err("PCIe: Unable to request linkdown interrupt:%d\n",
-			dev->irq[MSM_PCIE_INT_LINK_DOWN].num);
-		return rc;
-	}
-
-	INIT_WORK(&dev->handle_linkdown_work, handle_linkdown_func);
 
 	/* register handler for physical MSI interrupt line */
 	rc = devm_request_irq(pdev,
 		dev->irq[MSM_PCIE_INT_MSI].num, handle_msi_irq,
 		IRQF_TRIGGER_RISING, dev->irq[MSM_PCIE_INT_MSI].name, dev);
 	if (rc) {
-		pr_err("PCIe: RC%d: Unable to request MSI interrupt\n",
-			dev->rc_idx);
+		pr_err("PCIe: Unable to request MSI interrupt\n");
 		return rc;
 	}
 
@@ -651,8 +408,7 @@ int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
 			dev->wake_n, handle_wake_irq, IRQF_TRIGGER_FALLING,
 			 "msm_pcie_wake", dev);
 	if (rc) {
-		pr_err("PCIe: RC%d: Unable to request wake interrupt\n",
-			dev->rc_idx);
+		pr_err("PCIe: Unable to request wake interrupt\n");
 		return rc;
 	}
 
@@ -660,8 +416,7 @@ int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
 
 	rc = enable_irq_wake(dev->wake_n);
 	if (rc) {
-		pr_err("PCIe: RC%d: Unable to enable wake interrupt\n",
-			dev->rc_idx);
+		pr_err("PCIe: Unable to enable wake interrupt\n");
 		return rc;
 	}
 
@@ -671,8 +426,7 @@ int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
 			PCIE_MSI_NR_IRQS, &msm_pcie_msi_ops, dev);
 
 		if (!dev->irq_domain) {
-			pr_err("PCIe: RC%d: Unable to initialize irq domain\n",
-				dev->rc_idx);
+			pr_err("PCIe: Unable to initialize irq domain\n");
 			disable_irq(dev->wake_n);
 			return PTR_ERR(dev->irq_domain);
 		}
@@ -685,7 +439,7 @@ int32_t msm_pcie_irq_init(struct msm_pcie_dev_t *dev)
 
 void msm_pcie_irq_deinit(struct msm_pcie_dev_t *dev)
 {
-	PCIE_DBG("RC%d\n", dev->rc_idx);
+	PCIE_DBG("\n");
 
 	wakeup_source_trash(&dev->ws);
 	disable_irq(dev->wake_n);

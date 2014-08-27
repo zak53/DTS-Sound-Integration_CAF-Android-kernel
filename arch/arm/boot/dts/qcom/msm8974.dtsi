@@ -290,6 +290,7 @@
 		qcom,max-hw-load = <1216800>; /* 3840 x 2160 @ 30 + 1080p @ 30*/
 		qcom,clock-names = "core_clk", "iface_clk", "bus_clk", "mem_clk";
 		qcom,clock-configs = <0x3 0x0 0x0 0x0>;
+		qcom,sw-power-collapse;
 	};
 
 	qcom,vidc {
@@ -1433,9 +1434,11 @@
 			< 2265600000  925000 691 >;
 	};
 
-	qcom,cpubw {
-		compatible = "qcom,cpubw";
-		qcom,cpu-mem-ports = <1 512>, <2 512>;
+	cpubw: qcom,cpubw {
+		compatible = "qcom,devbw";
+		governor = "cpufreq";
+		qcom,src-dst-ports = <1 512>, <2 512>;
+		qcom,active-only;
 		qcom,bw-tbl =
 			<  381 /*  50 MHz */ >,
 			<  572 /*  75 MHz */ >,
@@ -1455,6 +1458,21 @@
 		qcom,bytes-per-beat = <8>;
 	};
 
+	devfreq-cpufreq {
+		cpubw-cpufreq {
+			target-dev = <&cpubw>;
+			cpu-to-dev-map =
+				<  300000  572 >,
+				<  422400 1144 >,
+				<  652800 1525 >,
+				<  883200 2342 >,
+				< 1190400 3509 >,
+				< 1497600 4684 >,
+				< 1728000 6103 >,
+				< 2457600 7102 >;
+		};
+	};
+
 	qcom,msm-cpufreq {
 		compatible = "qcom,msm-cpufreq";
 		clock-names = "l2_clk", "cpu0_clk", "cpu1_clk", "cpu2_clk",
@@ -1465,21 +1483,21 @@
 			 <&clock_krait clk_krait2_clk>,
 			 <&clock_krait clk_krait3_clk>;
 		qcom,cpufreq-table =
-			<  300000  300000  572 >,
-			<  422400  422400 1144 >,
-			<  652800  499200 1525 >,
-			<  729600  576000 2342 >,
-			<  883200  576000 2342 >,
-			<  960000  960000 3509 >,
-			< 1036800 1036800 3509 >,
-			< 1190400 1036800 3509 >,
-			< 1267200 1267200 4684 >,
-			< 1497600 1497600 4684 >,
-			< 1574400 1574400 6103 >,
-			< 1728000 1651200 6103 >,
-			< 1958400 1728000 7102 >,
-			< 2265600 1728000 7102 >,
-			< 2457600 1728000 7102 >;
+			<  300000 >,
+			<  422400 >,
+			<  652800 >,
+			<  729600 >,
+			<  883200 >,
+			<  960000 >,
+			< 1036800 >,
+			< 1190400 >,
+			< 1267200 >,
+			< 1497600 >,
+			< 1574400 >,
+			< 1728000 >,
+			< 1958400 >,
+			< 2265600 >,
+			< 2457600 >;
 	};
 
 	usb3: ssusb@f9200000 {
@@ -1568,11 +1586,11 @@
 		interrupts = <0 162 1>;
 
 		vdd_cx-supply = <&pm8841_s2_corner>;
-		proxy-reg-names = "vdd_cx";
-		vdd_cx-uV-uA = <7 100000>;
+		qcom,proxy-reg-names = "vdd_cx";
+		qcom,vdd_cx-uV-uA = <7 100000>;
 		clock-names = "bus_clk", "xo";
-		active-clock-names = "bus_clk";
-		proxy-clock-names = "xo";
+		qcom,active-clock-names = "bus_clk";
+		qcom,proxy-clock-names = "xo";
 
 		qcom,pas-id = <1>;
 		qcom,proxy-timeout-ms = <10000>;
@@ -1865,10 +1883,10 @@
 		interrupts = <0 149 1>;
 
 		vdd_pronto_pll-supply = <&pm8941_l12>;
-		proxy-reg-names = "vdd_pronto_pll";
-		vdd_pronto_pll-uV-uA = <1800000 18000>;
+		qcom,proxy-reg-names = "vdd_pronto_pll";
+		qcom,vdd_pronto_pll-uV-uA = <1800000 18000>;
 		clock-names = "xo";
-		proxy-clock-names = "xo";
+		qcom,proxy-clock-names = "xo";
 
 		qcom,pas-id = <6>;
 		qcom,proxy-timeout-ms = <10000>;
@@ -2023,10 +2041,10 @@
 		reg = <0xfdce0000 0x4000>;
 
 		vdd-supply = <&gdsc_venus>;
-		proxy-reg-names = "vdd";
+		qcom,proxy-reg-names = "vdd";
 		clock-names = "core_clk", "iface_clk",
 				"bus_clk", "mem_clk";
-		proxy-clock-names = "core_clk", "iface_clk",
+		qcom,proxy-clock-names = "core_clk", "iface_clk",
 					"bus_clk", "mem_clk";
 
 		qcom,msm-bus,name = "pil-venus";
@@ -2106,7 +2124,7 @@
         qcom,qcedev@fd440000 {
 		compatible = "qcom,qcedev";
 		reg = <0xfd440000 0x20000>,
-		      <0xfd444000 0x1b000>;
+		      <0xfd444000 0x8000>;
 		reg-names = "crypto-base","crypto-bam-base";
 		interrupts = <0 236 0>;
 		qcom,bam-pipe-pair = <1>;
@@ -2120,35 +2138,15 @@
 				<56 512 3936000 393600>;
 	};
 
-        qcom,qcrypto@fd440000 {
+        qcom,qcrypto@fd444000 {
 		compatible = "qcom,qcrypto";
 		reg = <0xfd440000 0x20000>,
-		      <0xfd444000 0x1b000>;
+		      <0xfd444000 0x8000>;
 		reg-names = "crypto-base","crypto-bam-base";
 		interrupts = <0 236 0>;
 		qcom,bam-pipe-pair = <2>;
 		qcom,ce-hw-instance = <1>;
 		qcom,ce-device = <0>;
-		qcom,clk-mgmt-sus-res;
-                qcom,msm-bus,name = "qcrypto-noc";
-		qcom,msm-bus,num-cases = <2>;
-		qcom,msm-bus,num-paths = <1>;
-		qcom,use-sw-aes-cbc-ecb-ctr-algo;
-		qcom,use-sw-aes-xts-algo;
-		qcom,use-sw-ahash-algo;
-		qcom,msm-bus,vectors-KBps =
-				<56 512 0 0>,
-				<56 512 3936000 393600>;
-	};
-        qcom,qcrypto1@fd440000 {
-		compatible = "qcom,qcrypto";
-		reg = <0xfd440000 0x20000>,
-		      <0xfd444000 0x1b000>;
-		reg-names = "crypto-base","crypto-bam-base";
-		interrupts = <0 236 0>;
-		qcom,bam-pipe-pair = <0>;
-		qcom,ce-hw-instance = <1>;
-		qcom,ce-device = <1>;
 		qcom,clk-mgmt-sus-res;
                 qcom,msm-bus,name = "qcrypto-noc";
 		qcom,msm-bus,num-cases = <2>;
@@ -2302,8 +2300,8 @@
 			qcom,smd-edge = <0>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x1000>;
+			qcom,pil-string = "modem";
 			interrupts = <0 25 1>;
-			label = "modem";
 		};
 
 		qcom,smsm-modem {
@@ -2319,8 +2317,8 @@
 			qcom,smd-edge = <1>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x100>;
+			qcom,pil-string = "adsp";
 			interrupts = <0 156 1>;
-			label = "adsp";
 		};
 
 		qcom,smsm-adsp {
@@ -2336,8 +2334,8 @@
 			qcom,smd-edge = <6>;
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x20000>;
+			qcom,pil-string = "wcnss";
 			interrupts = <0 142 1>;
-			label = "wcnss";
 		};
 
 		qcom,smsm-wcnss {
@@ -2354,9 +2352,7 @@
 			qcom,smd-irq-offset = <0x8>;
 			qcom,smd-irq-bitmask = <0x1>;
 			interrupts = <0 168 1>;
-			label = "rpm";
 			qcom,irq-no-suspend;
-			qcom,not-loadable;
 		};
 	};
 
@@ -2406,12 +2402,6 @@
 	l2-pmu {
 		compatible = "qcom,l2-pmu";
 		interrupts = <0 1 0>;
-	};
-
-	bimc_sharedmem {
-		compatible = "qcom,sharedmem-uio";
-		reg = <0xfc380000 0x00100000>;
-		reg-names = "bimc";
 	};
 
 	qcom,perfmap@fc330000 {

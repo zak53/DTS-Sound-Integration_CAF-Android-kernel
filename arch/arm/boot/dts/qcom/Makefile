@@ -27,18 +27,37 @@ dtb-$(CONFIG_ARCH_MSM8974) += msm8974-v1-cdp.dtb \
 	msm8974pro-ac-pm8941-cdp.dtb \
 	msm8974pro-ac-pm8941-liquid.dtb \
 	msm8974pro-ac-pm8941-mtp.dtb \
-	msm8974pro-ac-pma8084-pm8941-mtp.dtb \
-	msm8994-cdp-interposer.dtb
+	msm8974pro-ac-pma8084-pm8941-mtp.dtb
 dtb-$(CONFIG_ARCH_MSM8916) += msm8916-sim.dtb \
 	msm8916-rumi.dtb \
 	msm8916-cdp.dtb \
 	msm8916-cdp-smb1360.dtb \
 	msm8916-mtp.dtb \
+	msm8916-512mb-mtp.dtb \
 	msm8916-mtp-smb1360.dtb \
+	msm8916-512mb-mtp-smb1360.dtb \
+	msm8916-512mb-qrd-skui.dtb \
 	msm8916-qrd-skuh.dtb \
+	msm8916-qrd-skuhf.dtb \
 	msm8916-qrd-skui.dtb \
+	msm8916-qrd-skuic.dtb \
+	msm8916-512mb-qrd-skuh.dtb \
+	apq8016-mtp.dtb \
+	apq8016-mtp-smb1360.dtb \
 	msm8939-sim.dtb \
-	msm8939-rumi.dtb
+	msm8939-rumi.dtb \
+	msm8939-qrd-skuk.dtb \
+	msm8939-cdp.dtb \
+	msm8939-cdp-smb1360.dtb \
+	msm8939-mtp.dtb \
+	msm8939-mtp-smb1360.dtb \
+	msm8939-mtp-wcd9306.dtb \
+	msm8936-qrd-skuk.dtb \
+	msm8936-cdp.dtb \
+	msm8936-cdp-smb1360.dtb \
+	msm8936-mtp.dtb \
+	msm8936-mtp-smb1360.dtb \
+	msm8936-mtp-wcd9306.dtb
 dtb-$(CONFIG_ARCH_MSM8226) += msm8226-sim.dtb \
 	msm8226-fluid.dtb \
 	msm8226-v1-cdp.dtb \
@@ -48,11 +67,13 @@ dtb-$(CONFIG_ARCH_MSM8226) += msm8226-sim.dtb \
 	msm8226-v1-qrd-evt.dtb \
 	msm8226-v1-qrd-dvt.dtb \
 	msm8226-v2-720p-cdp.dtb \
-	msm8226-v2-320p-w-cdp.dtb \
+	msm8226-v2-720p-w-cdp.dtb \
 	msm8226-v2-1080p-cdp.dtb \
+	msm8226-v2-1080p-w-cdp.dtb \
 	msm8226-v2-720p-mtp.dtb \
-	msm8226-v2-320p-w-mtp.dtb \
+	msm8226-v2-720p-w-mtp.dtb \
 	msm8226-v2-1080p-mtp.dtb \
+	msm8226-v2-1080p-w-mtp.dtb \
 	msm8226-v2-qrd-evt.dtb \
 	msm8226-v2-qrd-dvt.dtb \
 	msm8926-v1-720p-cdp.dtb \
@@ -79,11 +100,13 @@ dtb-$(CONFIG_ARCH_MSM8226) += msm8226-sim.dtb \
 	apq8026-v1-w-mtp.dtb \
 	apq8026-v2-xpm.dtb \
 	apq8026-v2-720p-cdp.dtb \
-	apq8026-v2-320p-w-cdp.dtb \
+	apq8026-v2-720p-w-cdp.dtb \
 	apq8026-v2-1080p-cdp.dtb \
+	apq8026-v2-1080p-w-cdp.dtb \
 	apq8026-v2-720p-mtp.dtb \
-	apq8026-v2-320p-w-mtp.dtb \
-	apq8026-v2-1080p-mtp.dtb
+	apq8026-v2-720p-w-mtp.dtb \
+	apq8026-v2-1080p-mtp.dtb \
+	apq8026-v2-1080p-w-mtp.dtb
 dtb-$(CONFIG_ARCH_MSM8610) += msm8610-rumi.dtb \
 	msm8610-v1-cdp.dtb \
 	msm8610-v2-cdp.dtb \
@@ -102,6 +125,17 @@ dtb-$(CONFIG_ARCH_MDM9630) += mdm9630-sim.dtb \
 	mdm9630-cdp.dtb \
 	mdm9630-mtp.dtb
 dtb-$(CONFIG_ARCH_MSMZIRC) += msmzirc-sim.dtb
+dtb-$(CONFIG_ARCH_MSMSAMARIUM) += msmsamarium-sim.dtb \
+	msmsamarium-rumi.dtb \
+	msmsamarium-cdp-interposer.dtb \
+	msmsamarium-cdp.dtb \
+	msmsamarium-mtp.dtb \
+	apqsamarium-mtp.dtb
+dtb-$(CONFIG_ARCH_MPQ8092) += mpq8092-sim.dtb \
+	mpq8092-rumi.dtb \
+	mpq8092-cdp.dtb \
+	mpq8092-dtv.dtb \
+	mpq8092-dma.dtb
 dtb-$(CONFIG_ARCH_APQ8084) += apq8084-v1.0-old-pwr-grid-liquid.dtb \
 	apq8084-v1.1-old-pwr-grid-liquid.dtb \
 	apq8084-v1.1-liquid.dtb \
@@ -129,8 +163,8 @@ dtb-$(CONFIG_ARCH_APQ8084) += apq8084-v1.0-old-pwr-grid-liquid.dtb \
 	apq8084-v1.1-old-pwr-grid-mdm9x35-alt-cdp.dtb \
 	apq8084-v1.1-mdm9x35-alt-cdp.dtb \
 	apq8084-v1.1-sbc.dtb
-dtb-$(CONFIG_ARCH_MSM8994) += msm8994-sim.dtb
-dtb-$(CONFIG_ARCH_MSM8994) += msm8994-rumi.dtb
+dtb-$(CONFIG_ARCH_MSMPLUTONIUM) += msmplutonium-sim.dtb
+dtb-$(CONFIG_ARCH_MSMPLUTONIUM) += msmplutonium-rumi.dtb
 
 DTB_NAMES := $(subst $\",,$(CONFIG_BUILD_ARM_APPENDED_DTB_IMAGE_NAMES))
 ifneq ($(DTB_NAMES),)

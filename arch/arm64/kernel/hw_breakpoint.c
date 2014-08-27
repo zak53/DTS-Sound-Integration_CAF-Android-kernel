@@ -894,10 +894,29 @@ static struct notifier_block __cpuinitdata hw_breakpoint_reset_nb = {
 	.notifier_call = hw_breakpoint_reset_notify,
 };
 
-#ifdef CONFIG_ARM64_CPU_SUSPEND
-extern void cpu_suspend_set_dbg_restorer(void (*hw_bp_restore)(void *));
+#ifdef CONFIG_CPU_PM
+static int hw_breakpoint_cpu_pm_notify(struct notifier_block *self,
+				       unsigned long action,
+				       void *v)
+{
+	if (action == CPU_PM_EXIT) {
+		hw_breakpoint_reset(NULL);
+		return NOTIFY_OK;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block hw_breakpoint_cpu_pm_nb = {
+	.notifier_call = hw_breakpoint_cpu_pm_notify,
+};
+
+static void __init hw_breakpoint_pm_init(void)
+{
+	cpu_pm_register_notifier(&hw_breakpoint_cpu_pm_nb);
+}
 #else
-static inline void cpu_suspend_set_dbg_restorer(void (*hw_bp_restore)(void *))
+static inline void hw_breakpoint_pm_init(void)
 {
 }
 #endif
@@ -928,8 +947,7 @@ static int __init arch_hw_breakpoint_init(void)
 
 	/* Register hotplug notifier. */
 	register_cpu_notifier(&hw_breakpoint_reset_nb);
-	/* Register cpu_suspend hw breakpoint restore hook */
-	cpu_suspend_set_dbg_restorer(hw_breakpoint_reset);
+	hw_breakpoint_pm_init();
 
 	return 0;
 }

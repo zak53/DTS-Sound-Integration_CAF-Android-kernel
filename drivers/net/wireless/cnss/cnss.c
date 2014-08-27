@@ -436,7 +436,6 @@ struct pci_driver cnss_wlan_pci_driver = {
 int cnss_wlan_register_driver(struct cnss_wlan_driver *driver)
 {
 	int ret = 0;
-	int probe_again = 0;
 	struct cnss_wlan_driver *wdrv;
 	struct cnss_wlan_vreg_info *vreg_info;
 	struct cnss_wlan_gpio_info *gpio_info;
@@ -457,7 +456,6 @@ int cnss_wlan_register_driver(struct cnss_wlan_driver *driver)
 		return -EEXIST;
 	}
 
-again:
 	ret = cnss_wlan_vreg_set(vreg_info, VREG_ON);
 	if (ret) {
 		pr_err("wlan vreg ON failed\n");
@@ -504,22 +502,8 @@ again:
 
 		ret = wdrv->probe(pdev, penv->id);
 		if (ret) {
-			if (probe_again > 3) {
-				pr_err("Failed to probe WLAN\n");
-				goto err_wlan_probe;
-			}
-			pci_save_state(pdev);
-			penv->saved_state = pci_store_saved_state(pdev);
-			msm_pcie_pm_control(MSM_PCIE_SUSPEND,
-					    cnss_get_pci_dev_bus_number(pdev),
-					    NULL, NULL, PM_OPTIONS);
-			penv->pcie_link_state = PCIE_LINK_DOWN;
-			cnss_wlan_gpio_set(gpio_info, WLAN_EN_LOW);
-			usleep(WLAN_ENABLE_DELAY);
-			cnss_wlan_vreg_set(vreg_info, VREG_OFF);
-			usleep(POWER_ON_DELAY);
-			probe_again++;
-			goto again;
+			pr_err("Failed to probe WLAN\n");
+			goto err_wlan_probe;
 		}
 	}
 
