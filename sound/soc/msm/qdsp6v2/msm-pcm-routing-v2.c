@@ -85,7 +85,7 @@ static void msm_pcm_routing_cfg_pp(int port_id, int topology, int channels)
 	switch (topology) {
 	case SRS_TRUMEDIA_TOPOLOGY_ID:
 		pr_debug("%s: SRS_TRUMEDIA_TOPOLOGY_ID\n", __func__);
-		msm_dts_srs_tm_send_params(port_id, 1, 0);
+		msm_dts_srs_tm_init(port_id);
 		break;
 	case DOLBY_ADM_COPP_TOPOLOGY_ID:
 		pr_debug("%s: DOLBY_ADM_COPP_TOPOLOGY_ID\n", __func__);
@@ -104,7 +104,7 @@ static void msm_pcm_routing_deinit_pp(int port_id, int topology)
 	switch (topology) {
 	case SRS_TRUMEDIA_TOPOLOGY_ID:
 		pr_debug("%s: SRS_TRUMEDIA_TOPOLOGY_ID\n", __func__);
-		msm_dts_srs_tm_set_port_id(-1);
+		msm_dts_srs_tm_deinit(port_id);
 		break;
 	case DOLBY_ADM_COPP_TOPOLOGY_ID:
 		pr_debug("%s: DOLBY_ADM_COPP_TOPOLOGY_ID\n", __func__);
