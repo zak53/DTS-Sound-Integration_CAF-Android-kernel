@@ -485,6 +485,11 @@ static int mdp_lut_hw_update(struct fb_cmap *cmap)
 	c[1] = cmap->blue;
 	c[2] = cmap->red;
 
+	if (cmap->start > MDP_HIST_LUT_SIZE || cmap->len > MDP_HIST_LUT_SIZE ||
+			(cmap->start + cmap->len > MDP_HIST_LUT_SIZE)) {
+		pr_err("mdp_lut_hw_update invalid arguments\n");
+		return -EINVAL;
+	}
 	for (i = 0; i < cmap->len; i++) {
 		if (copy_from_user(&r, cmap->red++, sizeof(r)) ||
 		    copy_from_user(&g, cmap->green++, sizeof(g)) ||
@@ -2924,7 +2929,7 @@ static int mdp_probe(struct platform_device *pdev)
 	frame_rate = mdp_get_panel_framerate(mfd);
 	if (frame_rate) {
 		mfd->panel_info.frame_interval = 1000 / frame_rate;
-		mfd->cpu_pm_hdl = add_event_timer(NULL, (void *)mfd);
+		mfd->cpu_pm_hdl = add_event_timer(mdp_irq, NULL, (void *)mfd);
 	}
 	mdp_clk_ctrl(0);
 

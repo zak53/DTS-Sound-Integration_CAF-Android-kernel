@@ -18,6 +18,7 @@ Optional Properties:
  - qcom,vmax-mv : maximum output voltage in milli volts
  - qcom,ilim-ma : maximum output current limit threshold in milli amps
  - qcom,int-pwm-freq-khz : frequency for internal pwm
+ - qcom,en-brake : specify to enable internal reverse braking
  - qcom,brake-pattern : 4 byte active brake pattern. Each pattern represents
 		2-bit amplitude control 0x00: 0, 0x01: vmax/4, 0x02: vmax/2,
 		0x03: vmax. Default values are 0x00.
@@ -43,9 +44,17 @@ Required properties for pwm play mode:
  - qcom,pwm-channel: pwm channel the led will operate on
  - qcom,period-us: pwm period in us
  - qcom,duty-us: pwm duty cycle in us
+ - qcom,ext-pwm-dtest-line: dtest line to used with pwm
 
 Optional properties for pwm play mode:
  - qcom,ext-pwm-freq-khz : frequency for external pwm in kilo HZ
+
+Optional properties when qcom,actuator-type is "lra"
+ - qcom,correct-lra-drive-freq : boolean, use this to ensure LRA is driven at correct resonant
+				 frequency, which may change due to operating conditions.
+ - qcom,misc-trim-error-rc19p2-clk-reg-present : boolean, use this if TRIM_ERROR_RC19P2_CLK
+				register is present in MISC module. This register holds
+				the frequency error in 19.2Mhz RC clock.
 
 Example:
 		qcom,haptic@c000 {
@@ -62,7 +71,8 @@ Example:
 			qcom,ilim-ma = <800>;
 			qcom,sc-deb-cycles = <8>;
 			qcom,int-pwm-freq-khz = <505>;
-			qcom,brake-pattern = [00 00 03 03];
+			qcom,en-brake;
+			qcom,brake-pattern = [03 03 00 00];
 			qcom,use-play-irq;
 			qcom,use-sc-irq;
 			qcom,wave-samples = [3e 3e 3e 3e 3e 3e 3e 3e];

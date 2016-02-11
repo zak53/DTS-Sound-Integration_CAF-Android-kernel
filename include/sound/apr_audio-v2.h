@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
 *
 * This program is free software; you can redistribute it and/or modify
 * it under the terms of the GNU General Public License version 2 and
@@ -15,6 +15,18 @@
 #define _APR_AUDIO_V2_H_
 
 #include <linux/qdsp6v2/apr.h>
+
+/* size of header needed for passing data out of band */
+#define APR_CMD_OB_HDR_SZ  12
+
+/* size of header needed for getting data */
+#define APR_CMD_GET_HDR_SZ 16
+
+struct param_outband {
+	size_t       size;
+	void        *kvaddr;
+	phys_addr_t  paddr;
+};
 
 #define ADSP_ADM_VERSION    0x00070000
 
@@ -2441,6 +2453,32 @@ struct afe_port_cmdrsp_get_param_v2 {
 	u32                  status;
 } __packed;
 
+#define AFE_PARAM_ID_LPASS_CORE_SHARED_CLOCK_CONFIG	0x0001028C
+#define AFE_API_VERSION_LPASS_CORE_SHARED_CLK_CONFIG	0x1
+/*
+ * Payload of the AFE_PARAM_ID_LPASS_CORE_SHARED_CLOCK_CONFIG parameter used by
+ * AFE_MODULE_AUDIO_DEV_INTERFACE.
+*/
+struct afe_param_id_lpass_core_shared_clk_cfg {
+	u32	lpass_core_shared_clk_cfg_minor_version;
+/*
+ * Minor version used for lpass core shared clock configuration
+ * Supported value: AFE_API_VERSION_LPASS_CORE_SHARED_CLK_CONFIG
+ */
+	u32	enable;
+/*
+ * Specifies whether the lpass core shared clock is
+ * enabled (1) or disabled (0).
+ */
+} __packed;
+
+struct afe_lpass_core_shared_clk_config_command {
+	struct apr_hdr		   hdr;
+	struct afe_port_cmd_set_param_v2 param;
+	struct afe_port_param_data_v2    pdata;
+	struct afe_param_id_lpass_core_shared_clk_cfg clk_cfg;
+} __packed;
+
 /* adsp_afe_service_commands.h */
 
 #define ADSP_MEMORY_MAP_EBI_POOL      0
@@ -2467,8 +2505,7 @@ struct afe_port_cmdrsp_get_param_v2 {
 #define VPM_TX_DM_FLUENCE_COPP_TOPOLOGY			0x00010F72
 #define VPM_TX_QMIC_FLUENCE_COPP_TOPOLOGY		0x00010F75
 #define VPM_TX_DM_RFECNS_COPP_TOPOLOGY			0x00010F86
-#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX_0		0x00010347
-#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX_1		0x00010348
+#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX		0x10015002
 
 /* Memory map regions command payload used by the
  * #ASM_CMD_SHARED_MEM_MAP_REGIONS ,#ADM_CMD_SHARED_MEM_MAP_REGIONS
@@ -6951,59 +6988,59 @@ struct afe_spkr_prot_calib_get_resp {
 	struct asm_calib_res_cfg res_cfg;
 } __packed;
 
+
 /* SRS TRUMEDIA start */
 /* topology */
-#define SRS_TRUMEDIA_TOPOLOGY_ID	0x00010D90
+#define SRS_TRUMEDIA_TOPOLOGY_ID			0x00010D90
 /* module */
-#define SRS_TRUMEDIA_MODULE_ID		0x10005010
+#define SRS_TRUMEDIA_MODULE_ID				0x10005010
 /* parameters */
-#define SRS_TRUMEDIA_PARAMS		0x10005011
-#define SRS_TRUMEDIA_PARAMS_WOWHD	0x10005012
-#define SRS_TRUMEDIA_PARAMS_CSHP	0x10005013
-#define SRS_TRUMEDIA_PARAMS_HPF		0x10005014
-#define SRS_TRUMEDIA_PARAMS_AEQ		0x10005015
-#define SRS_TRUMEDIA_PARAMS_HL		0x10005016
-#define SRS_TRUMEDIA_PARAMS_GEQ		0x10005017
+#define SRS_TRUMEDIA_PARAMS				0x10005011
+#define SRS_TRUMEDIA_PARAMS_WOWHD			0x10005012
+#define SRS_TRUMEDIA_PARAMS_CSHP			0x10005013
+#define SRS_TRUMEDIA_PARAMS_HPF				0x10005014
+#define SRS_TRUMEDIA_PARAMS_AEQ				0x10005015
+#define SRS_TRUMEDIA_PARAMS_HL				0x10005016
+#define SRS_TRUMEDIA_PARAMS_GEQ				0x10005017
 
-#define SRS_ID_GLOBAL			0x00000001
-#define SRS_ID_WOWHD			0x00000002
-#define SRS_ID_CSHP			0x00000003
-#define SRS_ID_HPF			0x00000004
-#define SRS_ID_AEQ			0x00000005
-#define SRS_ID_HL			0x00000006
-#define SRS_ID_GEQ			0x00000007
+#define SRS_ID_GLOBAL	0x00000001
+#define SRS_ID_WOWHD	0x00000002
+#define SRS_ID_CSHP	0x00000003
+#define SRS_ID_HPF	0x00000004
+#define SRS_ID_AEQ	0x00000005
+#define SRS_ID_HL		0x00000006
+#define SRS_ID_GEQ	0x00000007
 
-#define SRS_CMD_UPLOAD			0x7FFF0000
-#define SRS_PARAM_OFFSET_MASK		0x3FFF0000
-#define SRS_PARAM_VALUE_MASK		0x0000FFFF
+#define SRS_CMD_UPLOAD		0x7FFF0000
+#define SRS_PARAM_OFFSET_MASK	0x3FFF0000
+#define SRS_PARAM_VALUE_MASK	0x0000FFFF
 
 struct srs_trumedia_params_GLOBAL {
-	uint8_t		v1;
-	uint8_t		v2;
-	uint8_t		v3;
-	uint8_t		v4;
-	uint8_t		v5;
-	uint8_t		v6;
-	uint8_t		v7;
-	uint8_t		v8;
-	uint16_t	v9;
+	uint8_t                  v1;
+	uint8_t                  v2;
+	uint8_t                  v3;
+	uint8_t                  v4;
+	uint8_t                  v5;
+	uint8_t                  v6;
+	uint8_t                  v7;
+	uint8_t                  v8;
+	uint16_t                 v9;
 } __packed;
 
 struct srs_trumedia_params_WOWHD {
-	uint32_t	v1;
-	uint16_t	v2;
-	uint16_t	v3;
-	uint16_t	v4;
-	uint16_t	v5;
-	uint16_t	v6;
-	uint16_t	v7;
-	uint16_t	v8;
-	uint16_t	v____A1;
-	uint32_t	v9;
-	uint16_t	v10;
-	uint16_t	v11;
-	uint32_t	v12[16];
-
+	uint32_t				v1;
+	uint16_t				v2;
+	uint16_t				v3;
+	uint16_t				v4;
+	uint16_t				v5;
+	uint16_t				v6;
+	uint16_t				v7;
+	uint16_t				v8;
+	uint16_t				v____A1;
+	uint32_t				v9;
+	uint16_t				v10;
+	uint16_t				v11;
+	uint32_t				v12[16];
 	uint32_t	v13[16];
 	uint32_t	v14[16];
 	uint32_t	v15[16];
@@ -7013,51 +7050,50 @@ struct srs_trumedia_params_WOWHD {
 } __packed;
 
 struct srs_trumedia_params_CSHP {
-	uint32_t	v1;
-	uint16_t	v2;
-	uint16_t	v3;
-	uint16_t	v4;
-	uint16_t	v5;
-	uint16_t	v6;
-	uint16_t	v____A1;
-	uint32_t	v7;
-	uint16_t	v8;
-	uint16_t	v9;
-	uint32_t	v10[16];
+	uint32_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v4;
+	uint16_t		v5;
+	uint16_t		v6;
+	uint16_t		v____A1;
+	uint32_t		v7;
+	uint16_t		v8;
+	uint16_t		v9;
+	uint32_t		v10[16];
 } __packed;
 
 struct srs_trumedia_params_HPF {
-	uint32_t	v1;
-	uint32_t	v2[26];
+	uint32_t		v1;
+	uint32_t		v2[26];
 } __packed;
 
 struct srs_trumedia_params_AEQ {
-	uint32_t	v1;
-	uint16_t	v2;
-	uint16_t	v3;
-	uint16_t	v4;
-	uint16_t	v____A1;
+	uint32_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v4;
+	uint16_t		v____A1;
 	uint32_t	v5[74];
 	uint32_t	v6[74];
 	uint16_t	v7[2048];
 } __packed;
 
 struct srs_trumedia_params_HL {
-	uint16_t	v1;
-	uint16_t	v2;
-	uint16_t	v3;
-	uint16_t	v____A1;
-	int32_t		v4;
-	uint32_t	v5;
-	uint16_t	v6;
-	uint16_t	v____A2;
-	uint32_t	v7;
+	uint16_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v____A1;
+	int32_t			v4;
+	uint32_t		v5;
+	uint16_t		v6;
+	uint16_t		v____A2;
+	uint32_t		v7;
 } __packed;
 
 struct srs_trumedia_params_GEQ {
 	int16_t		v1[10];
 } __packed;
-
 struct srs_trumedia_params {
 	struct srs_trumedia_params_GLOBAL	global;
 	struct srs_trumedia_params_WOWHD	wowhd;
@@ -7075,8 +7111,8 @@ struct srs_trumedia_params {
 #define AUDPROC_MODULE_ID_DTS_HPX_PREMIX 0x0001077C
 #define AUDPROC_MODULE_ID_DTS_HPX_POSTMIX 0x0001077B
 #define ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX 0x00010DED
-#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS 0x11000000
-#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER 0x11000001
+#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS  0x10015000
+#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER  0x10015001
 struct asm_dts_eagle_param {
 	struct apr_hdr	hdr;
 	struct asm_stream_cmd_set_pp_params_v2 param;
@@ -7087,12 +7123,6 @@ struct asm_dts_eagle_param_get {
 	struct apr_hdr	hdr;
 	struct asm_stream_cmd_get_pp_params_v2 param;
 } __packed;
-
-struct param_outband {
-	size_t       size;
-	void        *kvaddr;
-	phys_addr_t  paddr;
-};
 
 /* LSM Specific */
 #define VW_FEAT_DIM					(39)
@@ -7590,6 +7620,12 @@ struct afe_port_cmd_set_aanc_acdb_table {
 #define Q14_GAIN_ZERO_POINT_FIVE	0x2000
 #define Q14_GAIN_UNITY			0x4000
 
+struct default_chmixer_param_id_coeff {
+	uint32_t	index;
+	uint16_t	num_output_channels;
+	uint16_t	num_input_channels;
+};
+
 struct afe_svc_cmd_set_clip_bank_selection {
 	struct apr_hdr hdr;
 	struct afe_svc_cmd_set_param param;
@@ -7600,7 +7636,7 @@ struct afe_svc_cmd_set_clip_bank_selection {
 /* Ultrasound supported formats */
 #define US_POINT_EPOS_FORMAT_V2 0x0001272D
 #define US_RAW_FORMAT_V2        0x0001272C
-#define US_PROX_FORMAT_V2       0x0001272E
+#define US_PROX_FORMAT_V4       0x0001273B
 #define US_RAW_SYNC_FORMAT      0x0001272F
 #define US_GES_SYNC_FORMAT      0x00012730
 

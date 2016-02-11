@@ -45,6 +45,8 @@
 #define CE_CLK_DIV	1000000
 
 static DEFINE_MUTEX(bam_register_lock);
+static DEFINE_MUTEX(qce_iomap_mutex);
+
 struct bam_registration_info {
 	struct list_head qlist;
 	unsigned long handle;
@@ -5258,12 +5260,21 @@ static int __qce_init_clk(struct qce_device *pce_dev)
 			goto exit_put_core_src_clk;
 		}
 	} else {
-		pr_warn("Unable to get CE core src clk, set to NULL\n");
-		pce_dev->ce_core_src_clk = NULL;
+		if (pce_dev->support_only_core_src_clk) {
+			rc = PTR_ERR(pce_dev->ce_core_src_clk);
+			pce_dev->ce_core_src_clk = NULL;
+			pr_err("Unable to get CE core src clk\n");
+			return rc;
+		} else {
+			pr_warn("Unable to get CE core src clk, set to NULL\n");
+			pce_dev->ce_core_src_clk = NULL;
+		}
 	}
 
 	if (pce_dev->support_only_core_src_clk) {
 		pce_dev->ce_core_clk = NULL;
+		pce_dev->ce_clk = NULL;
+		pce_dev->ce_bus_clk = NULL;
 	} else {
 		pce_dev->ce_core_clk = clk_get(pce_dev->pdev, "core_clk");
 		if (IS_ERR(pce_dev->ce_core_clk)) {
@@ -5271,20 +5282,19 @@ static int __qce_init_clk(struct qce_device *pce_dev)
 			pr_err("Unable to get CE core clk\n");
 			goto exit_put_core_src_clk;
 		}
-	}
+		pce_dev->ce_clk = clk_get(pce_dev->pdev, "iface_clk");
+		if (IS_ERR(pce_dev->ce_clk)) {
+			rc = PTR_ERR(pce_dev->ce_clk);
+			pr_err("Unable to get CE interface clk\n");
+			goto exit_put_core_clk;
+		}
 
-	pce_dev->ce_clk = clk_get(pce_dev->pdev, "iface_clk");
-	if (IS_ERR(pce_dev->ce_clk)) {
-		rc = PTR_ERR(pce_dev->ce_clk);
-		pr_err("Unable to get CE interface clk\n");
-		goto exit_put_core_clk;
-	}
-
-	pce_dev->ce_bus_clk = clk_get(pce_dev->pdev, "bus_clk");
-	if (IS_ERR(pce_dev->ce_bus_clk)) {
-		rc = PTR_ERR(pce_dev->ce_bus_clk);
-		pr_err("Unable to get CE BUS interface clk\n");
-		goto exit_put_iface_clk;
+		pce_dev->ce_bus_clk = clk_get(pce_dev->pdev, "bus_clk");
+		if (IS_ERR(pce_dev->ce_bus_clk)) {
+			rc = PTR_ERR(pce_dev->ce_bus_clk);
+			pr_err("Unable to get CE BUS interface clk\n");
+			goto exit_put_iface_clk;
+		}
 	}
 	return rc;
 
@@ -5390,6 +5400,7 @@ void *qce_open(struct platform_device *pdev, int *rc)
 	}
 	pce_dev->pdev = &pdev->dev;
 
+	mutex_lock(&qce_iomap_mutex);
 	if (pdev->dev.of_node) {
 		*rc = __qce_get_device_tree_data(pdev, pce_dev);
 		if (*rc)
@@ -5429,7 +5440,7 @@ void *qce_open(struct platform_device *pdev, int *rc)
 		goto err;
 	qce_setup_ce_sps_data(pce_dev);
 	qce_disable_clk(pce_dev);
-
+	mutex_unlock(&qce_iomap_mutex);
 	return pce_dev;
 err:
 	qce_disable_clk(pce_dev);
@@ -5445,6 +5456,7 @@ err_iobase:
 	if (pce_dev->iobase)
 		iounmap(pce_dev->iobase);
 err_pce_dev:
+	mutex_unlock(&qce_iomap_mutex);
 	kfree(pce_dev);
 	return NULL;
 }
@@ -5458,6 +5470,7 @@ int qce_close(void *handle)
 	if (handle == NULL)
 		return -ENODEV;
 
+	mutex_lock(&qce_iomap_mutex);
 	qce_enable_clk(pce_dev);
 	qce_sps_exit(pce_dev);
 
@@ -5469,7 +5482,7 @@ int qce_close(void *handle)
 
 	qce_disable_clk(pce_dev);
 	__qce_deinit_clk(pce_dev);
-
+	mutex_unlock(&qce_iomap_mutex);
 	kfree(handle);
 
 	return 0;

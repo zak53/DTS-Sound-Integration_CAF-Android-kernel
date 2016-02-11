@@ -146,6 +146,7 @@ struct wcd_mbhc_cb {
 	void (*set_auto_zeroing) (struct snd_soc_codec *, bool);
 	struct firmware_cal * (*get_hwdep_fw_cal)(struct snd_soc_codec *,
 			enum wcd_cal_type);
+	void (*set_cap_mode)(struct snd_soc_codec *, bool, bool);
 };
 
 struct wcd_mbhc {
@@ -171,6 +172,7 @@ struct wcd_mbhc {
 	bool micbias_enable;
 	bool btn_press_intr;
 	bool is_hs_recording;
+	bool is_extn_cable;
 
 	struct snd_soc_codec *codec;
 	/* Work to perform MBHC Firmware Read */

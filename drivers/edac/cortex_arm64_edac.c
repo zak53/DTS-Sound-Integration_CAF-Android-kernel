@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,12 +25,14 @@
 #include <linux/workqueue.h>
 #include <linux/percpu.h>
 #include <soc/qcom/cti-pmu-irq.h>
+#include <linux/msm_rtb.h>
 
 #include <asm/cputype.h>
+#include <asm/esr.h>
 
 #include "edac_core.h"
 
-#define A53_CPMUERRSR_FATAL(a)	((a) & (1 << 63))
+#define A53_CPUMERRSR_FATAL(a)	((a) & (1LL << 63))
 #define A53_CPUMERRSR_OTHER(a)	(((a) >> 40) & 0xff)
 #define A53_CPUMERRSR_REPT(a)	(((a) >> 32) & 0xff)
 #define A53_CPUMERRSR_VALID(a)	((a) & (1 << 31))
@@ -38,7 +40,7 @@
 #define A53_CPUMERRSR_CPUID(a)	(((a) >> 18) & 0x07)
 #define A53_CPUMERRSR_ADDR(a)	((a) & 0xfff)
 
-#define A53_L2MERRSR_FATAL(a)	((a) & (1 << 63))
+#define A53_L2MERRSR_FATAL(a)	((a) & (1LL << 63))
 #define A53_L2MERRSR_OTHER(a)	(((a) >> 40) & 0xff)
 #define A53_L2MERRSR_REPT(a)	(((a) >> 32) & 0xff)
 #define A53_L2MERRSR_VALID(a)	((a) & (1 << 31))
@@ -46,7 +48,7 @@
 #define A53_L2MERRSR_CPUID(a)	(((a) >> 18) & 0x0f)
 #define A53_L2MERRSR_INDEX(a)	(((a) >> 3) & 0x3fff)
 
-#define A57_CPMUERRSR_FATAL(a)	((a) & (1 << 63))
+#define A57_CPUMERRSR_FATAL(a)	((a) & (1LL << 63))
 #define A57_CPUMERRSR_OTHER(a)	(((a) >> 40) & 0xff)
 #define A57_CPUMERRSR_REPT(a)	(((a) >> 32) & 0xff)
 #define A57_CPUMERRSR_VALID(a)	((a) & (1 << 31))
@@ -54,7 +56,7 @@
 #define A57_CPUMERRSR_BANK(a)	(((a) >> 18) & 0x1f)
 #define A57_CPUMERRSR_INDEX(a)	((a) & 0x1ffff)
 
-#define A57_L2MERRSR_FATAL(a)	((a) & (1 << 63))
+#define A57_L2MERRSR_FATAL(a)	((a) & (1LL << 63))
 #define A57_L2MERRSR_OTHER(a)	(((a) >> 40) & 0xff)
 #define A57_L2MERRSR_REPT(a)	(((a) >> 32) & 0xff)
 #define A57_L2MERRSR_VALID(a)	((a) & (1 << 31))
@@ -64,6 +66,11 @@
 
 #define L2ECTLR_INT_ERR		(1 << 30)
 #define L2ECTLR_EXT_ERR		(1 << 29)
+
+#define ESR_SERROR(a)	((a) >> ESR_EL1_EC_SHIFT == ESR_EL1_EC_SERROR)
+#define ESR_VALID(a)	((a) & BIT(24))
+#define ESR_L2_DBE(a) (ESR_SERROR(a) && ESR_VALID(a) && \
+			(((a) & 0x00C00003) == 0x1))
 
 #define CCI_IMPRECISEERROR_REG	0x10
 
@@ -112,13 +119,15 @@ struct erp_drvdata {
 	void __iomem *cci_base;
 	u32 mem_perf_counter;
 	struct notifier_block nb_pm;
+	struct notifier_block nb_cpu_wa;
 	struct notifier_block nb_cpu;
 	struct notifier_block nb_panic;
 	struct work_struct work;
 	int apply_cti_pmu_wa;
+	unsigned int sbe_irq;
 };
 
-static struct erp_drvdata *abort_handler_drvdata, *panic_handler_drvdata;
+static struct erp_drvdata *panic_handler_drvdata;
 
 struct erp_local_data {
 	struct erp_drvdata *drv;
@@ -172,6 +181,12 @@ static const struct errors_edac errors[] = {
 	__val;								\
 })
 
+#define read_esr_el1 ({							\
+	u64 __val;							\
+	asm("mrs %0, esr_el1" : "=r" (__val));				\
+	__val;								\
+})
+
 #define write_l2merrsr_el1(val) ({					\
 	asm("msr s3_1_c15_c2_3, %0" : : "r" (val));			\
 })
@@ -184,6 +199,39 @@ static const struct errors_edac errors[] = {
 	asm("msr s3_1_c15_c2_2, %0" : : "r" (val));			\
 })
 
+static void ca53_ca57_print_error_state_regs(void)
+{
+	u64 l2merrsr;
+	u64 cpumerrsr;
+	u32 esr_el1;
+	u32 l2ectlr;
+
+	cpumerrsr = read_cpumerrsr_el1;
+	l2merrsr = read_l2merrsr_el1;
+	esr_el1 = read_esr_el1;
+	l2ectlr = read_l2ectlr_el1;
+
+	/* store data in uncached rtb logs */
+	uncached_logk_pc(LOGK_READL, __builtin_return_address(0),
+				(void *)cpumerrsr);
+	uncached_logk_pc(LOGK_READL, __builtin_return_address(0),
+				(void *)l2merrsr);
+	uncached_logk_pc(LOGK_READL, __builtin_return_address(0),
+				(void *)((u64)esr_el1));
+	uncached_logk_pc(LOGK_READL, __builtin_return_address(0),
+				(void *)((u64)l2ectlr));
+
+	edac_printk(KERN_CRIT, EDAC_CPU, "CPUMERRSR value = %#llx\n",
+								cpumerrsr);
+	edac_printk(KERN_CRIT, EDAC_CPU, "L2MERRSR value = %#llx\n", l2merrsr);
+
+	edac_printk(KERN_CRIT, EDAC_CPU, "ESR value = %#x\n", esr_el1);
+	edac_printk(KERN_CRIT, EDAC_CPU, "L2ECTLR value = %#x\n", l2ectlr);
+	if (ESR_L2_DBE(esr_el1))
+		edac_printk(KERN_CRIT, EDAC_CPU,
+			"Double bit error on dirty L2 cacheline\n");
+}
+
 static void ca53_parse_cpumerrsr(struct erp_local_data *ed)
 {
 	u64 cpumerrsr;
@@ -194,10 +242,14 @@ static void ca53_parse_cpumerrsr(struct erp_local_data *ed)
 	if (!A53_CPUMERRSR_VALID(cpumerrsr))
 		return;
 
+	if (A53_CPUMERRSR_FATAL(cpumerrsr))
+		ed->err = DBE;
+
 	edac_printk(KERN_CRIT, EDAC_CPU, "Cortex A53 CPU%d L1 %s Error detected\n",
 					 smp_processor_id(), err_name[ed->err]);
-	edac_printk(KERN_CRIT, EDAC_CPU, "CPUMERRSR value = %#llx\n",
-								cpumerrsr);
+	ca53_ca57_print_error_state_regs();
+	if (ed->err == DBE)
+		edac_printk(KERN_CRIT, EDAC_CPU, "Fatal error\n");
 
 	cpuid = A53_CPUMERRSR_CPUID(cpumerrsr);
 
@@ -261,9 +313,14 @@ static void ca53_parse_l2merrsr(struct erp_local_data *ed)
 	if (!A53_L2MERRSR_VALID(l2merrsr))
 		return;
 
+	if (A53_L2MERRSR_FATAL(l2merrsr))
+		ed->err = DBE;
+
 	edac_printk(KERN_CRIT, EDAC_CPU, "CortexA53 L2 %s Error detected\n",
 							err_name[ed->err]);
-	edac_printk(KERN_CRIT, EDAC_CPU, "L2MERRSR value = %#llx\n", l2merrsr);
+	ca53_ca57_print_error_state_regs();
+	if (ed->err == DBE)
+		edac_printk(KERN_CRIT, EDAC_CPU, "Fatal error\n");
 
 	cpuid = A53_L2MERRSR_CPUID(l2merrsr);
 
@@ -313,10 +370,14 @@ static void ca57_parse_cpumerrsr(struct erp_local_data *ed)
 	if (!A57_CPUMERRSR_VALID(cpumerrsr))
 		return;
 
+	if (A57_CPUMERRSR_FATAL(cpumerrsr))
+		ed->err = DBE;
+
 	edac_printk(KERN_CRIT, EDAC_CPU, "Cortex A57 CPU%d L1 %s Error detected\n",
 					 smp_processor_id(), err_name[ed->err]);
-	edac_printk(KERN_CRIT, EDAC_CPU, "CPUMERRSR value = %#llx\n",
-								cpumerrsr);
+	ca53_ca57_print_error_state_regs();
+	if (ed->err == DBE)
+		edac_printk(KERN_CRIT, EDAC_CPU, "Fatal error\n");
 
 	bank = A57_CPUMERRSR_BANK(cpumerrsr);
 
@@ -374,9 +435,14 @@ static void ca57_parse_l2merrsr(struct erp_local_data *ed)
 	if (!A57_L2MERRSR_VALID(l2merrsr))
 		return;
 
+	if (A57_L2MERRSR_FATAL(l2merrsr))
+		ed->err = DBE;
+
 	edac_printk(KERN_CRIT, EDAC_CPU, "CortexA57 L2 %s Error detected\n",
 							err_name[ed->err]);
-	edac_printk(KERN_CRIT, EDAC_CPU, "L2MERRSR value = %#llx\n", l2merrsr);
+	ca53_ca57_print_error_state_regs();
+	if (ed->err == DBE)
+		edac_printk(KERN_CRIT, EDAC_CPU, "Fatal error\n");
 
 	cpuid = A57_L2MERRSR_CPUID(l2merrsr);
 
@@ -551,16 +617,6 @@ static irqreturn_t arm64_cci_handler(int irq, void *drvdata)
 	return IRQ_HANDLED;
 }
 
-void arm64_erp_local_dbe_handler(void)
-{
-	if (abort_handler_drvdata) {
-		struct erp_local_data errdata;
-		errdata.err = DBE;
-		errdata.drv = abort_handler_drvdata;
-		arm64_erp_local_handler(abort_handler_drvdata);
-	}
-}
-
 static inline u32 armv8pmu_pmcr_read(void)
 {
 	u32 val;
@@ -733,6 +789,12 @@ static void arm64_enable_pmu_irq(void *data)
 	enable_percpu_irq(irq, IRQ_TYPE_NONE);
 }
 
+static void arm64_disable_pmu_irq(void *data)
+{
+	unsigned int irq = *(unsigned int *)data;
+	disable_percpu_irq(irq);
+}
+
 static void check_sbe_event(struct erp_drvdata *drv)
 {
 	unsigned int partnum = read_cpuid_part_number();
@@ -776,7 +838,7 @@ static int msm_cti_pmu_wa_cpu_notify(struct notifier_block *self,
 					unsigned long action, void *hcpu)
 {
 	struct erp_drvdata *drv = container_of(self, struct erp_drvdata,
-								nb_cpu);
+								nb_cpu_wa);
 	switch (action) {
 	case CPU_ONLINE:
 		schedule_work_on((unsigned long)hcpu, &drv->work);
@@ -786,11 +848,33 @@ static int msm_cti_pmu_wa_cpu_notify(struct notifier_block *self,
 	return NOTIFY_OK;
 }
 
+static int arm64_edac_pmu_cpu_notify(struct notifier_block *self,
+					unsigned long action, void *hcpu)
+{
+	struct erp_drvdata *drv = container_of(self, struct erp_drvdata,
+								nb_cpu);
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_STARTING:
+		sbe_enable_event(drv);
+		arm64_enable_pmu_irq(&drv->sbe_irq);
+		break;
+	case CPU_DYING:
+		arm64_disable_pmu_irq(&drv->sbe_irq);
+		break;
+	};
+
+	return NOTIFY_OK;
+}
+
+#ifndef CONFIG_EDAC_CORTEX_ARM64_DBE_IRQ_ONLY
 void arm64_check_cache_ecc(void *info)
 {
 	if (panic_handler_drvdata)
 		check_sbe_event(panic_handler_drvdata);
 }
+#else
+static inline void arm64_check_cache_ecc(void *info) {}
+#endif
 
 static int arm64_erp_panic_notify(struct notifier_block *this,
 			      unsigned long event, void *ptr)
@@ -844,7 +928,7 @@ static int arm64_cpu_erp_probe(struct platform_device *pdev)
 
 	rc = of_property_read_u32(pdev->dev.of_node, "poll-delay-ms",
 							&poll_msec);
-	if (!rc) {
+	if (!rc && !IS_ENABLED(CONFIG_EDAC_CORTEX_ARM64_DBE_IRQ_ONLY)) {
 		drv->edev_ctl->edac_check = arm64_monitor_cache_errors;
 		drv->edev_ctl->poll_msec = poll_msec;
 		drv->edev_ctl->defer_work = 1;
@@ -893,7 +977,7 @@ static int arm64_cpu_erp_probe(struct platform_device *pdev)
 		goto out_irq;
 
 	sbe_irq = platform_get_irq_byname(pdev, "sbe-irq");
-	if (sbe_irq < 0) {
+	if (sbe_irq < 0 || IS_ENABLED(CONFIG_EDAC_CORTEX_ARM64_DBE_IRQ_ONLY)) {
 		pr_err("ARM64 CPU ERP: Could not find sbe-irq IRQ property. Proceeding anyway.\n");
 		fail++;
 		goto out_irq;
@@ -910,6 +994,7 @@ static int arm64_cpu_erp_probe(struct platform_device *pdev)
 								sbe_irq, rc);
 		goto out_irq;
 	}
+	drv->sbe_irq = sbe_irq;
 
 	drv->apply_cti_pmu_wa = of_property_read_bool(pdev->dev.of_node,
 						"qcom,apply-cti-pmu-wa");
@@ -922,11 +1007,13 @@ static int arm64_cpu_erp_probe(struct platform_device *pdev)
 				       &drv->nb_panic);
 	arm64_pmu_irq_handled_externally();
 	if (drv->apply_cti_pmu_wa) {
-		drv->nb_cpu.notifier_call = msm_cti_pmu_wa_cpu_notify;
-		register_cpu_notifier(&drv->nb_cpu);
+		drv->nb_cpu_wa.notifier_call = msm_cti_pmu_wa_cpu_notify;
+		register_cpu_notifier(&drv->nb_cpu_wa);
 		schedule_on_each_cpu(msm_enable_cti_pmu_workaround);
 		INIT_WORK(&drv->work, msm_enable_cti_pmu_workaround);
 	}
+	drv->nb_cpu.notifier_call = arm64_edac_pmu_cpu_notify;
+	register_cpu_notifier(&drv->nb_cpu);
 	on_each_cpu(sbe_enable_event, drv, 1);
 	on_each_cpu(arm64_enable_pmu_irq, &sbe_irq, 1);
 
@@ -937,14 +1024,6 @@ out_irq:
 		goto out_dev;
 	}
 
-	/*
-	 * abort_handler_drvdata points to erp_drvdata structure used for
-	 * reporting information on double-bit errors. There should only ever
-	 * be one.
-	 * */
-	WARN_ON(abort_handler_drvdata);
-
-	abort_handler_drvdata = drv;
 	panic_handler_drvdata = drv;
 
 	return 0;

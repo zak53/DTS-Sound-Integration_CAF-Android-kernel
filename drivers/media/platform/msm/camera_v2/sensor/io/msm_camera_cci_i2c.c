@@ -136,7 +136,7 @@ int32_t msm_camera_cci_i2c_write_seq(struct msm_camera_i2c_client *client,
 	uint32_t addr, uint8_t *data, uint32_t num_byte)
 {
 	int32_t rc = -EFAULT;
-	uint8_t i = 0;
+	uint32_t i = 0;
 	struct msm_camera_cci_ctrl cci_ctrl;
 	struct msm_camera_i2c_reg_array reg_conf_tbl[num_byte];
 
@@ -159,7 +159,7 @@ int32_t msm_camera_cci_i2c_write_seq(struct msm_camera_i2c_client *client,
 		reg_conf_tbl[i].reg_data = data[i];
 		reg_conf_tbl[i].delay = 0;
 	}
-	cci_ctrl.cmd = MSM_CCI_I2C_WRITE;
+	cci_ctrl.cmd = MSM_CCI_I2C_WRITE_SEQ;
 	cci_ctrl.cci_info = client->cci_client;
 	cci_ctrl.cfg.cci_i2c_write_cfg.reg_setting = reg_conf_tbl;
 	cci_ctrl.cfg.cci_i2c_write_cfg.data_type = MSM_CAMERA_I2C_BYTE_DATA;

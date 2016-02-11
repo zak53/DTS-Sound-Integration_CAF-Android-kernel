@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -32,6 +32,8 @@
 
 #define DEVICE_3D_NAME "kgsl-3d"
 #define DEVICE_3D0_NAME "kgsl-3d0"
+
+#define ADRENO_RBBM_STATUS_BUSY_MASK	~0x80000001
 
 #define ADRENO_PRIORITY_MAX_RB_LEVELS	4
 
@@ -142,6 +144,7 @@ enum adreno_gpurev {
 	ADRENO_REV_A418 = 418,
 	ADRENO_REV_A420 = 420,
 	ADRENO_REV_A430 = 430,
+	ADRENO_REV_A530 = 530,
 };
 
 #define ADRENO_SOFT_FAULT BIT(0)
@@ -234,7 +237,6 @@ struct adreno_device {
 	struct adreno_dispatcher dispatcher;
 	struct kgsl_memdesc pwron_fixup;
 	unsigned int pwron_fixup_dwords;
-	struct work_struct start_work;
 	struct work_struct input_work;
 	struct adreno_busy_data busy_data;
 	unsigned int ram_cycles_lo;
@@ -396,6 +398,7 @@ enum adreno_regs {
 	ADRENO_REG_CP_IB2_BASE,
 	ADRENO_REG_CP_IB2_BUFSZ,
 	ADRENO_REG_CP_TIMESTAMP,
+	ADRENO_REG_CP_SCRATCH_REG0,
 	ADRENO_REG_CP_SCRATCH_REG6,
 	ADRENO_REG_CP_SCRATCH_REG7,
 	ADRENO_REG_CP_ME_RAM_RADDR,
@@ -408,6 +411,7 @@ enum adreno_regs {
 	ADRENO_REG_CP_MEQ_DATA,
 	ADRENO_REG_CP_HW_FAULT,
 	ADRENO_REG_CP_PROTECT_STATUS,
+	ADRENO_REG_CP_PROTECT_REG_0,
 	ADRENO_REG_RBBM_STATUS,
 	ADRENO_REG_RBBM_PERFCTR_CTL,
 	ADRENO_REG_RBBM_PERFCTR_LOAD_CMD0,
@@ -432,6 +436,12 @@ enum adreno_regs {
 	ADRENO_REG_RBBM_PERFCTR_LOAD_VALUE_HI,
 	ADRENO_REG_RBBM_SECVID_TRUST_CONTROL,
 	ADRENO_REG_RBBM_ALWAYSON_COUNTER_LO,
+	ADRENO_REG_RBBM_SECVID_TRUST_CONFIG,
+	ADRENO_REG_RBBM_SECVID_TSB_CONTROL,
+	ADRENO_REG_RBBM_SECVID_TSB_TRUSTED_BASE,
+	ADRENO_REG_RBBM_SECVID_TSB_TRUSTED_SIZE,
+	ADRENO_REG_VBIF_XIN_HALT_CTRL0,
+	ADRENO_REG_VBIF_XIN_HALT_CTRL1,
 	ADRENO_REG_REGISTER_MAX,
 };
 
@@ -595,9 +605,11 @@ struct adreno_gpudev {
 
 	struct adreno_irq *irq;
 	int num_prio_levels;
+	unsigned int vbif_xin_halt_ctrl0_mask;
 	/* GPU specific function hooks */
 	void (*irq_trace)(struct adreno_device *, unsigned int status);
 	void (*snapshot)(struct adreno_device *, struct kgsl_snapshot *);
+	void (*gpudev_init)(struct adreno_device *);
 	int (*rb_init)(struct adreno_device *, struct adreno_ringbuffer *);
 	int (*perfcounter_init)(struct adreno_device *);
 	void (*start)(struct adreno_device *);
@@ -1208,27 +1220,31 @@ static inline void adreno_set_protected_registers(
 		unsigned int reg, int mask_len)
 {
 	unsigned int val;
+	unsigned int base =
+		adreno_getreg(adreno_dev, ADRENO_REG_CP_PROTECT_REG_0);
+	unsigned int offset = *index;
 
 	/* A430 has 24 registers (yay!).  Everything else has 16 (boo!) */
 
-	if (adreno_is_a430(adreno_dev))
+	if (adreno_is_a430(adreno_dev) || adreno_is_a418(adreno_dev))
 		BUG_ON(*index >= 24);
 	else
 		BUG_ON(*index >= 16);
 
-	val = 0x60000000 | ((mask_len & 0x1F) << 24) | ((reg << 2) & 0xFFFFF);
-
 	/*
-	 * Write the protection range to the next available protection
-	 * register
+	 * On A4XX targets with more than 16 protected mode registers
+	 * the upper registers are not contiguous with the lower 16
+	 * registers so we have to adjust the base and offset accordingly
 	 */
 
-	if (adreno_is_a4xx(adreno_dev))
-		kgsl_regwrite(&adreno_dev->dev,
-				A4XX_CP_PROTECT_REG_0 + *index, val);
-	else if (adreno_is_a3xx(adreno_dev))
-		kgsl_regwrite(&adreno_dev->dev,
-				A3XX_CP_PROTECT_REG_0 + *index, val);
+	if (adreno_is_a4xx(adreno_dev) && *index >= 0x10) {
+		base = A4XX_CP_PROTECT_REG_10;
+		offset = *index - 0x10;
+	}
+
+	val = 0x60000000 | ((mask_len & 0x1F) << 24) | ((reg << 2) & 0xFFFFF);
+
+	kgsl_regwrite(&adreno_dev->dev, base + offset, val);
 	*index = *index + 1;
 }
 

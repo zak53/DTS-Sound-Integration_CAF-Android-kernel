@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -170,7 +170,7 @@ static int ipa_generate_hdr_proc_ctx_hw_tbl(u32 hdr_sys_addr,
  * __ipa_commit_hdr() commits hdr to hardware
  * This function needs to be called with a locked mutex.
  */
-int __ipa_commit_hdr_v1(void)
+int __ipa_commit_hdr_v1_1(void)
 {
 	struct ipa_desc desc = { 0 };
 	struct ipa_mem_buffer *mem;
@@ -577,7 +577,7 @@ static int __ipa_add_hdr(struct ipa_hdr_add *hdr)
 	int id;
 	int mem_size;
 
-	if (hdr->hdr_len == 0) {
+	if (hdr->hdr_len == 0 || hdr->hdr_len > IPA_HDR_MAX_SIZE) {
 		IPAERR("bad parm\n");
 		goto error;
 	}
@@ -1110,10 +1110,10 @@ int ipa_reset_hdr(void)
 		list_del(&ctx_entry->link);
 		ctx_entry->ref_cnt = 0;
 		ctx_entry->cookie = 0;
-		kmem_cache_free(ipa_ctx->hdr_proc_ctx_cache, ctx_entry);
 
 		/* remove the handle from the database */
 		ipa_id_remove(ctx_entry->id);
+		kmem_cache_free(ipa_ctx->hdr_proc_ctx_cache, ctx_entry);
 
 	}
 	for (i = 0; i < IPA_HDR_PROC_CTX_BIN_MAX; i++) {

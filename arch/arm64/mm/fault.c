@@ -36,6 +36,7 @@
 #include <asm/system_misc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <asm/edac.h>
 
 #include <trace/events/exception.h>
 
@@ -369,6 +370,7 @@ static int __kprobes do_translation_fault(unsigned long addr,
  */
 static int do_bad(unsigned long addr, unsigned int esr, struct pt_regs *regs)
 {
+	arm64_check_cache_ecc(NULL);
 	return 1;
 }
 
@@ -485,7 +487,7 @@ asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
 	info.si_errno = 0;
 	info.si_code  = BUS_ADRALN;
 	info.si_addr  = (void __user *)addr;
-	arm64_notify_die("", regs, &info, esr);
+	arm64_notify_die("SP or PC abort", regs, &info, esr);
 }
 
 static struct fault_info debug_fault_info[] = {

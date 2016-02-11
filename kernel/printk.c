@@ -111,7 +111,7 @@ static struct console *exclusive_console;
  */
 struct console_cmdline
 {
-	char	name[8];			/* Name of the driver	    */
+	char	name[16];			/* Name of the driver	    */
 	int	index;				/* Minor dev. to use	    */
 	char	*options;			/* Options for the driver   */
 #ifdef CONFIG_A11Y_BRAILLE_CONSOLE
@@ -354,10 +354,12 @@ static u32 log_next(u32 idx, bool logbuf)
 #if defined(CONFIG_OOPS_LOG_BUFFER)
 void oops_printk_start(void)
 {
-	raw_spin_lock_irq(&logbuf_lock);
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&logbuf_lock, flags);
 	if (log_oops_first_seq == ULLONG_MAX)
 		log_oops_first_seq = log_next_seq;
-	raw_spin_unlock_irq(&logbuf_lock);
+	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
 }
 
 static void log_oops_store(struct log *msg)
@@ -2229,8 +2231,10 @@ static int __cpuinit console_cpu_notify(struct notifier_block *self,
 	case CPU_DEAD:
 	case CPU_DOWN_FAILED:
 	case CPU_UP_CANCELED:
+#ifdef CONFIG_CONSOLE_FLUSH_ON_HOTPLUG
 		console_lock();
 		console_unlock();
+#endif
 		break;
 	case CPU_ONLINE:
 	case CPU_DYING:
@@ -2598,6 +2602,8 @@ void register_console(struct console *newcon)
 	 */
 	for (i = 0; i < MAX_CMDLINECONSOLES && console_cmdline[i].name[0];
 			i++) {
+		BUILD_BUG_ON(sizeof(console_cmdline[i].name) !=
+			     sizeof(newcon->name));
 		if (strcmp(console_cmdline[i].name, newcon->name) != 0)
 			continue;
 		if (newcon->index >= 0 &&
@@ -2793,7 +2799,7 @@ void wake_up_klogd(void)
 	preempt_enable();
 }
 
-int printk_sched(const char *fmt, ...)
+int printk_deferred(const char *fmt, ...)
 {
 	unsigned long flags;
 	va_list args;

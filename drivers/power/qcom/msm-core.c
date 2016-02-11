@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -33,6 +33,7 @@
 #include <linux/thermal.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/uio_driver.h>
 #include <asm/smp_plat.h>
 #include <stdbool.h>
 #define CREATE_TRACE_POINTS
@@ -40,6 +41,7 @@
 
 #define TEMP_BASE_POINT 35
 #define TEMP_MAX_POINT 95
+#define CPU_HOTPLUG_LIMIT 80
 #define CPU_BIT_MASK(cpu) BIT(cpu)
 #define DEFAULT_TEMP 40
 #define DEFAULT_LOW_HYST_TEMP 10
@@ -96,6 +98,7 @@ struct cpu_static_info {
 
 static DEFINE_MUTEX(policy_update_mutex);
 static DEFINE_MUTEX(kthread_update_mutex);
+static DEFINE_SPINLOCK(update_lock);
 static struct delayed_work sampling_work;
 static struct completion sampling_completion;
 static struct task_struct *sampling_task;
@@ -116,6 +119,7 @@ module_param_named(disabled, disabled, int,
 		S_IRUGO | S_IWUSR | S_IWGRP);
 static bool in_suspend;
 static bool activate_power_table;
+
 /*
  * Cannot be called from an interrupt context
  */
@@ -141,8 +145,27 @@ static void set_threshold(struct cpu_activity_info *cpu_node)
 	if (cpu_node->sensor_id < 0)
 		return;
 
-	set_and_activate_threshold(cpu_node->sensor_id,
-		&cpu_node->hi_threshold);
+	/*
+	 * Before operating on the threshold structure which is used by
+	 * thermal core ensure that the sensor is disabled to prevent
+	 * incorrect operations on the sensor list maintained by thermal code.
+	 */
+	sensor_activate_trip(cpu_node->sensor_id,
+			&cpu_node->hi_threshold, false);
+	sensor_activate_trip(cpu_node->sensor_id,
+			&cpu_node->low_threshold, false);
+
+	cpu_node->hi_threshold.temp = cpu_node->temp + high_hyst_temp;
+	cpu_node->low_threshold.temp = cpu_node->temp - low_hyst_temp;
+
+	/*
+	 * Set the threshold only if we are below the hotplug limit
+	 * Adding more work at this high temperature range, seems to
+	 * fail hotplug notifications.
+	 */
+	if (cpu_node->hi_threshold.temp < CPU_HOTPLUG_LIMIT)
+		set_and_activate_threshold(cpu_node->sensor_id,
+			&cpu_node->hi_threshold);
 
 	set_and_activate_threshold(cpu_node->sensor_id,
 		&cpu_node->low_threshold);
@@ -175,6 +198,9 @@ static void repopulate_stats(int cpu)
 	int temp_point;
 	struct cpu_pstate_pwr *pt =  per_cpu(ptable, cpu);
 
+	if (!pt)
+		return;
+
 	if (cpu_node->temp < TEMP_BASE_POINT)
 		temp_point = 0;
 	else if (cpu_node->temp > TEMP_MAX_POINT)
@@ -194,7 +220,6 @@ void trigger_cpu_pwr_stats_calc(void)
 {
 	int cpu;
 	static long prev_temp[NR_CPUS];
-	static DEFINE_SPINLOCK(update_lock);
 	struct cpu_activity_info *cpu_node;
 
 	if (disabled)
@@ -211,12 +236,31 @@ void trigger_cpu_pwr_stats_calc(void)
 			sensor_get_temp(cpu_node->sensor_id, &cpu_node->temp);
 		prev_temp[cpu] = cpu_node->temp;
 
-		if (activate_power_table && cpu_node->sp->table)
+		/*
+		 * Do not populate/update stats before policy and ptable have
+		 * been updated.
+		 */
+		if (activate_power_table && cpu_stats[cpu].ptable
+			&& cpu_node->sp->table)
 			repopulate_stats(cpu);
 	}
 	spin_unlock(&update_lock);
 }
 EXPORT_SYMBOL(trigger_cpu_pwr_stats_calc);
+
+void set_cpu_throttled(cpumask_t *mask, bool throttling)
+{
+	int cpu;
+
+	if (!mask)
+		return;
+
+	spin_lock(&update_lock);
+	for_each_cpu(cpu, mask)
+		cpu_stats[cpu].throttling = throttling;
+	spin_unlock(&update_lock);
+}
+EXPORT_SYMBOL(set_cpu_throttled);
 
 static void update_related_freq_table(struct cpufreq_policy *policy)
 {
@@ -264,18 +308,13 @@ static __ref int do_sampling(void *data)
 
 		for_each_online_cpu(cpu) {
 			cpu_node = &activity[cpu];
-			if (prev_temp[cpu] == cpu_node->temp)
-				goto unlock;
-
-			prev_temp[cpu] = cpu_node->temp;
-			cpu_node->low_threshold.temp = cpu_node->temp
-							- low_hyst_temp;
-			cpu_node->hi_threshold.temp = cpu_node->temp
-							+ high_hyst_temp;
-			set_threshold(cpu_node);
-			trace_temp_threshold(cpu, cpu_node->temp,
-				cpu_node->hi_threshold.temp,
-				cpu_node->low_threshold.temp);
+			if (prev_temp[cpu] != cpu_node->temp) {
+				prev_temp[cpu] = cpu_node->temp;
+				set_threshold(cpu_node);
+				trace_temp_threshold(cpu, cpu_node->temp,
+					cpu_node->hi_threshold.temp,
+					cpu_node->low_threshold.temp);
+			}
 		}
 		if (!poll_ms)
 			goto unlock;
@@ -302,6 +341,14 @@ static void clear_static_power(struct cpu_static_info *sp)
 		kfree(sp->power[i]);
 	kfree(sp->power);
 	kfree(sp);
+}
+
+static BLOCKING_NOTIFIER_HEAD(msm_core_stats_notifier_list);
+
+int register_cpu_pwr_stats_ready_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&msm_core_stats_notifier_list,
+						nb);
 }
 
 static int update_userspace_power(struct sched_params __user *argp)
@@ -358,6 +405,7 @@ static int update_userspace_power(struct sched_params __user *argp)
 	/* Copy the same power values for all the cpus in the cpumask
 	 * argp->cpumask within the cluster (argp->cluster)
 	 */
+	spin_lock(&update_lock);
 	cpumask = argp->cpumask;
 	for (i = 0; i < MAX_CORES_PER_CLUSTER; i++, cpumask >>= 1) {
 		if (!(cpumask & 0x01))
@@ -378,8 +426,12 @@ static int update_userspace_power(struct sched_params __user *argp)
 			}
 			cpu_stats[cpu].ptable = per_cpu(ptable, cpu);
 			repopulate_stats(cpu);
+
+			blocking_notifier_call_chain(
+				&msm_core_stats_notifier_list, cpu, NULL);
 		}
 	}
+	spin_unlock(&update_lock);
 
 	activate_power_table = true;
 	return 0;
@@ -399,12 +451,15 @@ static long msm_core_ioctl(struct file *file, unsigned int cmd,
 	struct cpu_activity_info *node = NULL;
 	struct sched_params __user *argp = (struct sched_params __user *)arg;
 	int i, cpu = num_possible_cpus();
-	int mpidr = (argp->cluster << (MAX_CORES_PER_CLUSTER *
-			MAX_NUM_OF_CLUSTERS));
-	int cpumask = argp->cpumask;
+	int mpidr;
+	int cpumask;
 
 	if (!argp)
 		return -EINVAL;
+
+	mpidr = (argp->cluster << (MAX_CORES_PER_CLUSTER *
+			MAX_NUM_OF_CLUSTERS));
+	cpumask = argp->cpumask;
 
 	switch (cmd) {
 	case EA_LEAKAGE:
@@ -413,13 +468,9 @@ static long msm_core_ioctl(struct file *file, unsigned int cmd,
 			pr_err("Userspace power update failed with %ld\n", ret);
 		break;
 	case EA_VOLT:
-		for (i = 0; i < MAX_CORES_PER_CLUSTER; i++, cpumask >>= 1) {
-			if (!(cpumask & 0x01))
-				continue;
-
-			mpidr |= i;
+		for (i = 0; cpumask > 0; i++, cpumask >>= 1) {
 			for_each_possible_cpu(cpu) {
-				if (cpu_logical_map(cpu) == mpidr)
+				if (cpu_logical_map(cpu) == (mpidr | i))
 					break;
 			}
 		}
@@ -492,6 +543,7 @@ static int msm_core_stats_init(struct device *dev, int cpu)
 	cpu_node = &activity[cpu];
 	cpu_stats[cpu].cpu = cpu;
 	cpu_stats[cpu].temp = cpu_node->temp;
+	cpu_stats[cpu].throttling = false;
 
 	cpu_stats[cpu].len = cpu_node->sp->num_of_freqs;
 	pstate = devm_kzalloc(dev,
@@ -504,6 +556,7 @@ static int msm_core_stats_init(struct device *dev, int cpu)
 		pstate[i].freq = cpu_node->sp->table[i].frequency;
 
 	per_cpu(ptable, cpu) = pstate;
+
 	return 0;
 }
 
@@ -767,10 +820,10 @@ static int system_suspend_handler(struct notifier_block *nb,
 			if (activity[cpu].sensor_id < 0)
 				continue;
 
-			sensor_cancel_trip(activity[cpu].sensor_id,
-				&activity[cpu].hi_threshold);
-			sensor_cancel_trip(activity[cpu].sensor_id,
-				&activity[cpu].low_threshold);
+			sensor_activate_trip(activity[cpu].sensor_id,
+				&activity[cpu].hi_threshold, false);
+			sensor_activate_trip(activity[cpu].sensor_id,
+				&activity[cpu].low_threshold, false);
 		}
 		break;
 	default:
@@ -889,6 +942,49 @@ static void free_dyn_memory(void)
 	}
 }
 
+static int uio_init(struct platform_device *pdev)
+{
+	int ret = 0;
+	struct uio_info *info = NULL;
+	struct resource *clnt_res = NULL;
+	u32 ea_mem_size = 0;
+	phys_addr_t ea_mem_pyhsical = 0;
+
+	clnt_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!clnt_res) {
+		pr_err("resource not found\n");
+		return -ENODEV;
+	}
+
+	info = devm_kzalloc(&pdev->dev, sizeof(struct uio_info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+
+	ea_mem_size = resource_size(clnt_res);
+	ea_mem_pyhsical = clnt_res->start;
+
+	if (ea_mem_size == 0) {
+		pr_err("msm-core: memory size is zero");
+		return -EINVAL;
+	}
+
+	/* Setup device */
+	info->name = clnt_res->name;
+	info->version = "1.0";
+	info->mem[0].addr = ea_mem_pyhsical;
+	info->mem[0].size = ea_mem_size;
+	info->mem[0].memtype = UIO_MEM_PHYS;
+
+	ret = uio_register_device(&pdev->dev, info);
+	if (ret) {
+		pr_err("uio register failed ret=%d", ret);
+		return ret;
+	}
+	dev_set_drvdata(&pdev->dev, info);
+
+	return 0;
+}
+
 static int msm_core_dev_probe(struct platform_device *pdev)
 {
 	int ret = 0;
@@ -918,6 +1014,11 @@ static int msm_core_dev_probe(struct platform_device *pdev)
 	ret = of_property_read_u32(node, key, &poll_ms);
 	if (ret)
 		pr_info("msm-core initialized without polling period\n");
+
+
+	ret = uio_init(pdev);
+	if (ret)
+		return ret;
 
 	ret = msm_core_freq_init();
 	if (ret)
@@ -953,6 +1054,9 @@ failed:
 static int msm_core_remove(struct platform_device *pdev)
 {
 	int cpu;
+	struct uio_info *info = dev_get_drvdata(&pdev->dev);
+
+	uio_unregister_device(info);
 
 	for_each_possible_cpu(cpu) {
 		if (activity[cpu].sensor_id < 0)

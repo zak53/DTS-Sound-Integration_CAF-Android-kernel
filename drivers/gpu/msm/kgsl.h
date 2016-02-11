@@ -24,6 +24,7 @@
 #include <linux/cdev.h>
 #include <linux/regulator/consumer.h>
 #include <linux/mm.h>
+#include <linux/dma-attrs.h>
 
 /* The number of memstore arrays limits the number of contexts allowed.
  * If more contexts are needed, update multiple for MEMSTORE_SIZE
@@ -147,6 +148,7 @@ struct kgsl_memdesc {
 	struct kgsl_memdesc_ops *ops;
 	unsigned int flags; /* Flags set from userspace */
 	struct device *dev;
+	struct dma_attrs attrs;
 };
 
 /*
@@ -191,9 +193,9 @@ struct kgsl_mem_entry {
 	unsigned int id;
 	struct kgsl_process_private *priv;
 	int pending_free;
-	struct kgsl_device_private *dev_priv;
 };
 
+struct kgsl_device_private;
 struct kgsl_event_group;
 
 typedef void (*kgsl_event_func)(struct kgsl_device *, struct kgsl_event_group *,
@@ -449,7 +451,7 @@ static inline void *kgsl_malloc(size_t size)
  */
 static inline void kgsl_free(void *ptr)
 {
-	if (is_vmalloc_addr(ptr))
+	if (ptr != NULL && is_vmalloc_addr(ptr))
 		return vfree(ptr);
 
 	kfree(ptr);

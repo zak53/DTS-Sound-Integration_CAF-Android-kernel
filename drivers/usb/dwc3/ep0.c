@@ -277,7 +277,7 @@ static void dwc3_ep0_stall_and_restart(struct dwc3 *dwc)
 
 	/* stall is always issued on EP0 */
 	dep = dwc->eps[0];
-	__dwc3_gadget_ep_set_halt(dep, 1);
+	__dwc3_gadget_ep_set_halt(dep, 1, false);
 	dep->flags = DWC3_EP_ENABLED;
 	dwc->delayed_status = false;
 
@@ -519,7 +519,7 @@ static int dwc3_ep0_handle_feature(struct dwc3 *dwc,
 				return -EINVAL;
 			if (set == 0 && (dep->flags & DWC3_EP_WEDGE))
 				break;
-			ret = __dwc3_gadget_ep_set_halt(dep, set);
+			ret = __dwc3_gadget_ep_set_halt(dep, set, true);
 			if (ret)
 				return -EINVAL;
 			break;
@@ -1002,7 +1002,6 @@ static void __dwc3_ep0_do_control_data(struct dwc3 *dwc,
 	}
 
 	dbg_queue(dep->number, &req->request, ret);
-	WARN_ON(ret < 0);
 }
 
 static int dwc3_ep0_start_control_status(struct dwc3_ep *dep)
@@ -1053,7 +1052,11 @@ static void dwc3_ep0_end_control_data(struct dwc3 *dwc, struct dwc3_ep *dep)
 	cmd |= DWC3_DEPCMD_PARAM(dep->resource_index);
 	memset(&params, 0, sizeof(params));
 	ret = dwc3_send_gadget_ep_cmd(dwc, dep->number, cmd, &params);
-	WARN_ON_ONCE(ret);
+	if (ret) {
+		dev_dbg(dwc->dev, "%s: send ep cmd ENDTRANSFER failed",
+			dep->name);
+		dbg_event(dep->number, "EENDXFER", ret);
+	}
 	dep->resource_index = 0;
 }
 
@@ -1098,7 +1101,9 @@ static void dwc3_ep0_xfernotready(struct dwc3 *dwc,
 					dwc->ctrl_req_addr, 0,
 					DWC3_TRBCTL_CONTROL_DATA);
 			dbg_event(epnum, "ZLP", ret);
-			WARN_ON(ret < 0);
+			if (ret)
+				dev_dbg(dwc->dev, "%s: start xfer cmd failed",
+					dep->name);
 		}
 
 		break;
@@ -1115,7 +1120,8 @@ static void dwc3_ep0_xfernotready(struct dwc3 *dwc,
 
 		if (dwc->delayed_status &&
 				list_empty(&dwc->eps[0]->request_list)) {
-			WARN_ON_ONCE(event->endpoint_number != 1);
+			if (event->endpoint_number != 1)
+				dbg_event(epnum, "EEPNUM", event->status);
 			dev_vdbg(dwc->dev, "Mass Storage delayed status\n");
 			return;
 		}

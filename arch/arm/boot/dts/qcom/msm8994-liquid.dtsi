@@ -1,5 +1,5 @@
 
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -64,6 +64,11 @@
 &dsi_dual_jdi_4k_video_1 {
 	qcom,cont-splash-enabled;
 };
+
+&mdss_fb0 {
+	qcom,boot-indication-enabled;
+};
+
 &mdss_dsi0 {
 	qcom,dsi-pref-prim-pan = <&dsi_dual_jdi_4k_video_0>;
 	pinctrl-names = "mdss_default", "mdss_sleep";
@@ -84,6 +89,12 @@
 
 	vddio-supply = <&pm8994_s4>;
 	qcom,regulator-ldo-mode;
+};
+
+&labibb {
+	status = "ok";
+	qpnp,qpnp-labibb-mode = "lcd";
+	qcom,qpnp-ibb-discharge-resistor = <32>;
 };
 
 &pmx_hdmi_cec {
@@ -505,13 +516,13 @@
 		qcom,mbhc-audio-jack-type = "6-pole-jack";
 		qcom,dock-plug-det-irq = <&pm8994_gpios 13 0x1>;
 		qcom,ext-ult-spk-amp-gpio = <&pmi8994_gpios 1 0>;
+		asoc-codec = <&stub_codec>, <&hdmi_audio>;
+		asoc-codec-names = "msm-stub-codec.1", "msm-hdmi-audio-codec-rx";
 	};
 
 	liquid_dock {
 		compatible = "qcom,liquid-dock";
 		qcom,dock-detect-gpio = <&pm8994_gpios 5 0>;
-		qcom,dock-hub-reset-gpio = <&pm8994_gpios 1 0>;
-		qcom,dock-eth-reset-gpio = <&pm8994_mpps 6 0>;
 		qcom,usb-host = <&usb_ehci>;
 	};
 };
@@ -529,7 +540,8 @@
 };
 
 &pmi8994_charger {
-	qcom,charging-disabled;
+	qcom,dc-psy-type = "Wipower";
+	qcom,charge-unknown-battery;
 };
 
 &slim_msm {
@@ -586,16 +598,19 @@
 	};
 };
 
-&pm8994_gpios {
-	gpio@c000 { /* GPIO 1 HUB RESET*/
-		qcom,mode = <1>;	/* Digital output */
-		qcom,output-type = <0>;	/* CMOS logic */
-		qcom,vin-sel = <2>;	/* 1.8v */
-		qcom,src-sel = <0>;	/* Constant */
-		qcom,master-en = <1>;	/* Enable GPIO */
-		status = "okay";
+&i2c_5 {
+	smb349-dual-charger@1b {
+		compatible = "qcom,smb349-dual-charger";
+		reg = <0x1b>;
+		interrupt-parent = <&spmi_bus>;
+		qcom,chg-stat-gpio = <&pm8994_gpios 6 0x1>;
+		qcom,fastchg-current-max-ma = <2000>;
+		qcom,battery-psy-name = "cradle-charger";
+		qcom,ext-psy-name = "battery";
 	};
+};
 
+&pm8994_gpios {
 	gpio@c100 { /* GPIO 2 */
 		qcom,mode = <0>;
 		qcom,pull = <0>;
@@ -734,15 +749,6 @@
 		qcom,master-en = <1>;	/* Enable GPIO */
 		status = "okay";
 	};
-
-	mpp@a500 { /* MPP 6 Ethernet RESET */
-		qcom,mode = <1>;	/* Digital output */
-		qcom,output-type = <0>;	/* CMOS logic */
-		qcom,vin-sel = <2>;	/* 1.8 V */
-		qcom,src-sel = <0>;	/* Constant */
-		qcom,master-en = <1>;	/* Enable GPIO */
-		status = "okay";
-	};
 };
 
 &pmi8994_gpios {
@@ -860,16 +866,6 @@
 				qcom,s2-type = <7>;
 			};
 		};
-       };
-
-       qcom,pmi8994@3 {
-              qcom,leds@d000 {
-                     qcom,rgb_2 {
-                            status = "ok";
-                            qcom,default-state = "on";
-                            qcom,turn-off-delay-ms = <5000>;
-                     };
-              };
        };
 };
 

@@ -5,6 +5,8 @@ HSUSB PHY
 Required properties:
  - compatible: Should be "qcom,usb-hsphy"
  - reg: Address and length of the register set for the device
+   Required regs are:
+	"core" : the QSCRATCH base register set
  - <supply-name>-supply: phandle to the regulator device tree node
    Required "supply-name" examples are:
 	"vdd" : vdd supply for HSPHY digital circuit operation
@@ -15,10 +17,15 @@ Required properties:
    microvolts or a value corresponding to voltage corner
 
 Optional properties:
- - reg: Address and length of the TCSR register to be written when performing
-   a block reset, as well as to intialize the internal MUX to select the
-   correct controller. If present this must be the second register listed.
-
+ - reg: Additional registers
+	"tcsr" : top-level CSR register to be written during power-on reset
+		 intialize the internal MUX that controls whether this PHY is
+		 used with the USB3 or the USB2 controller.
+	"phy_csr" : register region that contains additional PHY CSRs that
+		    offer additional control apart from the QSCRATCH registers.
+		    These handle functions such as controlling the internal
+		    reference clock buffer and powering on/off the entire PHY.
+ - vddcx-supply: phandle to VDDCX regulator powering digital circuitry
  - qcom,hsphy-init: Init value used to override HSPHY parameters into
    QSCRATCH register. This 32-bit value represents parameters as follows:
 		bits 0-5   PARAMETER_OVERRIDE_A
@@ -36,6 +43,10 @@ Optional properties:
    If omitted, defaults to 1
  - qcom,sleep-clk-reset: If present, the HSUSB PHY sleep clock supports the clk_reset
    operation, and should be called during initialization.
+ - qcom,vdda-force-on: If present, HW requires a workaround that forces 1.8V and 3.1V
+		       regulator supplies to be left on even when PHY enters into
+		       low power mode.
+
 Example:
 	hsphy@f9200000 {
 		compatible = "qcom,usb-hsphy";
@@ -71,6 +82,8 @@ Optional properties:
    dependent on the primary PHY referenced by this phandle.
  - qcom,override-pll-calibration: If present, program PHY register to overrride
 	the automatic PHY PLL calibration settings.
+ - qcom,qmp-misc-config: If present, program PHY miscellaneous device-specific
+	registers.
 
 Example:
 	ssphy@f9200000 {
@@ -148,6 +161,9 @@ Optional properties:
    control in device mode. The reg-names property is required if the
    reg property is specified.
  - qcom,emulation: Indicates that we are running on emulation platform.
+ - qcom,qusb-tune: Used to pass QUSB PHY tuning parameters. The 4 tuning parameters
+   are passed in as 4 bytes packed into a single 32-bit value. The parameters control
+   On-chip Rout Term, TX Output Level, RX Sensitivity and TX Pre-emphasis respectively.
 
 Example:
 	qusb_phy: qusb@f9b39000 {

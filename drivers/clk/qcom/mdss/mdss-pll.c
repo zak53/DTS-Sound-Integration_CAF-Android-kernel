@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -45,6 +45,7 @@ int mdss_pll_resource_enable(struct mdss_pll_resources *pll_res, bool enable)
 		return rc;
 	}
 
+	mutex_lock(&pll_res->res_lock);
 	if (enable) {
 		if (pll_res->resource_ref_cnt == 0)
 			changed++;
@@ -67,6 +68,7 @@ int mdss_pll_resource_enable(struct mdss_pll_resources *pll_res, bool enable)
 			pll_res->resource_enable = enable;
 	}
 
+	mutex_unlock(&pll_res->res_lock);
 	return rc;
 }
 
@@ -142,11 +144,16 @@ static int mdss_pll_resource_parse(struct platform_device *pdev,
 	} else if (!strcmp(compatible_stream, "qcom,mdss_dsi_pll_8994")) {
 		pll_res->pll_interface_type = MDSS_DSI_PLL_20NM;
 		pll_res->target_id = MDSS_PLL_TARGET_8994;
+	} else if (!strcmp(compatible_stream, "qcom,mdss_dsi_pll_8992")) {
+		pll_res->pll_interface_type = MDSS_DSI_PLL_20NM;
+		pll_res->target_id = MDSS_PLL_TARGET_8992;
 	} else if (!strcmp(compatible_stream, "qcom,mdss_edp_pll")) {
 		pll_res->pll_interface_type = MDSS_EDP_PLL;
 	} else if (!strcmp(compatible_stream, "qcom,mdss_hdmi_pll")) {
 		pll_res->pll_interface_type = MDSS_HDMI_PLL;
 	} else if (!strcmp(compatible_stream, "qcom,mdss_hdmi_pll_8994")) {
+		pll_res->pll_interface_type = MDSS_HDMI_PLL_20NM;
+	} else if (!strcmp(compatible_stream, "qcom,mdss_hdmi_pll_8992")) {
 		pll_res->pll_interface_type = MDSS_HDMI_PLL_20NM;
 	} else {
 		goto err;
@@ -207,6 +214,7 @@ static int mdss_pll_probe(struct platform_device *pdev)
 	struct resource *pll_base_reg;
 	struct resource *phy_base_reg;
 	struct resource *dynamic_pll_base_reg;
+	struct resource *gdsc_base_reg;
 	struct mdss_pll_resources *pll_res;
 
 	if (!pdev->dev.of_node) {
@@ -309,6 +317,26 @@ static int mdss_pll_probe(struct platform_device *pdev)
 		}
 	}
 
+	gdsc_base_reg = platform_get_resource_byname(pdev,
+					IORESOURCE_MEM, "gdsc_base");
+	if (!gdsc_base_reg) {
+		pr_err("Unable to get the gdsc base resource\n");
+		rc = -ENOMEM;
+		goto gdsc_io_error;
+	}
+	pll_res->gdsc_base = ioremap(gdsc_base_reg->start,
+			resource_size(gdsc_base_reg));
+	if (!pll_res->gdsc_base) {
+		pr_err("Unable to remap gdsc base resources\n");
+		rc = -ENOMEM;
+		goto gdsc_io_error;
+	}
+
+	pll_res->pll_en_90_phase = of_property_read_bool(pdev->dev.of_node,
+						"qcom,mdss-en-pll-90-phase");
+	if (pll_res->pll_en_90_phase)
+		pr_debug("%s: PLL configured to enable 90-Phase", __func__);
+
 	rc = mdss_pll_resource_init(pdev, pll_res);
 	if (rc) {
 		pr_err("Pll resource init failed rc=%d\n", rc);
@@ -326,6 +354,9 @@ static int mdss_pll_probe(struct platform_device *pdev)
 clock_register_error:
 	mdss_pll_resource_deinit(pdev, pll_res);
 res_init_error:
+	if (pll_res->gdsc_base)
+		iounmap(pll_res->gdsc_base);
+gdsc_io_error:
 	if (pll_res->dyn_pll_base)
 		iounmap(pll_res->dyn_pll_base);
 dyn_pll_io_error:
@@ -356,6 +387,8 @@ static int mdss_pll_remove(struct platform_device *pdev)
 	mdss_pll_resource_deinit(pdev, pll_res);
 	if (pll_res->phy_base)
 		iounmap(pll_res->phy_base);
+	if (pll_res->gdsc_base)
+		iounmap(pll_res->gdsc_base);
 	mdss_pll_resource_release(pdev, pll_res);
 	iounmap(pll_res->pll_base);
 	devm_kfree(&pdev->dev, pll_res);
@@ -366,6 +399,8 @@ static const struct of_device_id mdss_pll_dt_match[] = {
 	{.compatible = "qcom,mdss_dsi_pll_8974"},
 	{.compatible = "qcom,mdss_dsi_pll_8994"},
 	{.compatible = "qcom,mdss_hdmi_pll_8994"},
+	{.compatible = "qcom,mdss_dsi_pll_8992"},
+	{.compatible = "qcom,mdss_hdmi_pll_8992"},
 	{.compatible = "qcom,mdss_dsi_pll_8916"},
 	{.compatible = "qcom,mdss_dsi_pll_8939"},
 	{.compatible = "qcom,mdss_dsi_pll_8909"},

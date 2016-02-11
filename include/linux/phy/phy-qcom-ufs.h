@@ -61,7 +61,6 @@ struct ufs_qcom_phy {
 	struct list_head list;
 	struct device *dev;
 	void __iomem *mmio;
-	void __iomem *dev_ref_clk_ctrl_mmio;
 	struct clk *tx_iface_clk;
 	struct clk *rx_iface_clk;
 	bool is_iface_clk_enabled;
@@ -69,9 +68,9 @@ struct ufs_qcom_phy {
 	struct clk *ref_clk_parent;
 	struct clk *ref_clk;
 	bool is_ref_clk_enabled;
-	bool is_dev_ref_clk_enabled;
 	struct ufs_qcom_phy_vreg vdda_pll;
 	struct ufs_qcom_phy_vreg vdda_phy;
+	struct ufs_qcom_phy_vreg vddp_ref_clk;
 	unsigned int quirks;
 	u8 host_ctrl_rev_major;
 	u16 host_ctrl_rev_minor;
@@ -159,8 +158,6 @@ struct ufs_qcom_phy_specific_ops {
 	void (*power_control) (struct ufs_qcom_phy *phy, bool val);
 };
 
-int ufs_qcom_phy_init_vreg(struct phy *phy,
-			struct ufs_qcom_phy_vreg *vreg, const char *name);
 int ufs_qcom_phy_cfg_vreg(struct phy *phy,
 			struct ufs_qcom_phy_vreg *vreg, bool on);
 int ufs_qcom_phy_enable_vreg(struct phy *phy,

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -913,6 +913,7 @@ struct ipa_wdi_out_params {
  * @send_dl_skb: callback for sending skb on downlink direction to adapter.
  *		Client is expected to free the skb.
  * @device_ethaddr: device Ethernet address in network order.
+ * @ipa_desc_size: IPA Sys Pipe Desc Size
  */
 struct odu_bridge_params {
 	const char *netdev_name;
@@ -920,6 +921,81 @@ struct odu_bridge_params {
 	ipa_notify_cb tx_dp_notify;
 	int (*send_dl_skb)(void *priv, struct sk_buff *skb);
 	u8 device_ethaddr[ETH_ALEN];
+	u32 ipa_desc_size;
+};
+
+/**
+ * enum ipa_mhi_event_type - event type for mhi callback
+ *
+ * @IPA_MHI_EVENT_READY: IPA MHI is ready and IPA uC is loaded. After getting
+ *	this event MHI client is expected to call to ipa_mhi_start() API
+ * @IPA_MHI_EVENT_DATA_AVAILABLE: downlink data available on MHI channel
+ */
+enum ipa_mhi_event_type {
+	IPA_MHI_EVENT_READY,
+	IPA_MHI_EVENT_DATA_AVAILABLE,
+	IPA_MHI_EVENT_MAX,
+};
+
+typedef void (*mhi_client_cb)(void *priv, enum ipa_mhi_event_type event,
+	unsigned long data);
+
+/**
+ * struct ipa_mhi_msi_info - parameters for MSI (Message Signaled Interrupts)
+ * @addr_low: MSI lower base physical address
+ * @addr_hi: MSI higher base physical address
+ * @data: Data Pattern to use when generating the MSI
+ * @mask: Mask indicating number of messages assigned by the host to device
+ *
+ * msi value is written according to this formula:
+ *	((data & ~mask) | (mmio.msiVec & mask))
+ */
+struct ipa_mhi_msi_info {
+	u32 addr_low;
+	u32 addr_hi;
+	u32 data;
+	u32 mask;
+};
+
+/**
+ * struct ipa_mhi_init_params - parameters for IPA MHI initialization API
+ *
+ * @msi: MSI (Message Signaled Interrupts) parameters
+ * @mmio_addr: MHI MMIO physical address
+ * @first_ch_idx: First channel ID for hardware accelerated channels.
+ * @first_er_idx: First event ring ID for hardware accelerated channels.
+ * @notify: client callback
+ * @priv: client private data to be provided in client callback
+ */
+struct ipa_mhi_init_params {
+	struct ipa_mhi_msi_info msi;
+	u32 mmio_addr;
+	u32 first_ch_idx;
+	u32 first_er_idx;
+	mhi_client_cb notify;
+	void *priv;
+};
+
+/**
+ * struct ipa_mhi_start_params - parameters for IPA MHI start API
+ *
+ * @host_ctrl_addr: Base address of MHI control data structures
+ * @host_data_addr: Base address of MHI data buffers
+ */
+struct ipa_mhi_start_params {
+	u32 host_ctrl_addr;
+	u32 host_data_addr;
+};
+
+/**
+ * struct ipa_mhi_connect_params - parameters for IPA MHI channel connect API
+ *
+ * @sys: IPA EP configuration info
+ * @channel_id: MHI channel id
+ */
+struct ipa_mhi_connect_params {
+	struct ipa_sys_connect_params sys;
+	u8 channel_id;
 };
 
 #ifdef CONFIG_IPA
@@ -1146,6 +1222,15 @@ int teth_bridge_disconnect(enum ipa_client_type client);
 int teth_bridge_connect(struct teth_bridge_connect_params *connect_params);
 
 /*
+ * Tethering client info
+ */
+void ipa_set_client(int index, enum ipacm_client_enum client, bool uplink);
+
+enum ipacm_client_enum ipa_get_client(int pipe_idx);
+
+bool ipa_get_client_uplink(int pipe_idx);
+
+/*
  * ODU bridge
  */
 
@@ -1159,6 +1244,40 @@ int odu_bridge_tx_dp(struct sk_buff *skb, struct ipa_tx_meta *metadata);
 
 int odu_bridge_cleanup(void);
 
+/*
+ * IPADMA
+ */
+int ipa_dma_init(void);
+
+int ipa_dma_enable(void);
+
+int ipa_dma_disable(void);
+
+int ipa_dma_sync_memcpy(phys_addr_t dest, phys_addr_t src, int len);
+
+int ipa_dma_async_memcpy(phys_addr_t dest, phys_addr_t src, int len,
+			void (*user_cb)(void *user1), void *user_param);
+
+int ipa_dma_uc_memcpy(phys_addr_t dest, phys_addr_t src, int len);
+
+void ipa_dma_destroy(void);
+
+/*
+ * MHI
+ */
+int ipa_mhi_init(struct ipa_mhi_init_params *params);
+
+int ipa_mhi_start(struct ipa_mhi_start_params *params);
+
+int ipa_mhi_connect_pipe(struct ipa_mhi_connect_params *in, u32 *clnt_hdl);
+
+int ipa_mhi_disconnect_pipe(u32 clnt_hdl);
+
+int ipa_mhi_suspend(bool force);
+
+int ipa_mhi_resume(void);
+
+int ipa_mhi_destroy(void);
 
 /*
  * mux id
@@ -1186,7 +1305,8 @@ int ipa_get_ep_mapping(enum ipa_client_type client);
 
 bool ipa_is_ready(void);
 
-void ipa_q6_init_done(void);
+void ipa_proxy_clk_vote(void);
+void ipa_proxy_clk_unvote(void);
 
 enum ipa_hw_type ipa_get_hw_type(void);
 
@@ -1689,6 +1809,25 @@ static inline int teth_bridge_connect(struct teth_bridge_connect_params
 }
 
 /*
+ * Tethering client info
+ */
+static inline void ipa_set_client(int index, enum ipacm_client_enum client,
+	bool uplink)
+{
+}
+
+static inline enum ipacm_client_enum ipa_get_client(int pipe_idx)
+{
+	return -EPERM;
+}
+
+static inline bool ipa_get_client_uplink(int pipe_idx)
+{
+	return -EPERM;
+}
+
+
+/*
  * ODU bridge
  */
 static inline int odu_bridge_init(struct odu_bridge_params *params)
@@ -1717,6 +1856,85 @@ static inline int odu_bridge_cleanup(void)
 	return -EPERM;
 }
 
+/*
+ * IPADMA
+ */
+static inline int ipa_dma_init(void)
+{
+	return -EPERM;
+}
+
+static inline int ipa_dma_enable(void)
+{
+	return -EPERM;
+}
+
+static inline int ipa_dma_disable(void)
+{
+	return -EPERM;
+}
+
+static inline int ipa_dma_sync_memcpy(phys_addr_t dest, phys_addr_t src
+			, int len)
+{
+	return -EPERM;
+}
+
+static inline int ipa_dma_async_memcpy(phys_addr_t dest, phys_addr_t src
+			, int len, void (*user_cb)(void *user1),
+			void *user_param)
+{
+	return -EPERM;
+}
+
+static inline int ipa_dma_uc_memcpy(phys_addr_t dest, phys_addr_t src, int len)
+{
+	return -EPERM;
+}
+
+static inline void ipa_dma_destroy(void)
+{
+	return;
+}
+
+/*
+ * MHI
+ */
+static inline int ipa_mhi_init(struct ipa_mhi_init_params *params)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_start(struct ipa_mhi_start_params *params)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_connect_pipe(struct ipa_mhi_connect_params *in,
+	u32 *clnt_hdl)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_disconnect_pipe(u32 clnt_hdl)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_suspend(bool force)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_resume(void)
+{
+	return -EPERM;
+}
+
+static inline int ipa_mhi_destroy(void)
+{
+	return -EPERM;
+}
 
 /*
  * mux id
@@ -1770,7 +1988,11 @@ static inline bool ipa_is_ready(void)
 	return false;
 }
 
-static inline void ipa_q6_init_done(void)
+static inline void ipa_proxy_clk_vote(void)
+{
+}
+
+static inline void ipa_proxy_clk_unvote(void)
 {
 }
 

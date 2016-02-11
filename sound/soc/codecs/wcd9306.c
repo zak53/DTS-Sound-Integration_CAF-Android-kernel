@@ -19,7 +19,6 @@
 #include <linux/ratelimit.h>
 #include <linux/debugfs.h>
 #include <linux/wait.h>
-#include <linux/bitops.h>
 #include <linux/mfd/wcd9xxx/core.h>
 #include <linux/mfd/wcd9xxx/wcd9xxx_registers.h>
 #include <linux/mfd/wcd9xxx/wcd9306_registers.h>
@@ -38,6 +37,7 @@
 #include "wcd9306.h"
 #include "wcd9xxx-resmgr.h"
 #include "wcd9xxx-common.h"
+#include "wcdcal-hwdep.h"
 
 #define TAPAN_HPH_PA_SETTLE_COMP_ON 5000
 #define TAPAN_HPH_PA_SETTLE_COMP_OFF 13000
@@ -57,6 +57,8 @@
 #define TAPAN_REGISTER_START_OFFSET 0x800
 
 #define CODEC_REG_CFG_MINOR_VER 1
+
+#define BUS_DOWN 1
 
 static struct regulator *tapan_codec_find_regulator(
 	struct snd_soc_codec *codec,
@@ -291,6 +293,9 @@ struct tapan_priv {
 	u32 anc_slot;
 	bool anc_func;
 
+	/* cal info for codec */
+	struct fw_info *fw_data;
+
 	/*track adie loopback mode*/
 	bool lb_mode;
 
@@ -335,6 +340,7 @@ struct tapan_priv {
 
 	int (*machine_codec_event_cb)(struct snd_soc_codec *codec,
 					enum wcd9xxx_codec_event);
+	unsigned long status_mask;
 };
 
 static const u32 comp_shift[] = {
@@ -2245,15 +2251,18 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 	const char *filename;
 	const struct firmware *fw;
 	int i;
-	int ret;
+	int ret = 0;
 	int num_anc_slots;
 	struct wcd9xxx_anc_header *anc_head;
 	struct tapan_priv *tapan = snd_soc_codec_get_drvdata(codec);
+	struct firmware_cal *hwdep_cal = NULL;
 	u32 anc_writes_size = 0;
 	int anc_size_remaining;
 	u32 *anc_ptr;
 	u16 reg;
 	u8 mask, val, old_val;
+	size_t cal_size;
+	const void *data;
 
 	dev_dbg(codec->dev, "%s %d\n", __func__, event);
 	if (tapan->anc_func == 0)
@@ -2263,39 +2272,54 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 
 		filename = "wcd9306/wcd9306_anc.bin";
 
-		ret = request_firmware(&fw, filename, codec->dev);
-		if (ret != 0) {
-			dev_err(codec->dev, "Failed to acquire ANC data: %d\n",
-				ret);
-			return -ENODEV;
+		hwdep_cal = wcdcal_get_fw_cal(tapan->fw_data, WCD9XXX_ANC_CAL);
+		if (hwdep_cal) {
+			data = hwdep_cal->data;
+			cal_size = hwdep_cal->size;
+			dev_dbg(codec->dev, "%s: using hwdep calibration\n",
+				__func__);
+		} else {
+			ret = request_firmware(&fw, filename, codec->dev);
+			if (ret != 0) {
+				dev_err(codec->dev, "Failed to acquire ANC data: %d\n",
+					ret);
+				return -ENODEV;
+			}
+			if (!fw) {
+				dev_err(codec->dev, "failed to get anc fw");
+				return -ENODEV;
+			}
+			data = fw->data;
+			cal_size = fw->size;
+			dev_dbg(codec->dev, "%s: using request_firmware calibration\n",
+				__func__);
 		}
-
-		if (fw->size < sizeof(struct wcd9xxx_anc_header)) {
+		if (cal_size < sizeof(struct wcd9xxx_anc_header)) {
 			dev_err(codec->dev, "Not enough data\n");
-			release_firmware(fw);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto err;
 		}
 
 		/* First number is the number of register writes */
-		anc_head = (struct wcd9xxx_anc_header *)(fw->data);
-		anc_ptr = (u32 *)(fw->data +
+		anc_head = (struct wcd9xxx_anc_header *)(data);
+		anc_ptr = (u32 *)(data +
 				  sizeof(struct wcd9xxx_anc_header));
-		anc_size_remaining = fw->size -
+		anc_size_remaining = cal_size -
 				     sizeof(struct wcd9xxx_anc_header);
 		num_anc_slots = anc_head->num_anc_slots;
 
 		if (tapan->anc_slot >= num_anc_slots) {
 			dev_err(codec->dev, "Invalid ANC slot selected\n");
-			release_firmware(fw);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto err;
 		}
 
 		for (i = 0; i < num_anc_slots; i++) {
 
 			if (anc_size_remaining < TAPAN_PACKED_REG_SIZE) {
 				dev_err(codec->dev, "Invalid register format\n");
-				release_firmware(fw);
-				return -EINVAL;
+				ret = -EINVAL;
+				goto err;
 			}
 			anc_writes_size = (u32)(*anc_ptr);
 			anc_size_remaining -= sizeof(u32);
@@ -2304,8 +2328,8 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 			if (anc_writes_size * TAPAN_PACKED_REG_SIZE
 				> anc_size_remaining) {
 				dev_err(codec->dev, "Invalid register format\n");
-				release_firmware(fw);
-				return -ENOMEM;
+				ret = -EINVAL;
+				goto err;
 			}
 
 			if (tapan->anc_slot == i)
@@ -2317,8 +2341,8 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 		}
 		if (i == num_anc_slots) {
 			dev_err(codec->dev, "Selected ANC slot not present\n");
-			release_firmware(fw);
-			return -ENOMEM;
+			ret = -EINVAL;
+			goto err;
 		}
 
 		for (i = 0; i < anc_writes_size; i++) {
@@ -2328,7 +2352,8 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 			snd_soc_write(codec, reg, (old_val & ~mask) |
 					(val & mask));
 		}
-		release_firmware(fw);
+		if (!hwdep_cal)
+			release_firmware(fw);
 
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
@@ -2342,6 +2367,10 @@ static int tapan_codec_enable_anc(struct snd_soc_dapm_widget *w,
 		break;
 	}
 	return 0;
+err:
+	if (!hwdep_cal)
+		release_firmware(fw);
+	return ret;
 }
 
 static int tapan_codec_enable_micbias(struct snd_soc_dapm_widget *w,
@@ -3571,6 +3600,7 @@ static int tapan_write(struct snd_soc_codec *codec, unsigned int reg,
 {
 	int ret;
 	struct wcd9xxx *wcd9xxx = codec->control_data;
+	struct tapan_priv *tapan_p = snd_soc_codec_get_drvdata(codec);
 
 	if (reg == SND_SOC_NOPM)
 		return 0;
@@ -3584,7 +3614,12 @@ static int tapan_write(struct snd_soc_codec *codec, unsigned int reg,
 				reg, ret);
 	}
 
-	return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
+	if (unlikely(test_bit(BUS_DOWN, &tapan_p->status_mask))) {
+		printk_ratelimited(KERN_ERR "write 0x%02x while offline\n",
+				reg);
+		return -ENODEV;
+	} else
+		return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
 }
 static unsigned int tapan_read(struct snd_soc_codec *codec,
 				unsigned int reg)
@@ -3592,6 +3627,7 @@ static unsigned int tapan_read(struct snd_soc_codec *codec,
 	unsigned int val;
 	int ret;
 	struct wcd9xxx *wcd9xxx = codec->control_data;
+	struct tapan_priv *tapan_p = snd_soc_codec_get_drvdata(codec);
 
 	if (reg == SND_SOC_NOPM)
 		return 0;
@@ -3608,8 +3644,14 @@ static unsigned int tapan_read(struct snd_soc_codec *codec,
 				reg, ret);
 	}
 
-	val = wcd9xxx_reg_read(&wcd9xxx->core_res, reg);
-	return val;
+	if (unlikely(test_bit(BUS_DOWN, &tapan_p->status_mask))) {
+		printk_ratelimited(KERN_ERR "write 0x%02x while offline\n",
+				reg);
+		return -ENODEV;
+	} else {
+		val = wcd9xxx_reg_read(&wcd9xxx->core_res, reg);
+		return val;
+	}
 }
 
 static int tapan_startup(struct snd_pcm_substream *substream,
@@ -6037,6 +6079,26 @@ static void tapan_compute_impedance(struct wcd9xxx_mbhc *mbhc, s16 *l, s16 *r,
 	*zr = rr;
 }
 
+static struct firmware_cal *tapan_get_hwdep_fw_cal(struct snd_soc_codec *codec,
+		enum wcd_cal_type type)
+{
+	struct tapan_priv *tapan;
+	struct firmware_cal *hwdep_cal;
+	if (!codec) {
+		pr_err("%s: NULL codec pointer\n", __func__);
+		return NULL;
+	}
+	tapan = snd_soc_codec_get_drvdata(codec);
+	hwdep_cal = wcdcal_get_fw_cal(tapan->fw_data, type);
+	if (!hwdep_cal) {
+		dev_err(codec->dev, "%s: cal not sent by %d\n",
+				__func__, type);
+		return NULL;
+	} else {
+		return hwdep_cal;
+	}
+}
+
 static const struct wcd9xxx_mbhc_cb mbhc_cb = {
 	.enable_mux_bias_block = tapan_enable_mux_bias_block,
 	.cfilt_fast_mode = tapan_put_cfilt_fast_mode,
@@ -6046,6 +6108,7 @@ static const struct wcd9xxx_mbhc_cb mbhc_cb = {
 	.get_cdc_type = tapan_get_cdc_type,
 	.setup_zdet = tapan_setup_zdet,
 	.compute_impedance = tapan_compute_impedance,
+	.get_hwdep_fw_cal = tapan_get_hwdep_fw_cal,
 };
 
 int tapan_hs_detect(struct snd_soc_codec *codec,
@@ -6076,9 +6139,13 @@ EXPORT_SYMBOL(tapan_event_register);
 static int tapan_device_down(struct wcd9xxx *wcd9xxx)
 {
 	struct snd_soc_codec *codec;
+	struct tapan_priv *tapan;
 
 	codec = (struct snd_soc_codec *)(wcd9xxx->ssr_priv);
+	tapan = snd_soc_codec_get_drvdata(codec);
+
 	snd_soc_card_change_online_state(codec->card, 0);
+	set_bit(BUS_DOWN, &tapan->status_mask);
 
 	return 0;
 }
@@ -6107,6 +6174,9 @@ static int tapan_post_reset_cb(struct wcd9xxx *wcd9xxx)
 	tapan = snd_soc_codec_get_drvdata(codec);
 
 	mutex_lock(&codec->mutex);
+
+	clear_bit(BUS_DOWN, &tapan->status_mask);
+
 	if (codec->reg_def_copy) {
 		pr_debug("%s: Update ASOC cache", __func__);
 		kfree(codec->reg_cache);
@@ -6136,6 +6206,12 @@ static int tapan_post_reset_cb(struct wcd9xxx *wcd9xxx)
 	tapan_slim_interface_init_reg(codec);
 
 	wcd9xxx_resmgr_post_ssr(&tapan->resmgr);
+
+	wcd9xxx_resmgr_rm_cond_update_bits(
+				&tapan->resmgr,
+				WCD9XXX_COND_HPH_MIC,
+				TAPAN_A_MICB_2_CTL, 7,
+				false);
 
 	wcd9xxx_mbhc_deinit(&tapan->mbhc);
 
@@ -6187,7 +6263,7 @@ static struct regulator *tapan_codec_find_regulator(
 	struct wcd9xxx *core = NULL;
 
 	if (codec == NULL) {
-		dev_err(codec->dev, "%s: codec not initialized\n", __func__);
+		pr_err("%s: codec not initialized\n", __func__);
 		return NULL;
 	}
 	core = dev_get_drvdata(codec->dev->parent);
@@ -6354,7 +6430,7 @@ static int tapan_codec_probe(struct snd_soc_codec *codec)
 	pdata = dev_get_platdata(codec->dev->parent);
 	ret = wcd9xxx_resmgr_init(&tapan->resmgr, codec, core_res, pdata,
 				  &pdata->micbias, &tapan_reg_address,
-				  WCD9XXX_CDC_TYPE_TAPAN);
+				  NULL, WCD9XXX_CDC_TYPE_TAPAN);
 	if (ret) {
 		pr_err("%s: wcd9xxx init failed %d\n", __func__, ret);
 		return ret;
@@ -6380,6 +6456,21 @@ static int tapan_codec_probe(struct snd_soc_codec *codec)
 	else
 		rco_clk_rate = TAPAN_MCLK_CLK_9P6MHZ;
 
+
+	tapan->fw_data = kzalloc(sizeof(*(tapan->fw_data)), GFP_KERNEL);
+	if (!tapan->fw_data) {
+		dev_err(codec->dev, "Failed to allocate fw_data\n");
+		goto err_nomem_slimch;
+	}
+	set_bit(WCD9XXX_ANC_CAL, tapan->fw_data->cal_bit);
+	set_bit(WCD9XXX_MAD_CAL, tapan->fw_data->cal_bit);
+	set_bit(WCD9XXX_MBHC_CAL, tapan->fw_data->cal_bit);
+	ret = wcd_cal_create_hwdep(tapan->fw_data,
+				WCD9XXX_CODEC_HWDEP_NODE, codec);
+	if (ret < 0) {
+		dev_err(codec->dev, "%s hwdep failed %d\n", __func__, ret);
+		goto err_hwdep;
+	}
 	ret = wcd9xxx_mbhc_init(&tapan->mbhc, &tapan->resmgr, codec,
 				tapan_enable_mbhc_micbias,
 				&mbhc_cb, &cdc_intr_ids, rco_clk_rate,
@@ -6425,7 +6516,7 @@ static int tapan_codec_probe(struct snd_soc_codec *codec)
 	if (!ptr) {
 		pr_err("%s: no mem for slim chan ctl data\n", __func__);
 		ret = -ENOMEM;
-		goto err_nomem_slimch;
+		goto err_hwdep;
 	}
 
 	if (tapan->intf_type == WCD9XXX_INTERFACE_TYPE_I2C) {
@@ -6487,6 +6578,8 @@ static int tapan_codec_probe(struct snd_soc_codec *codec)
 
 err_pdata:
 	kfree(ptr);
+err_hwdep:
+	kfree(tapan->fw_data);
 err_nomem_slimch:
 	kfree(tapan);
 	return ret;

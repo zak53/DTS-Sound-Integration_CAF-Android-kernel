@@ -81,10 +81,10 @@ static inline void arch_timer_reg_write(int access, int reg, u32 val,
 		struct arch_timer *timer = to_arch_timer(clk);
 		switch (reg) {
 		case ARCH_TIMER_REG_CTRL:
-			writel_relaxed(val, timer->base + CNTP_CTL);
+			writel_relaxed_no_log(val, timer->base + CNTP_CTL);
 			break;
 		case ARCH_TIMER_REG_TVAL:
-			writel_relaxed(val, timer->base + CNTP_TVAL);
+			writel_relaxed_no_log(val, timer->base + CNTP_TVAL);
 			break;
 		default:
 			BUILD_BUG();
@@ -93,10 +93,10 @@ static inline void arch_timer_reg_write(int access, int reg, u32 val,
 		struct arch_timer *timer = to_arch_timer(clk);
 		switch (reg) {
 		case ARCH_TIMER_REG_CTRL:
-			writel_relaxed(val, timer->base + CNTV_CTL);
+			writel_relaxed_no_log(val, timer->base + CNTV_CTL);
 			break;
 		case ARCH_TIMER_REG_TVAL:
-			writel_relaxed(val, timer->base + CNTV_TVAL);
+			writel_relaxed_no_log(val, timer->base + CNTV_TVAL);
 			break;
 		default:
 			BUILD_BUG();
@@ -115,10 +115,10 @@ static inline u32 arch_timer_reg_read(int access, int reg,
 		struct arch_timer *timer = to_arch_timer(clk);
 		switch (reg) {
 		case ARCH_TIMER_REG_CTRL:
-			val = readl_relaxed(timer->base + CNTP_CTL);
+			val = readl_relaxed_no_log(timer->base + CNTP_CTL);
 			break;
 		case ARCH_TIMER_REG_TVAL:
-			val = readl_relaxed(timer->base + CNTP_TVAL);
+			val = readl_relaxed_no_log(timer->base + CNTP_TVAL);
 			break;
 		default:
 			BUILD_BUG();
@@ -127,10 +127,10 @@ static inline u32 arch_timer_reg_read(int access, int reg,
 		struct arch_timer *timer = to_arch_timer(clk);
 		switch (reg) {
 		case ARCH_TIMER_REG_CTRL:
-			val = readl_relaxed(timer->base + CNTV_CTL);
+			val = readl_relaxed_no_log(timer->base + CNTV_CTL);
 			break;
 		case ARCH_TIMER_REG_TVAL:
-			val = readl_relaxed(timer->base + CNTV_TVAL);
+			val = readl_relaxed_no_log(timer->base + CNTV_TVAL);
 			break;
 		default:
 			BUILD_BUG();
@@ -325,7 +325,20 @@ static void arch_counter_set_user_access(void)
 	arch_timer_set_cntkctl(cntkctl);
 }
 
-static int __cpuinit arch_timer_setup(struct clock_event_device *clk)
+static void arch_timer_configure_evtstream(void)
+{
+	int evt_stream_div, pos;
+
+	/* Find the closest power of two to the divisor */
+	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ;
+	pos = fls(evt_stream_div);
+	if (pos > 1 && !(evt_stream_div & (1 << (pos - 2))))
+		pos--;
+	/* enable event stream */
+	arch_timer_evtstrm_enable(min(pos, 15));
+}
+
+static int arch_timer_setup(struct clock_event_device *clk)
 {
 	__arch_timer_setup(ARCH_CP15_TIMER, clk);
 
@@ -338,6 +351,8 @@ static int __cpuinit arch_timer_setup(struct clock_event_device *clk)
 	}
 
 	arch_counter_set_user_access();
+	if (IS_ENABLED(CONFIG_ARM_ARCH_TIMER_EVTSTREAM))
+		arch_timer_configure_evtstream();
 
 	return 0;
 }
@@ -352,7 +367,8 @@ arch_timer_detect_rate(void __iomem *cntbase, struct device_node *np)
 	/* Try to determine the frequency from the device tree or CNTFRQ */
 	if (of_property_read_u32(np, "clock-frequency", &arch_timer_rate)) {
 		if (cntbase)
-			arch_timer_rate = readl_relaxed(cntbase + CNTFRQ);
+			arch_timer_rate = readl_relaxed_no_log(cntbase
+								+ CNTFRQ);
 		else
 			arch_timer_rate = arch_timer_get_cntfrq();
 	}
@@ -389,9 +405,9 @@ static u64 arch_counter_get_cntpct_mem(void)
 	u32 pct_lo, pct_hi, tmp_hi;
 
 	do {
-		pct_hi = readl_relaxed(arch_counter_base + CNTPCT_HI);
-		pct_lo = readl_relaxed(arch_counter_base + CNTPCT_LO);
-		tmp_hi = readl_relaxed(arch_counter_base + CNTPCT_HI);
+		pct_hi = readl_relaxed_no_log(arch_counter_base + CNTPCT_HI);
+		pct_lo = readl_relaxed_no_log(arch_counter_base + CNTPCT_LO);
+		tmp_hi = readl_relaxed_no_log(arch_counter_base + CNTPCT_HI);
 	} while (pct_hi != tmp_hi);
 
 	return ((u64) pct_hi << 32) | pct_lo;
@@ -402,9 +418,9 @@ static notrace u64 arch_counter_get_cntvct_mem(void)
 	u32 vct_lo, vct_hi, tmp_hi;
 
 	do {
-		vct_hi = readl_relaxed(arch_counter_base + CNTVCT_HI);
-		vct_lo = readl_relaxed(arch_counter_base + CNTVCT_LO);
-		tmp_hi = readl_relaxed(arch_counter_base + CNTVCT_HI);
+		vct_hi = readl_relaxed_no_log(arch_counter_base + CNTVCT_HI);
+		vct_lo = readl_relaxed_no_log(arch_counter_base + CNTVCT_LO);
+		tmp_hi = readl_relaxed_no_log(arch_counter_base + CNTVCT_HI);
 	} while (vct_hi != tmp_hi);
 
 	return ((u64) vct_hi << 32) | vct_lo;
@@ -726,7 +742,7 @@ static void __init arch_timer_mem_init(struct device_node *np)
 		return;
 	}
 
-	cnttidr = readl_relaxed(cntctlbase + CNTTIDR);
+	cnttidr = readl_relaxed_no_log(cntctlbase + CNTTIDR);
 	iounmap(cntctlbase);
 
 	/*

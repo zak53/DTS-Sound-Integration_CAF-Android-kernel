@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -52,7 +52,7 @@
 #define KGSL_STATE_NAP		0x00000004
 #define KGSL_STATE_SLEEP	0x00000008
 #define KGSL_STATE_SUSPEND	0x00000010
-#define KGSL_STATE_HUNG		0x00000020
+#define KGSL_STATE_AWARE	0x00000020
 #define KGSL_STATE_SLUMBER	0x00000080
 
 #define KGSL_GRAPHICS_MEMORY_LOW_WATERMARK  0x1000000
@@ -163,7 +163,7 @@ struct kgsl_functable {
 	   calling the hook */
 	struct kgsl_context *(*drawctxt_create) (struct kgsl_device_private *,
 						uint32_t *flags);
-	int (*drawctxt_detach) (struct kgsl_context *context);
+	void (*drawctxt_detach)(struct kgsl_context *context);
 	void (*drawctxt_destroy) (struct kgsl_context *context);
 	void (*drawctxt_dump) (struct kgsl_device *device,
 		struct kgsl_context *context);
@@ -245,6 +245,8 @@ struct kgsl_memobj_node {
  * @submit_ticks: Variable to hold ticks at the time of cmdbatch submit.
  * This structure defines an atomic batch of command buffers issued from
  * userspace.
+ * @timeout_jiffies: For a syncpoint cmdbatch the jiffies at which the
+ * timer will expire
  */
 struct kgsl_cmdbatch {
 	struct kgsl_device *device;
@@ -266,6 +268,8 @@ struct kgsl_cmdbatch {
 	unsigned long profiling_buffer_gpuaddr;
 	unsigned int profile_index;
 	uint64_t submit_ticks;
+	unsigned int global_ts;
+	unsigned long timeout_jiffies;
 };
 
 /**
@@ -401,7 +405,7 @@ struct kgsl_device {
 	.wait_queue = __WAIT_QUEUE_HEAD_INITIALIZER((_dev).wait_queue),\
 	.active_cnt_wq = __WAIT_QUEUE_HEAD_INITIALIZER((_dev).active_cnt_wq),\
 	.mutex = __MUTEX_INITIALIZER((_dev).mutex),\
-	.state = KGSL_STATE_INIT,\
+	.state = KGSL_STATE_NONE,\
 	.ver_major = DRIVER_VERSION_MAJOR,\
 	.ver_minor = DRIVER_VERSION_MINOR
 
@@ -479,7 +483,6 @@ struct kgsl_context {
  * @comm: task name of the process
  * @mem_lock: Spinlock to protect the process memory lists
  * @refcount: kref object for reference counting the process
- * @process_private_mutex: Mutex to synchronize access to the process struct
  * @mem_rb: RB tree node for the memory owned by this process
  * @idr: Iterator for assigning IDs to memory allocations
  * @pagetable: Pointer to the pagetable owned by this process
@@ -487,31 +490,28 @@ struct kgsl_context {
  * @debug_root: Pointer to the debugfs root for this process
  * @stats: Memory allocation statistics for this process
  * @syncsource_idr: sync sources created by this process
+ * @syncsource_lock: Spinlock to protect the syncsource idr
+ * @fd_count: Counter for the number of FDs for this process
  */
 struct kgsl_process_private {
 	unsigned long priv;
 	pid_t pid;
 	char comm[TASK_COMM_LEN];
 	spinlock_t mem_lock;
-
-	/* General refcount for process private struct obj */
 	struct kref refcount;
-	/* Mutex to synchronize access to each process_private struct obj */
-	struct mutex process_private_mutex;
-
 	struct rb_root mem_rb;
 	struct idr mem_idr;
 	struct kgsl_pagetable *pagetable;
 	struct list_head list;
 	struct kobject kobj;
 	struct dentry *debug_root;
-
 	struct {
 		unsigned int cur;
 		unsigned int max;
 	} stats[KGSL_MEM_ENTRY_MAX];
-
 	struct idr syncsource_idr;
+	spinlock_t syncsource_lock;
+	int fd_count;
 };
 
 /**
@@ -541,6 +541,7 @@ struct kgsl_device_private {
  * @work: worker to dump the frozen memory
  * @dump_gate: completion gate signaled by worker when it is finished.
  * @process: the process that caused the hang, if known.
+ * @sysfs_read: An atomic for concurrent snapshot reads via syfs.
  */
 struct kgsl_snapshot {
 	u8 *start;
@@ -555,6 +556,7 @@ struct kgsl_snapshot {
 	struct work_struct work;
 	struct completion dump_gate;
 	struct kgsl_process_private *process;
+	atomic_t sysfs_read;
 };
 
 /**
@@ -667,6 +669,15 @@ static inline int kgsl_create_device_workqueue(struct kgsl_device *device)
 	return 0;
 }
 
+static inline int kgsl_state_is_awake(struct kgsl_device *device)
+{
+	if (device->state == KGSL_STATE_ACTIVE ||
+		device->state == KGSL_STATE_AWARE)
+		return true;
+	else
+		return false;
+}
+
 int kgsl_readtimestamp(struct kgsl_device *device, void *priv,
 		enum kgsl_timestamp_type type, unsigned int *timestamp);
 
@@ -716,7 +727,6 @@ void kgsl_context_destroy(struct kref *kref);
 
 int kgsl_context_init(struct kgsl_device_private *, struct kgsl_context
 		*context);
-int kgsl_context_detach(struct kgsl_context *context);
 
 void kgsl_context_dump(struct kgsl_context *context);
 
@@ -981,5 +991,18 @@ void kgsl_snapshot_add_section(struct kgsl_device *device, u16 id,
 	struct kgsl_snapshot *snapshot,
 	size_t (*func)(struct kgsl_device *, u8 *, size_t, void *),
 	void *priv);
+
+/**
+ * struct kgsl_pwr_limit - limit structure for each client
+ * @node: Local list node for the limits list
+ * @level: requested power level
+ * @device: pointer to the device structure
+ */
+struct kgsl_pwr_limit {
+	struct list_head node;
+	unsigned int level;
+	struct kgsl_device *device;
+};
+
 
 #endif  /* __KGSL_DEVICE_H */

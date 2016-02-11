@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -96,6 +96,7 @@ struct remote_iommu_petersons_spinlock kgsl_iommu_sync_lock_vars;
  */
 
 static struct page *kgsl_guard_page;
+static struct kgsl_memdesc kgsl_secure_guard_page_memdesc;
 
 static int get_iommu_unit(struct device *dev, struct kgsl_mmu **mmu_out,
 			struct kgsl_iommu_unit **iommu_unit_out)
@@ -374,7 +375,7 @@ static int kgsl_iommu_fault_handler(struct iommu_domain *domain,
 	if (adreno_dev->ft_pf_policy & KGSL_FT_PAGEFAULT_GPUHALT_ENABLE) {
 		adreno_set_gpu_fault(adreno_dev, ADRENO_IOMMU_PAGE_FAULT);
 		/* turn off GPU IRQ so we don't get faults from it too */
-		kgsl_pwrctrl_irq(device, KGSL_PWRFLAGS_OFF);
+		kgsl_pwrctrl_change_state(device, KGSL_STATE_AWARE);
 		adreno_dispatcher_schedule(device);
 	}
 
@@ -1611,15 +1612,6 @@ static int kgsl_iommu_start(struct kgsl_mmu *mmu)
 
 	kgsl_iommu_disable_clk(mmu, KGSL_IOMMU_MAX_UNITS);
 
-	if (mmu->secured) {
-		kgsl_regwrite(mmu->device, A4XX_RBBM_SECVID_TRUST_CONFIG, 0x2);
-		kgsl_regwrite(mmu->device, A4XX_RBBM_SECVID_TSB_CONTROL, 0x0);
-		kgsl_regwrite(mmu->device, A4XX_RBBM_SECVID_TSB_TRUSTED_BASE,
-						KGSL_IOMMU_SECURE_MEM_BASE);
-		kgsl_regwrite(mmu->device, A4XX_RBBM_SECVID_TSB_TRUSTED_SIZE,
-						KGSL_IOMMU_SECURE_MEM_SIZE);
-	}
-
 done:
 	return status;
 }
@@ -1671,9 +1663,13 @@ kgsl_iommu_unmap(struct kgsl_pagetable *pt,
 		return 0;
 
 	if (kgsl_memdesc_has_guard_page(memdesc))
-		range += PAGE_SIZE;
+		range += kgsl_memdesc_guard_page_size(memdesc);
 
-	if (kgsl_memdesc_is_secured(memdesc) && kgsl_mmu_is_secured(pt->mmu)) {
+	if (kgsl_memdesc_is_secured(memdesc)) {
+
+		if (!kgsl_mmu_is_secured(pt->mmu))
+			return -EINVAL;
+
 		mutex_lock(&device->mutex);
 		ret = kgsl_active_count_get(device);
 		if (!ret) {
@@ -1702,6 +1698,112 @@ kgsl_iommu_unmap(struct kgsl_pagetable *pt,
 	return ret;
 }
 
+/*
+ * _create_sg_no_large_pages - Create a sg list from a given sg list w/o
+ * greater that 64K pages
+ * @memdesc - The memory descriptor containing the sg
+ *
+ * Returns the new sg list else error pointer on failure
+ */
+struct scatterlist *_create_sg_no_large_pages(struct kgsl_memdesc *memdesc)
+{
+	struct page *page;
+	struct scatterlist *s, *s_temp, *sg_temp;
+	int sglen_alloc = 0;
+	uint64_t offset, pg_size;
+	int i;
+
+	for_each_sg(memdesc->sg, s, memdesc->sglen, i) {
+		if (SZ_1M <= s->length) {
+			sglen_alloc += s->length >> 16;
+			sglen_alloc += ((s->length & 0xF000) >> 12);
+		} else {
+			sglen_alloc++;
+		}
+	}
+	/* No large pages were detected */
+	if (sglen_alloc == memdesc->sglen)
+		return NULL;
+
+	sg_temp = kgsl_malloc(sglen_alloc * sizeof(struct scatterlist));
+	if (NULL == sg_temp)
+		return ERR_PTR(-ENOMEM);
+
+	sg_init_table(sg_temp, sglen_alloc);
+	s_temp = sg_temp;
+
+	for_each_sg(memdesc->sg, s, memdesc->sglen, i) {
+		page = sg_page(s);
+		if (SZ_1M <= s->length) {
+			for (offset = 0; offset < s->length; s_temp++) {
+				pg_size = ((s->length - offset) >= SZ_64K) ?
+						SZ_64K : SZ_4K;
+				sg_set_page(s_temp, page, pg_size, offset);
+				offset += pg_size;
+			}
+		} else {
+			sg_set_page(s_temp, page, s->length, 0);
+			s_temp++;
+		}
+	}
+	return sg_temp;
+}
+
+/**
+ * _iommu_add_guard_page - Add iommu guard page
+ * @pt - Pointer to kgsl pagetable structure
+ * @memdesc - memdesc to add guard page
+ * @gpuaddr - GPU addr of guard page
+ * @protflags - flags for mapping
+ *
+ * Return 0 on success, error on map fail
+ */
+int _iommu_add_guard_page(struct kgsl_pagetable *pt,
+						   struct kgsl_memdesc *memdesc,
+						   unsigned int gpuaddr,
+						   unsigned int protflags)
+{
+	struct kgsl_iommu_pt *iommu_pt = pt->priv;
+	phys_addr_t physaddr = page_to_phys(kgsl_guard_page);
+	int ret;
+
+	if (kgsl_memdesc_has_guard_page(memdesc)) {
+
+		/*
+		 * Allocate guard page for secure buffers.
+		 * This has to be done after we attach a smmu pagetable.
+		 * Allocate the guard page when first secure buffer is.
+		 * mapped to save 1MB of memory if CPZ is not used.
+		 */
+		if (kgsl_memdesc_is_secured(memdesc)) {
+			if (!kgsl_secure_guard_page_memdesc.physaddr) {
+				if (kgsl_cma_alloc_secure(pt->mmu->device,
+					&kgsl_secure_guard_page_memdesc,
+					SZ_1M)) {
+					KGSL_CORE_ERR(
+					"Secure guard page alloc failed\n");
+					return -ENOMEM;
+				}
+			}
+
+			physaddr = kgsl_secure_guard_page_memdesc.physaddr;
+		}
+
+		ret = iommu_map(iommu_pt->domain, gpuaddr, physaddr,
+				kgsl_memdesc_guard_page_size(memdesc),
+				protflags & ~IOMMU_WRITE);
+		if (ret) {
+			KGSL_CORE_ERR(
+			"iommu_map(%p, addr %x, flags %x) err: %d\n",
+			iommu_pt->domain, gpuaddr, protflags & ~IOMMU_WRITE,
+			ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int
 kgsl_iommu_map(struct kgsl_pagetable *pt,
 			struct kgsl_memdesc *memdesc)
@@ -1713,6 +1815,7 @@ kgsl_iommu_map(struct kgsl_pagetable *pt,
 	unsigned int protflags;
 	struct kgsl_device *device = pt->mmu->device;
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	struct scatterlist *sg_temp = NULL;
 
 	BUG_ON(NULL == iommu_pt);
 
@@ -1726,38 +1829,46 @@ kgsl_iommu_map(struct kgsl_pagetable *pt,
 	if (memdesc->priv & KGSL_MEMDESC_PRIVILEGED)
 		protflags |= IOMMU_PRIV;
 
-	if (kgsl_memdesc_is_secured(memdesc) && kgsl_mmu_is_secured(pt->mmu)) {
+	if (kgsl_memdesc_is_secured(memdesc)) {
+
+		if (!kgsl_mmu_is_secured(pt->mmu))
+			return -EINVAL;
+
 		mutex_lock(&device->mutex);
 		ret = kgsl_active_count_get(device);
 		if (!ret) {
 			ret = iommu_map_range(iommu_pt->domain, iommu_virt_addr,
-					  memdesc->sg, size, protflags);
+				memdesc->sg, size, protflags);
 			kgsl_active_count_put(device);
 		}
 		mutex_unlock(&device->mutex);
-	} else
+	} else {
+		sg_temp = _create_sg_no_large_pages(memdesc);
+
+		if (IS_ERR(sg_temp))
+			return PTR_ERR(sg_temp);
+
 		ret = iommu_map_range(iommu_pt->domain, iommu_virt_addr,
-				memdesc->sg, size, protflags);
-	if (ret) {
+				sg_temp ? sg_temp : memdesc->sg,
+				size, protflags);
+	}
+
+	if (ret)
 		KGSL_CORE_ERR("iommu_map_range(%p, %x, %p, %zd, %x) err: %d\n",
-			iommu_pt->domain, iommu_virt_addr, memdesc->sg, size,
+			iommu_pt->domain, iommu_virt_addr,
+			sg_temp != NULL ? sg_temp : memdesc->sg, size,
 			protflags, ret);
+
+	kgsl_free(sg_temp);
+
+	if (ret)
 		return ret;
-	}
-	if (kgsl_memdesc_has_guard_page(memdesc)) {
-		ret = iommu_map(iommu_pt->domain, iommu_virt_addr + size,
-				page_to_phys(kgsl_guard_page), PAGE_SIZE,
-				protflags & ~IOMMU_WRITE);
-		if (ret) {
-			KGSL_CORE_ERR("iommu_map(%p, %zx, guard, %x) err: %d\n",
-				iommu_pt->domain, iommu_virt_addr + size,
-				protflags & ~IOMMU_WRITE,
-				ret);
-			/* cleanup the partial mapping */
-			iommu_unmap_range(iommu_pt->domain, iommu_virt_addr,
-					  size);
-		}
-	}
+
+	ret = _iommu_add_guard_page(pt, memdesc, iommu_virt_addr + size,
+								protflags);
+	if (ret)
+		/* cleanup the partial mapping */
+		iommu_unmap_range(iommu_pt->domain, iommu_virt_addr, size);
 
 	/*
 	 *  IOMMU V1 BFBs pre-fetch data beyond what is being used by the core.
@@ -1874,6 +1985,8 @@ static int kgsl_iommu_close(struct kgsl_mmu *mmu)
 		kgsl_guard_page = NULL;
 	}
 
+	kgsl_sharedmem_free(&kgsl_secure_guard_page_memdesc);
+
 	return 0;
 }
 
@@ -1909,7 +2022,7 @@ static int kgsl_iommu_flush_pt(struct kgsl_mmu *mmu)
 
 	/* For v0 SMMU GPU needs to be idle for tlb invalidate as well */
 	if (msm_soc_version_supports_iommu_v0()) {
-		ret = kgsl_idle(mmu->device);
+		ret = adreno_spin_idle(mmu->device);
 		if (ret)
 			return ret;
 	}
@@ -1940,7 +2053,7 @@ static int kgsl_iommu_flush_pt(struct kgsl_mmu *mmu)
 				(KGSL_IOMMU_CTX_TLBSTATUS_SACTIVE)) {
 				if (time_after(jiffies,
 					wait_for_flush)) {
-					KGSL_DRV_ERR(mmu->device,
+					KGSL_DRV_WARN(mmu->device,
 					"Wait limit reached for IOMMU tlb flush\n");
 					break;
 				}
@@ -1981,7 +2094,11 @@ static int kgsl_iommu_set_pt(struct kgsl_mmu *mmu,
 
 	pt_base = kgsl_iommu_get_pt_base_addr(mmu, pt);
 
-	ret = kgsl_idle(mmu->device);
+	/*
+	 * Taking the liberty to spin idle since this codepath
+	 * is invoked when we can spin safely for it to be idle
+	 */
+	ret = adreno_spin_idle(mmu->device);
 	if (ret)
 		return ret;
 

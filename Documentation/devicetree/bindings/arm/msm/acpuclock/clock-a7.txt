@@ -7,7 +7,7 @@ optionally have a register which encodes the maximum rate supported by hw.
 
 Required properties:
 - compatible: "qcom,clock-a7-8226", "qcom,clock-a7-9630",
-		"qcom,clock-a53-8916"
+		"qcom,clock-a53-8916", "qcom,clock-a7-9640", "qcom,clock-a7-vpipa"
 - reg: pairs of physical address and region size
 - reg-names: "rcg-base" is expected
 - clock-names: list of names of clock inputs
@@ -26,6 +26,8 @@ Optional properties:
 - qcom,safe-freq: Frequency in HZ
 	     When switching rates from A to B, the mux div clock will
              instead switch from A -> safe_freq -> B.
+- qcom,enable-opp: This will allow to register the cpu clock with OPP
+	     framework.
 
 Example:
 	qcom,acpuclk@f9011050 {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -127,6 +127,7 @@ struct rmnet_mhi_private {
 	struct net_device	      *dev;
 	atomic_t		      irq_masked_cntr;
 	rwlock_t		      out_chan_full_lock;
+	atomic_t		      pending_data;
 };
 
 struct tx_buffer_priv {
@@ -691,7 +692,15 @@ static int rmnet_mhi_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 			sizeof(ext_cmd.u.if_name));
 		break;
 	case RMNET_IOCTL_SET_SLEEP_STATE:
-		mhi_set_lpm(rmnet_mhi_ptr->tx_client_handle, ext_cmd.u.data);
+		if (rmnet_mhi_ptr->mhi_enabled &&
+		    rmnet_mhi_ptr->tx_client_handle != NULL) {
+			mhi_set_lpm(rmnet_mhi_ptr->tx_client_handle,
+				   ext_cmd.u.data);
+		} else {
+			rmnet_log(MSG_ERROR,
+				  "Cannot set LPM value, MHI is not up.\n");
+			return -ENODEV;
+		}
 		break;
 	default:
 		rc = -EINVAL;
@@ -904,8 +913,17 @@ static void rmnet_mhi_cb(struct mhi_cb_info *cb_info)
 	case MHI_CB_MHI_DISABLED:
 		rmnet_log(MSG_CRITICAL,
 			"Got MHI_DISABLED notification. Stopping stack\n");
-		if (rmnet_mhi_ptr->mhi_enabled)
+		if (rmnet_mhi_ptr->mhi_enabled) {
+			rmnet_mhi_ptr->mhi_enabled = 0;
+			/* Ensure MHI is disabled before other mem ops */
+			wmb();
+			while (atomic_read(&rmnet_mhi_ptr->pending_data)) {
+				rmnet_log(MSG_CRITICAL,
+					"Waiting for channels to stop.\n");
+				msleep(25);
+			}
 			rmnet_mhi_disable(rmnet_mhi_ptr);
+		}
 		break;
 	case MHI_CB_MHI_ENABLED:
 		rmnet_log(MSG_CRITICAL,
@@ -931,10 +949,16 @@ static void rmnet_mhi_cb(struct mhi_cb_info *cb_info)
 		}
 		break;
 	case MHI_CB_XFER:
-		if (IS_INBOUND(cb_info->chan))
-			rmnet_mhi_rx_cb(cb_info->result);
-		else
-			rmnet_mhi_tx_cb(cb_info->result);
+		atomic_inc(&rmnet_mhi_ptr->pending_data);
+		/* Flush pending data is set before any other mem operations */
+		wmb();
+		if (rmnet_mhi_ptr->mhi_enabled) {
+			if (IS_INBOUND(cb_info->chan))
+				rmnet_mhi_rx_cb(cb_info->result);
+			else
+				rmnet_mhi_tx_cb(cb_info->result);
+		}
+		atomic_dec(&rmnet_mhi_ptr->pending_data);
 		break;
 	default:
 		break;

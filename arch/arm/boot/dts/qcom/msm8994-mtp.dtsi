@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -277,6 +277,9 @@
 
 #include "dsi-panel-sharp-dualmipi0-wqxga-video.dtsi"
 #include "dsi-panel-sharp-dualmipi1-wqxga-video.dtsi"
+#include "dsi-panel-jdi-1080p-video.dtsi"
+#include "dsi-panel-sharp-1080p-cmd.dtsi"
+
 &mdss_mdp {
 	qcom,mdss-pref-prim-intf = "dsi";
 };
@@ -286,6 +289,11 @@
 	qcom,pins = <&gp 78>;
 };
 
+&pmx_mdss_te {
+	qcom,num-grp-pins = <1>;
+	qcom,pins = <&gp 10>;
+};
+
 &mdss_dsi0 {
 	qcom,dsi-pref-prim-pan = <&dsi_dual_sharp_video_0>;
 	pinctrl-names = "mdss_default", "mdss_sleep";
@@ -293,10 +301,35 @@
 	pinctrl-1 = <&mdss_dsi_suspend>;
 	qcom,dsi-panel-bias-vreg;
 	qcom,platform-reset-gpio = <&msm_gpio 78 0>;
+	qcom,platform-bklight-en-gpio = <&pmi8994_gpios 2 0>;
+        qcom,platform-enable-gpio = <&pm8994_gpios 14 0>;
 };
 
 &mdss_dsi1 {
 	qcom,dsi-pref-prim-pan = <&dsi_dual_sharp_video_1>;
+};
+
+&dsi_sharp_1080_cmd {
+	qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_wled";
+	qcom,mdss-dsi-bl-min-level = <1>;
+	qcom,mdss-dsi-bl-max-level = <4095>;
+	qcom,cont-splash-enabled;
+};
+
+&dsi_jdi_1080_vid {
+	qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_wled";
+	qcom,mdss-dsi-bl-min-level = <1>;
+	qcom,mdss-dsi-bl-max-level = <4095>;
+	qcom,cont-splash-enabled;
+};
+
+&labibb {
+	status = "ok";
+	qpnp,qpnp-labibb-mode = "lcd";
+};
+
+&ibb_regulator {
+	qcom,qpnp-ibb-discharge-resistor = <32>;
 };
 
 &dsi_dual_sharp_video_0 {
@@ -304,10 +337,16 @@
 	qcom,mdss-dsi-bl-min-level = <1>;
 	qcom,mdss-dsi-bl-max-level = <4095>;
 	qcom,cont-splash-enabled;
+	qcom,mdss-dsi-pan-enable-dynamic-fps;
+	qcom,mdss-dsi-pan-fps-update = "dfps_immediate_porch_mode_vfp";
+	qcom,mdss-dsi-min-refresh-rate = <30>;
 };
 
 &dsi_dual_sharp_video_1 {
 	qcom,cont-splash-enabled;
+	qcom,mdss-dsi-pan-enable-dynamic-fps;
+	qcom,mdss-dsi-pan-fps-update = "dfps_immediate_porch_mode_vfp";
+	qcom,mdss-dsi-min-refresh-rate = <30>;
 };
 
 &pmx_hdmi_cec {
@@ -470,6 +509,8 @@
 		qcom,mbhc-audio-jack-type = "6-pole-jack";
 		qcom,ext-ult-spk-amp-gpio = <&pmi8994_gpios 1 0>;
 		qcom,hdmi-audio-rx;
+		asoc-codec = <&stub_codec>, <&hdmi_audio>;
+		asoc-codec-names = "msm-stub-codec.1", "msm-hdmi-audio-codec-rx";
 	};
 };
 
@@ -538,6 +579,10 @@
 		qcom,src-sel = <0>;		/* Constant */
 		qcom,out-strength = <1>;	/* High drive strength */
 		qcom,master-en = <1>;		/* Enable GPIO */
+		status = "okay";
+	};
+
+	gpio@cd00 { /* GPIO 14 */
 		status = "okay";
 	};
 
@@ -620,6 +665,15 @@
 		qcom,pull = <5>;	/* No Pull */
 		qcom,vin-sel = <2>;	/* 1.8 */
 		qcom,src-sel = <0>;	/* CONSTANT */
+		qcom,master-en = <1>;	/* ENABLE GPIO */
+		status = "okay";
+	};
+
+	gpio@c400 {	/* GPIO 5  OTG SWITCH EN */
+		qcom,mode = <1>;	/* DIGITAL OUT */
+		qcom,pull = <5>;	/* No Pull */
+		qcom,vin-sel = <2>;	/* 1.8 */
+		qcom,src-sel = <0>;	/* GPIO */
 		qcom,master-en = <1>;	/* ENABLE GPIO */
 		status = "okay";
 	};
@@ -712,12 +766,12 @@
 	mtp_batterydata: qcom,battery-data {
 		qcom,batt-id-range-pct = <15>;
 		#include "batterydata-itech-3000mah.dtsi"
-		#include "batterydata-itech-3020mah.dtsi"
 	};
 };
 
 &pmi8994_fg {
 	qcom,battery-data = <&mtp_batterydata>;
+	qcom,ext-sense-type;
 };
 
 &pmi8994_haptics {
@@ -725,8 +779,18 @@
 };
 
 &pmi8994_charger {
-	qcom,ext-sense-type;
-	qcom,dc-psy-type = "Wireless";
+	qcom,dc-psy-type = "Wipower";
+	qcom,dcin-vadc = <&pmi8994_vadc>;
+	qcom,wipower-default-ilim-map = <4000000 20000000 550 700 300>;
+	qcom,wipower-pt-ilim-map = <4000000 7140000 550 700 300>,
+					<7140000 8140000 550 700 300>,
+					<8140000 9140000 500 700 300>,
+					<9140000 9950000 500 700 300>;
+	qcom,wipower-div2-ilim-map = <4000000 4820000 550 700 300>,
+					<4820000 5820000 550 700 300>,
+					<5820000 6820000 550 650 650>,
+					<6820000 7820000 550 700 600>,
+					<7820000 8500000 550 700 550>;
 };
 
 &cnss {
@@ -742,4 +806,13 @@
 		qcom,float-voltage-mv = <4400>;
 		qcom,recharge-thresh-mv = <100>;
 	};
+};
+
+&usb_ehci {
+	status = "ok";
+	qcom,usb2-enable-uicc;
+};
+
+&qusb_phy {
+	status = "ok";
 };

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -62,7 +62,7 @@ static int pll1_vco_set_rate_20nm(struct clk *c, unsigned long rate)
 	struct mdss_pll_resources *pll_res = vco->priv;
 
 	mdss_pll_resource_enable(pll_res, true);
-	__dsi_pll_disable(pll_res->pll_base);
+	pll_20nm_config_powerdown(pll_res->pll_base);
 	mdss_pll_resource_enable(pll_res, false);
 
 	pr_debug("Configuring PLL1 registers.\n");
@@ -82,44 +82,6 @@ static int shadow_vco_set_rate_20nm(struct clk *c, unsigned long rate)
 	}
 
 	rc = shadow_pll_20nm_vco_set_rate(vco, rate);
-
-	return rc;
-}
-
-static int dsi_pll_enable_seq_8994(struct mdss_pll_resources *dsi_pll_res)
-{
-	int rc = 0;
-	int pll_locked;
-
-	/*
-	 * PLL power up sequence.
-	 * Add necessary delays recommeded by hardware.
-	 */
-	MDSS_PLL_REG_W(dsi_pll_res->pll_base,
-				MMSS_DSI_PHY_PLL_PLLLOCK_CMP_EN, 0x0D);
-	MDSS_PLL_REG_W(dsi_pll_res->pll_base,
-				MMSS_DSI_PHY_PLL_PLL_CNTRL, 0x07);
-	MDSS_PLL_REG_W(dsi_pll_res->pll_base,
-				MMSS_DSI_PHY_PLL_PLL_BKG_KVCO_CAL_EN, 0x00);
-	udelay(500);
-	dsi_pll_20nm_phy_ctrl_config(dsi_pll_res, 0x200); /* Ctrl 0 */
-	/*
-	 * Make sure that the PHY controller configurations are completed
-	 * before checking the pll lock status.
-	 */
-	wmb();
-	pll_locked = dsi_20nm_pll_lock_status(dsi_pll_res);
-	if (!pll_locked) {
-		pr_err("DSI PLL lock failed\n");
-		rc = -EINVAL;
-	} else {
-		pr_debug("DSI PLL Lock success\n");
-		/*
-		*  Following cached registers are useful when
-		*  dynamic refresh feature is enabled.
-		*/
-		dsi_cache_trim_codes(dsi_pll_res);
-	}
 
 	return rc;
 }
@@ -205,10 +167,10 @@ static struct dsi_pll_vco_clk mdss_dsi1_vco_clk_src = {
 
 static struct dsi_pll_vco_clk dsi_vco_clk_8994 = {
 	.ref_clk_rate = 19200000,
-	.min_rate = 1000000000,
-	.max_rate = 2000000000,
+	.min_rate = 300000000,
+	.max_rate = 1500000000,
 	.pll_en_seq_cnt = 1,
-	.pll_enable_seqs[0] = dsi_pll_enable_seq_8994,
+	.pll_enable_seqs[0] = pll_20nm_vco_enable_seq,
 	.c = {
 		.dbg_name = "dsi_vco_clk_8994",
 		.ops = &clk_ops_dsi_vco,
@@ -218,8 +180,8 @@ static struct dsi_pll_vco_clk dsi_vco_clk_8994 = {
 
 static struct dsi_pll_vco_clk shadow_dsi_vco_clk_8994 = {
 	.ref_clk_rate = 19200000,
-	.min_rate = 1000000000,
-	.max_rate = 2000000000,
+	.min_rate = 300000000,
+	.max_rate = 1500000000,
 	.c = {
 		.dbg_name = "shadow_dsi_vco_clk_8994",
 		.ops = &shadow_clk_ops_dsi_vco,
@@ -503,9 +465,9 @@ static void dsi_pll_off_work(struct work_struct *work)
 			mdss_pll_resources, pll_off);
 
 	mdss_pll_resource_enable(pll_res, true);
-	__dsi_pll_disable(pll_res->pll_base);
+	pll_20nm_config_powerdown(pll_res->pll_base);
 	if (pll_res->pll_1_base)
-		__dsi_pll_disable(pll_res->pll_1_base);
+		pll_20nm_config_powerdown(pll_res->pll_1_base);
 	mdss_pll_resource_enable(pll_res, false);
 }
 
@@ -575,6 +537,14 @@ int dsi_pll_clock_register_20nm(struct platform_device *pdev,
 		shadow_hr_oclk3_div_clk_8994.priv = pll_res;
 		shadow_dsi_vco_clk_8994.priv = pll_res;
 
+		if (pll_res->pll_en_90_phase) {
+			dsi_vco_clk_8994.min_rate = 1000000000;
+			dsi_vco_clk_8994.max_rate = 2000000000;
+			shadow_dsi_vco_clk_8994.min_rate = 1000000000;
+			shadow_dsi_vco_clk_8994.max_rate = 2000000000;
+			pr_debug("%s:Update VCO range: 1GHz-2Ghz", __func__);
+		}
+
 		pll_res->vco_delay = VCO_DELAY_USEC;
 
 		/* Set clock source operations */
@@ -603,7 +573,8 @@ int dsi_pll_clock_register_20nm(struct platform_device *pdev,
 		mdss_dsi1_vco_clk_src.priv = pll_res;
 	}
 
-	if (pll_res->target_id == MDSS_PLL_TARGET_8994) {
+	if ((pll_res->target_id == MDSS_PLL_TARGET_8994) ||
+			(pll_res->target_id == MDSS_PLL_TARGET_8992)) {
 		if (pll_res->index) {
 			rc = of_msm_clock_register(pdev->dev.of_node,
 					mdss_dsi_pll_1_cc_8994,

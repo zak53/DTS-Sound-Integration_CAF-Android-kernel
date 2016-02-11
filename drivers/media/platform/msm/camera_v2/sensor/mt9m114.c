@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,6 +27,9 @@
 #define MT9M114_COMMAND_REGISTER_REFRESH        (1 << 2)
 #define MT9M114_COMMAND_REGISTER_WAIT_FOR_EVENT (1 << 3)
 #define MT9M114_COMMAND_REGISTER_OK             (1 << 15)
+#define MT9M114_CURRENT_STATE_REGISTER          0xDC01
+#define MT9M114_STREAMING_STATE                 0x31
+#define MT9M114_STANDBY_STATE                   0x52
 
 DEFINE_MSM_MUTEX(mt9m114_mut);
 static struct msm_sensor_ctrl_t mt9m114_s_ctrl;
@@ -1178,6 +1181,7 @@ int32_t mt9m114_sensor_config(struct msm_sensor_ctrl_t *s_ctrl,
 	struct sensorb_cfg_data *cdata = (struct sensorb_cfg_data *)argp;
 	int32_t rc = 0;
 	int32_t i = 0;
+	uint16_t current_state = 0;
 	mutex_lock(s_ctrl->msm_sensor_mutex);
 	CDBG("%s:%d %s cfgtype = %d\n", __func__, __LINE__,
 		s_ctrl->sensordata->sensor_name, cdata->cfgtype);
@@ -1235,12 +1239,18 @@ int32_t mt9m114_sensor_config(struct msm_sensor_ctrl_t *s_ctrl,
 	case CFG_SET_STOP_STREAM:
 		break;
 	case CFG_SET_START_STREAM:
-		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
-			i2c_write_conf_tbl(
+		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
 			s_ctrl->sensor_i2c_client,
-			mt9m114_config_change_settings,
-			ARRAY_SIZE(mt9m114_config_change_settings),
-			MSM_CAMERA_I2C_WORD_DATA);
+			MT9M114_CURRENT_STATE_REGISTER,
+			&current_state, MSM_CAMERA_I2C_BYTE_DATA);
+		if (current_state != MT9M114_STREAMING_STATE) {
+			rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
+				i2c_write_conf_tbl(
+				s_ctrl->sensor_i2c_client,
+				mt9m114_config_change_settings,
+				ARRAY_SIZE(mt9m114_config_change_settings),
+				MSM_CAMERA_I2C_WORD_DATA);
+		}
 		break;
 	case CFG_GET_SENSOR_INIT_PARAMS:
 		cdata->cfg.sensor_init_params.modes_supported =
@@ -1262,6 +1272,13 @@ int32_t mt9m114_sensor_config(struct msm_sensor_ctrl_t *s_ctrl,
 		if (copy_from_user(&conf_array,
 			(void *)cdata->cfg.setting,
 			sizeof(struct msm_camera_i2c_reg_setting))) {
+			pr_err("%s:%d failed\n", __func__, __LINE__);
+			rc = -EFAULT;
+			break;
+		}
+
+		if (!conf_array.size ||
+			conf_array.size > I2C_REG_DATA_MAX) {
 			pr_err("%s:%d failed\n", __func__, __LINE__);
 			rc = -EFAULT;
 			break;
@@ -1406,6 +1423,7 @@ int32_t mt9m114_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 	struct sensorb_cfg_data32 *cdata = (struct sensorb_cfg_data32 *)argp;
 	int32_t rc = 0;
 	int32_t i = 0;
+	uint16_t current_state = 0;
 	mutex_lock(s_ctrl->msm_sensor_mutex);
 	CDBG("%s:%d %s cfgtype = %d\n", __func__, __LINE__,
 		s_ctrl->sensordata->sensor_name, cdata->cfgtype);
@@ -1463,12 +1481,18 @@ int32_t mt9m114_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 	case CFG_SET_STOP_STREAM:
 		break;
 	case CFG_SET_START_STREAM:
-		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
-			i2c_write_conf_tbl(
+		rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->i2c_read(
 			s_ctrl->sensor_i2c_client,
-			mt9m114_config_change_settings,
-			ARRAY_SIZE(mt9m114_config_change_settings),
-			MSM_CAMERA_I2C_WORD_DATA);
+			MT9M114_CURRENT_STATE_REGISTER,
+			&current_state, MSM_CAMERA_I2C_BYTE_DATA);
+		if (current_state != MT9M114_STREAMING_STATE) {
+			rc = s_ctrl->sensor_i2c_client->i2c_func_tbl->
+				i2c_write_conf_tbl(
+				s_ctrl->sensor_i2c_client,
+				mt9m114_config_change_settings,
+				ARRAY_SIZE(mt9m114_config_change_settings),
+				MSM_CAMERA_I2C_WORD_DATA);
+		}
 		break;
 	case CFG_GET_SENSOR_INIT_PARAMS:
 		cdata->cfg.sensor_init_params.modes_supported =
@@ -1501,6 +1525,13 @@ int32_t mt9m114_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 		conf_array.delay = conf_array32.delay;
 		conf_array.size = conf_array32.size;
 		conf_array.reg_setting = compat_ptr(conf_array32.reg_setting);
+
+		if (!conf_array.size ||
+			conf_array.size > I2C_REG_DATA_MAX) {
+			pr_err("%s:%d failed\n", __func__, __LINE__);
+			rc = -EFAULT;
+			break;
+		}
 
 		reg_setting = kzalloc(conf_array.size *
 			(sizeof(struct msm_camera_i2c_reg_array)), GFP_KERNEL);
@@ -1595,6 +1626,8 @@ int32_t mt9m114_sensor_config32(struct msm_sensor_ctrl_t *s_ctrl,
 	case CFG_SET_BESTSHOT_MODE:
 		break;
 	case CFG_SET_ISO:
+		break;
+	case CFG_SET_STREAM_TYPE:
 		break;
 	default:
 	pr_err("Invalid cfgtype func %s line %d cfgtype = %d\n",

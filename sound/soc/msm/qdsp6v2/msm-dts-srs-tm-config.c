@@ -14,11 +14,12 @@
 #include <linux/module.h>
 #include <linux/bitops.h>
 #include <linux/mutex.h>
+#include <linux/atomic.h>
 #include <linux/msm_audio_ion.h>
 #include <sound/control.h>
 #include <sound/q6adm-v2.h>
 #include <sound/asound.h>
-
+#include <sound/msm-dts-eagle.h>
 #include "msm-dts-srs-tm-config.h"
 #include "msm-pcm-routing-v2.h"
 
@@ -28,8 +29,7 @@ static union srs_trumedia_params_u msm_srs_trumedia_params;
 static struct ion_client *ion_client;
 static struct ion_handle *ion_handle;
 static struct param_outband po;
-static int ref_cnt;
-
+static atomic_t ref_cnt;
 #define ION_MEM_SIZE	(8 * 1024)
 
 static int set_port_id(int port_id, int copp_idx)
@@ -100,19 +100,19 @@ static int msm_dts_srs_trumedia_control_set_(int port_id,
 					    struct snd_kcontrol *kcontrol,
 					    struct snd_ctl_elem_value *ucontrol)
 {
-	__u16 offset, value, max = sizeof(msm_srs_trumedia_params) >> 1;
 
+	__u16 offset, value, max = sizeof(msm_srs_trumedia_params) >> 1;
 	if (SRS_CMD_UPLOAD ==
-	    (ucontrol->value.integer.value[0] & SRS_CMD_UPLOAD)) {
+		(ucontrol->value.integer.value[0] & SRS_CMD_UPLOAD)) {
 		__u32 techs = ucontrol->value.integer.value[0] & 0xFF;
 		__s32 index = adm_validate_and_get_port_index(port_id);
 		if (index < 0) {
 			pr_err("%s: Invalid port idx %d port_id 0x%x\n",
-				__func__, index, port_id);
-			return -EINVAL;
-		}
-		pr_debug("SRS %s: send params request, flags = %u\n",
-			__func__, techs);
+					__func__, index, port_id);
+				return -EINVAL;
+			}
+		pr_debug("SRS %s: send params request, flag = %u\n",
+					__func__, techs);
 		if (srs_port_id[index] >= 0 && techs)
 			msm_dts_srs_tm_send_params(port_id, techs);
 		return 0;
@@ -124,10 +124,10 @@ static int msm_dts_srs_trumedia_control_set_(int port_id,
 	if (offset < max) {
 		msm_srs_trumedia_params.raw_params[offset] = value;
 		pr_debug("SRS %s: index set... (max %d, requested %d, value 0x%X)\n",
-			__func__, max, offset, value);
+			 __func__, max, offset, value);
 	} else {
 		pr_err("SRS %s: index out of bounds! (max %d, requested %d)\n",
-				__func__, max, offset);
+		       __func__, max, offset);
 	}
 	return 0;
 }
@@ -157,6 +157,7 @@ static int msm_dts_srs_trumedia_control_i2s_set(struct snd_kcontrol *kcontrol,
 	msm_pcm_routing_release_lock();
 	return ret;
 }
+
 static int msm_dts_srs_trumedia_control_mi2s_set(struct snd_kcontrol *kcontrol,
 					  struct snd_ctl_elem_value *ucontrol)
 {
@@ -169,6 +170,7 @@ static int msm_dts_srs_trumedia_control_mi2s_set(struct snd_kcontrol *kcontrol,
 	msm_pcm_routing_release_lock();
 	return ret;
 }
+
 static int msm_dts_srs_trumedia_control_hdmi_set(struct snd_kcontrol *kcontrol,
 					   struct snd_ctl_elem_value *ucontrol)
 {
@@ -241,6 +243,7 @@ static const struct snd_kcontrol_new lpa_srs_trumedia_controls_i2s[] = {
 	})
 	}
 };
+
 static const struct snd_kcontrol_new lpa_srs_trumedia_controls_mi2s[] = {
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
@@ -262,6 +265,7 @@ static const struct snd_kcontrol_new lpa_srs_trumedia_controls_mi2s[] = {
 		})
 	}
 };
+
 void msm_dts_srs_tm_add_controls(struct snd_soc_platform *platform)
 {
 	snd_soc_add_platform_controls(platform,
@@ -275,31 +279,29 @@ void msm_dts_srs_tm_add_controls(struct snd_soc_platform *platform)
 	snd_soc_add_platform_controls(platform,
 				lpa_srs_trumedia_controls_i2s,
 			ARRAY_SIZE(lpa_srs_trumedia_controls_i2s));
-
 	snd_soc_add_platform_controls(platform,
 				lpa_srs_trumedia_controls_mi2s,
 			ARRAY_SIZE(lpa_srs_trumedia_controls_mi2s));
 }
 
-static void reg_ion_mem(void)
+static int reg_ion_mem(void)
 {
 	int rc;
-	pr_err("%s: entered\n", __func__);
 	rc = msm_audio_ion_alloc("SRS_TRUMEDIA", &ion_client, &ion_handle,
-				 ION_MEM_SIZE, &po.paddr, &po.size,
+				 ION_MEM_SIZE, &po.paddr, (size_t *)&po.size,
 				 &po.kvaddr);
 	if (rc != 0)
 		pr_err("%s: failed to allocate memory.\n", __func__);
-
-	pr_debug("%s: exited ion_client = %p, ion_handle = %p, phys_addr = %lu, length = %zd, vaddr = %p, rc = 0x%x\n",
-		__func__, ion_client, ion_handle, (long)po.paddr,
-		po.size, po.kvaddr, rc);
+		pr_debug("%s: exited ion_client = %p, ion_handle = %p, phys_addr = %lu, length = %d, vaddr = %p, rc = 0x%x\n",
+			__func__, ion_client, ion_handle, (long)po.paddr,
+			(unsigned int)po.size, po.kvaddr, rc);
+	return rc;
 }
 
 void msm_dts_srs_tm_ion_memmap(struct param_outband *po_)
 {
 	if (po.kvaddr == NULL) {
-		pr_debug("%s: calling reg_ion_mem()\n", __func__);
+		pr_debug("%s: callingreg_ion_mem()\n", __func__);
 		reg_ion_mem();
 	}
 	po_->size = ION_MEM_SIZE;
@@ -318,27 +320,35 @@ static void unreg_ion_mem(void)
 void msm_dts_srs_tm_deinit(int port_id)
 {
 	set_port_id(port_id, -1);
-
-	if (!--ref_cnt) {
-		pr_debug("%s: calling unreg_ion_mem()\n", __func__);
-		unreg_ion_mem();
+	atomic_dec(&ref_cnt);
+	if (po.kvaddr != NULL) {
+		if (!atomic_read(&ref_cnt)) {
+			pr_debug("%s: calling unreg_ion_mem()\n", __func__);
+			unreg_ion_mem();
+		}
 	}
-
 	return;
 }
 
 void msm_dts_srs_tm_init(int port_id, int copp_idx)
 {
+	int cur_ref_cnt = 0;
+
 	if (set_port_id(port_id, copp_idx) < 0) {
 		pr_err("%s: Invalid port_id: %d\n", __func__, port_id);
 		return;
 	}
 
-	if (!ref_cnt++ && po.kvaddr == NULL) {
+	cur_ref_cnt = atomic_read(&ref_cnt);
+	atomic_inc(&ref_cnt);
+	if (!cur_ref_cnt && po.kvaddr == NULL) {
 		pr_debug("%s: calling reg_ion_mem()\n", __func__);
-		reg_ion_mem();
+		if (reg_ion_mem() != 0) {
+			atomic_dec(&ref_cnt);
+			po.kvaddr = NULL;
+			return;
+		}
 	}
-
 	msm_dts_srs_tm_send_params(port_id, 1);
 	return;
 }

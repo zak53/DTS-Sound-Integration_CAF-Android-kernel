@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -35,20 +35,22 @@
 #define RTB_COMPAT_STR	"qcom,msm-rtb"
 
 /* Write
- * 1) 11 bytes sentinel
+ * 1) 3 bytes sentinel
  * 2) 1 bytes of log type
  * 3) 8 bytes of where the caller came from
  * 4) 4 bytes index
  * 4) 8 bytes extra data from the caller
+ * 5) 8 bytes of timestamp
  *
  * Total = 32 bytes.
  */
 struct msm_rtb_layout {
-	unsigned char sentinel[11];
+	unsigned char sentinel[3];
 	unsigned char log_type;
 	uint32_t idx;
 	uint64_t caller;
 	uint64_t data;
+	uint64_t timestamp;
 } __attribute__ ((__packed__));
 
 
@@ -86,6 +88,7 @@ static int msm_rtb_panic_notifier(struct notifier_block *this,
 
 static struct notifier_block msm_rtb_panic_blk = {
 	.notifier_call  = msm_rtb_panic_notifier,
+	.priority = INT_MAX,
 };
 
 int notrace msm_rtb_event_should_log(enum logk_event_type log_type)
@@ -124,6 +127,11 @@ static void msm_rtb_write_data(uint64_t data, struct msm_rtb_layout *start)
 	start->data = data;
 }
 
+static void msm_rtb_write_timestamp(struct msm_rtb_layout *start)
+{
+	start->timestamp = sched_clock();
+}
+
 static void uncached_logk_pc_idx(enum logk_event_type log_type, uint64_t caller,
 				 uint64_t data, int idx)
 {
@@ -136,6 +144,7 @@ static void uncached_logk_pc_idx(enum logk_event_type log_type, uint64_t caller,
 	msm_rtb_write_caller(caller, start);
 	msm_rtb_write_idx(idx, start);
 	msm_rtb_write_data(data, start);
+	msm_rtb_write_timestamp(start);
 	mb();
 
 	return;
@@ -152,10 +161,20 @@ static void uncached_logk_timestamp(int idx)
 }
 
 #if defined(CONFIG_MSM_RTB_SEPARATE_CPUS)
+/*
+ * Since it is not necessarily true that nentries % step_size == 0,
+ * must make appropriate adjustments to the index when a "wraparound"
+ * occurs to ensure that msm_rtb.rtb[x] always belongs to the same cpu.
+ * It is desired to give all cpus the same number of entries; this leaves
+ * (nentries % step_size) dead space at the end of the buffer.
+ */
 static int msm_rtb_get_idx(void)
 {
 	int cpu, i, offset;
 	atomic_t *index;
+	unsigned long flags;
+	u32 unused_buffer_size = msm_rtb.nentries % msm_rtb.step_size;
+	int adjusted_size;
 
 	/*
 	 * ideally we would use get_cpu but this is a close enough
@@ -165,17 +184,24 @@ static int msm_rtb_get_idx(void)
 
 	index = &per_cpu(msm_rtb_idx_cpu, cpu);
 
+	local_irq_save(flags);
 	i = atomic_add_return(msm_rtb.step_size, index);
 	i -= msm_rtb.step_size;
 
-	/* Check if index has wrapped around */
-	offset = (i & (msm_rtb.nentries - 1)) -
-		 ((i - msm_rtb.step_size) & (msm_rtb.nentries - 1));
+	/*
+	 * Check if index has wrapped around or is in the unused region at the
+	 * end of the buffer
+	 */
+	adjusted_size = atomic_read(index) + unused_buffer_size;
+	offset = (adjusted_size & (msm_rtb.nentries - 1)) -
+		 ((adjusted_size - msm_rtb.step_size) & (msm_rtb.nentries - 1));
 	if (offset < 0) {
 		uncached_logk_timestamp(i);
-		i = atomic_add_return(msm_rtb.step_size, index);
+		i = atomic_add_return(msm_rtb.step_size + unused_buffer_size,
+									index);
 		i -= msm_rtb.step_size;
 	}
+	local_irq_restore(flags);
 
 	return i;
 }

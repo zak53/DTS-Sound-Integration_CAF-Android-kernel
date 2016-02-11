@@ -96,6 +96,7 @@ config DOLBY_DAP
 config DTS_EAGLE
 	bool "Enable DTS Eagle Support"
 	depends on SND_SOC_MSM_QDSP6V2_INTF
+	select SND_HWDEP
 	help
 	 To add DTS Eagle support on QDSP6 targets.
 	 Eagle is a DTS pre/post processing
@@ -190,6 +191,7 @@ config SND_SOC_MSM8226
 	select DOLBY_DAP
 	select DTS_SRS_TM
 	select QTI_PP
+	select SND_HWDEP
 	help
 	 To add support for SoC audio on MSM8226.
 	 This will enable sound soc drivers which
@@ -258,6 +260,7 @@ config SND_SOC_MSM8X16
 	select QTI_PP
 	select DTS_SRS_TM
 	select DOLBY_DAP
+	select DOLBY_DS2
 	select MSM_QDSP6_APRV3
 	select MSM_QDSP6V2_CODECS
 	select SND_SOC_CPE
@@ -285,6 +288,7 @@ config SND_SOC_MSM8909
 	select MSM_QDSP6_APRV3
 	select MSM_QDSP6V2_CODECS
 	select SND_HWDEP
+	select DOLBY_DS2
 	help
 	 To add support for SoC audio on MSM8909.
 	 This will enable sound soc drivers which
@@ -315,10 +319,12 @@ config SND_SOC_MSM8994
 	select SND_SOC_WCD9330
 	select SND_SOC_MSM_HDMI_CODEC_RX
 	select QTI_PP
+	select DTS_SRS_TM
 	select SND_SOC_CPE
 	select MSM_ULTRASOUND
 	select DOLBY_DS2
 	select SND_HWDEP
+        select DTS_EAGLE
 	help
 	 To add support for SoC audio on MSM8994.
 	 This will enable sound soc drivers which
@@ -326,9 +332,9 @@ config SND_SOC_MSM8994
 	 the machine drivers and the corresponding
 	 DAI-links.
 
-config SND_SOC_MSMZIRC
-	tristate "SoC Machine driver for MSMZIRC boards"
-	depends on ARCH_MSMZIRC
+config SND_SOC_MDM9640
+	tristate "SoC Machine driver for MDM9640 boards"
+	depends on ARCH_MDM9640
 	select SND_SOC_QDSP6V2
 	select SND_SOC_MSM_STUB
 	select SND_SOC_WCD9330
@@ -338,7 +344,7 @@ config SND_SOC_MSMZIRC
 	select MSM_QDSP6V2_CODECS
 	select SND_HWDEP
         help
-	 To add support for SoC audio on MSMZIRC boards.
+	 To add support for SoC audio on MDM9640 boards.
 	 This will enable sound soc drivers which
 	 interfaces with DSP, also it will enable
 	 the machine drivers and the corresponding

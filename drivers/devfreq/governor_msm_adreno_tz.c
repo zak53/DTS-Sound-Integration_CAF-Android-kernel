@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -35,6 +35,13 @@ static DEFINE_SPINLOCK(tz_lock);
  * MIN_BUSY is 1 msec for the sample to be sent
  */
 #define MIN_BUSY		1000
+/*
+ * Use BUSY_BIN to check for fully busy rendering
+ * intervals that may need early intervention when
+ * seen with LONG_FRAME lengths
+ */
+#define BUSY_BIN		95
+#define LONG_FRAME		25000
 #define MAX_TZ_VERSION		0
 
 /*
@@ -177,6 +184,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	struct devfreq_dev_status stats;
 	int val, level = 0;
 	unsigned int scm_data[3];
+	static int busy_bin, frame_flag;
 
 	/* keeps stats.private_data == NULL   */
 	result = devfreq->profile->get_dev_status(devfreq->dev.parent, &stats);
@@ -201,6 +209,15 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 		return 0;
 	}
 
+	if ((stats.busy_time * 100 / stats.total_time) > BUSY_BIN) {
+		busy_bin += stats.busy_time;
+		if (stats.total_time > LONG_FRAME)
+			frame_flag = 1;
+	} else {
+		busy_bin = 0;
+		frame_flag = 0;
+	}
+
 	level = devfreq_get_freq_level(devfreq, stats.current_frequency);
 	if (level < 0) {
 		pr_err(TAG "bad freq %ld\n", stats.current_frequency);
@@ -211,8 +228,11 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	 * If there is an extended block of busy processing,
 	 * increase frequency.  Otherwise run the normal algorithm.
 	 */
-	if (priv->bin.busy_time > CEILING) {
+	if (priv->bin.busy_time > CEILING ||
+		(busy_bin > CEILING && frame_flag)) {
 		val = -1 * level;
+		busy_bin = 0;
+		frame_flag = 0;
 	} else {
 
 		scm_data[0] = level;
@@ -338,17 +358,6 @@ static int tz_stop(struct devfreq *devfreq)
 	return 0;
 }
 
-
-static int tz_resume(struct devfreq *devfreq)
-{
-	struct devfreq_dev_profile *profile = devfreq->profile;
-	unsigned long freq;
-
-	freq = profile->initial_freq;
-
-	return profile->target(devfreq->dev.parent, &freq, 0);
-}
-
 static int tz_suspend(struct devfreq *devfreq)
 {
 	struct devfreq_msm_adreno_tz_data *priv = devfreq->data;
@@ -383,9 +392,6 @@ static int tz_handler(struct devfreq *devfreq, unsigned int event, void *data)
 		break;
 
 	case DEVFREQ_GOV_RESUME:
-		result = tz_resume(devfreq);
-		break;
-
 	case DEVFREQ_GOV_INTERVAL:
 		/* ignored, this governor doesn't use polling */
 	default:

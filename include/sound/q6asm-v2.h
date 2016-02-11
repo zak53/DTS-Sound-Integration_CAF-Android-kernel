@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,6 +17,7 @@
 #include <sound/apr_audio-v2.h>
 #include <linux/list.h>
 #include <linux/msm_ion.h>
+#include <linux/spinlock.h>
 
 #define IN                      0x000
 #define OUT                     0x001
@@ -170,6 +171,8 @@ struct audio_client {
 	/* Relative or absolute TS */
 	atomic_t	       time_flag;
 	atomic_t	       nowait_cmd_cnt;
+	struct list_head       no_wait_que;
+	spinlock_t             no_wait_que_spinlock;
 	atomic_t               mem_state;
 	void		       *priv;
 	uint32_t               io_mode;
@@ -350,7 +353,8 @@ int q6asm_media_format_block_pcm_format_support(struct audio_client *ac,
 
 int q6asm_media_format_block_pcm_format_support_v2(struct audio_client *ac,
 				uint32_t rate, uint32_t channels,
-				uint16_t bits_per_sample, int stream_id);
+				uint16_t bits_per_sample, int stream_id,
+				bool use_default_chmap, char *channel_map);
 
 int q6asm_media_format_block_multi_ch_pcm(struct audio_client *ac,
 			uint32_t rate, uint32_t channels,
@@ -399,10 +403,12 @@ int q6asm_set_volume(struct audio_client *ac, int volume);
 /* Send Volume Command */
 int q6asm_set_volume_v2(struct audio_client *ac, int volume, int instance);
 
-int q6asm_dts_eagle_set(struct audio_client *ac, int param_id, int size,
-			void *data);
-int q6asm_dts_eagle_get(struct audio_client *ac, int param_id,
-			int size, void *data);
+/* DTS Eagle Params */
+int q6asm_dts_eagle_set(struct audio_client *ac, int param_id, uint32_t size,
+			void *data, struct param_outband *po, int m_id);
+int q6asm_dts_eagle_get(struct audio_client *ac, int param_id, uint32_t size,
+			void *data, struct param_outband *po, int m_id);
+
 /* Set SoftPause Params */
 int q6asm_set_softpause(struct audio_client *ac,
 			struct asm_softpause_params *param);

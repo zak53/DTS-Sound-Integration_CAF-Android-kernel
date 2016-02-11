@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -348,7 +348,7 @@ static int diagchar_close(struct inode *inode, struct file *file)
 	* This will specially help in case of ungraceful exit of any DCI client
 	* This call will remove any pending registrations of such client
 	*/
-	dci_entry = dci_lookup_client_entry_pid(current->pid);
+	dci_entry = dci_lookup_client_entry_pid(current->tgid);
 	if (dci_entry)
 		diag_dci_deinit_client(dci_entry);
 	/* If the exiting process is the socket process */
@@ -608,13 +608,13 @@ static int diag_remote_init(void)
 	diagmem_setsize(POOL_TYPE_MDM_DCI, itemsize_mdm_dci, poolsize_mdm_dci);
 	diagmem_setsize(POOL_TYPE_MDM2_DCI, itemsize_mdm_dci,
 			poolsize_mdm_dci);
-	diagmem_setsize(POOL_TYPE_MDM_USB, itemsize_mdm_usb, poolsize_mdm_usb);
-	diagmem_setsize(POOL_TYPE_MDM2_USB, itemsize_mdm_usb, poolsize_mdm_usb);
+	diagmem_setsize(POOL_TYPE_MDM_MUX, itemsize_mdm_usb, poolsize_mdm_usb);
+	diagmem_setsize(POOL_TYPE_MDM2_MUX, itemsize_mdm_usb, poolsize_mdm_usb);
 	diagmem_setsize(POOL_TYPE_MDM_DCI_WRITE, itemsize_mdm_dci_write,
 			poolsize_mdm_dci_write);
 	diagmem_setsize(POOL_TYPE_MDM2_DCI_WRITE, itemsize_mdm_dci_write,
 			poolsize_mdm_dci_write);
-	diagmem_setsize(POOL_TYPE_QSC_USB, itemsize_qsc_usb,
+	diagmem_setsize(POOL_TYPE_QSC_MUX, itemsize_qsc_usb,
 			poolsize_qsc_usb);
 	driver->cb_buf = kzalloc(HDLC_OUT_BUF_SIZE, GFP_KERNEL);
 	if (!driver->cb_buf)
@@ -896,19 +896,6 @@ static int diag_switch_logging(int requested_mode)
 					driver->logging_mode);
 		return 0;
 	}
-
-	if (requested_mode != MEMORY_DEVICE_MODE)
-		diag_update_real_time_vote(DIAG_PROC_MEMORY_DEVICE,
-					   MODE_REALTIME, ALL_PROC);
-	else
-		diag_update_proc_vote(DIAG_PROC_MEMORY_DEVICE, VOTE_UP,
-				      ALL_PROC);
-
-	if (!(requested_mode == MEMORY_DEVICE_MODE &&
-					driver->logging_mode == USB_MODE))
-		queue_work(driver->diag_real_time_wq,
-						&driver->diag_real_time_work);
-
 	mutex_lock(&driver->diagchar_mutex);
 	temp = driver->logging_mode;
 	driver->logging_mode = requested_mode;
@@ -930,6 +917,7 @@ static int diag_switch_logging(int requested_mode)
 				pr_err("socket process, status: %d\n",
 					status);
 			}
+			driver->socket_process = NULL;
 		}
 	} else if (driver->logging_mode == SOCKET_MODE) {
 		driver->socket_process = current;
@@ -948,6 +936,19 @@ static int diag_switch_logging(int requested_mode)
 	}
 
 	driver->logging_process_id = current->tgid;
+	if (driver->logging_mode != MEMORY_DEVICE_MODE) {
+		diag_update_real_time_vote(DIAG_PROC_MEMORY_DEVICE,
+						MODE_REALTIME, ALL_PROC);
+	} else {
+		diag_update_proc_vote(DIAG_PROC_MEMORY_DEVICE, VOTE_UP,
+						ALL_PROC);
+	}
+
+	if (!(driver->logging_mode == MEMORY_DEVICE_MODE &&
+					temp == USB_MODE))
+		queue_work(driver->diag_real_time_wq,
+						&driver->diag_real_time_work);
+
 	status = diag_mux_switch_logging(new_mode);
 	if (status) {
 		if (requested_mode == MEMORY_DEVICE_MODE)
@@ -1156,6 +1157,13 @@ static int diag_ioctl_set_buffering_mode(unsigned long ioarg)
 
 	if (copy_from_user(&params, (void __user *)ioarg, sizeof(params)))
 		return -EFAULT;
+
+	if (params.peripheral >= NUM_SMD_CONTROL_CHANNELS)
+		return -EINVAL;
+
+	mutex_lock(&driver->mode_lock);
+	driver->buffering_flag[params.peripheral] = 1;
+	mutex_unlock(&driver->mode_lock);
 
 	return diag_send_peripheral_buffering_mode(&params);
 }
@@ -1859,7 +1867,6 @@ static ssize_t diagchar_write(struct file *file, const char __user *buf,
 						 POOL_TYPE_HDLC);
 	if (!buf_hdlc) {
 		ret = -ENOMEM;
-		driver->used = 0;
 		goto fail_free_copy;
 	}
 	if (HDLC_OUT_BUF_SIZE < (2*payload_size) + 3) {
@@ -2303,13 +2310,13 @@ static int __init diagchar_init(void)
 	diagmem_setsize(POOL_TYPE_HDLC, itemsize_hdlc, poolsize_hdlc);
 	diagmem_setsize(POOL_TYPE_USER, itemsize_user, poolsize_user);
 	/*
-	 * POOL_TYPE_USB_APPS is for USB write structures for the Local
-	 * USB channel. The number of items encompasses Diag data generated on
+	 * POOL_TYPE_MUX_APPS is for the buffers in the Diag MUX layer.
+	 * The number of buffers encompasses Diag data generated on
 	 * the Apss processor + 1 for the responses generated exclusively on
 	 * the Apps processor + data from SMD data channels (2 channels per
 	 * peripheral) + data from SMD command channels
 	 */
-	diagmem_setsize(POOL_TYPE_USB_APPS, itemsize_usb_apps,
+	diagmem_setsize(POOL_TYPE_MUX_APPS, itemsize_usb_apps,
 			poolsize_usb_apps + 1 + (NUM_SMD_DATA_CHANNELS * 2) +
 			NUM_SMD_CMD_CHANNELS);
 	diagmem_setsize(POOL_TYPE_DCI, itemsize_dci, poolsize_dci);

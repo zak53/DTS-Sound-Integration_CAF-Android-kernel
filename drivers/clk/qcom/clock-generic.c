@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -276,6 +276,8 @@ static long __div_round_rate(struct div_data *data, unsigned long rate,
 	numer = data->is_half_divider ? 2 : 1;
 
 	for (div = min_div; div <= max_div; div++) {
+		if (data->skip_odd_div && (div & 1))
+				continue;
 		req_prate = mult_frac(rate, div, numer);
 		prate = clk_round_rate(parent, req_prate);
 		if (IS_ERR_VALUE(prate))
@@ -480,7 +482,7 @@ static long __slave_div_round_rate(struct clk *c, unsigned long rate,
 	max_div = d->data.max_div;
 
 	p_rate = clk_get_rate(c->parent);
-	div = p_rate / rate;
+	div = DIV_ROUND_CLOSEST(p_rate, rate);
 	div = max(div, min_div);
 	div = min(div, max_div);
 	if (best_div)

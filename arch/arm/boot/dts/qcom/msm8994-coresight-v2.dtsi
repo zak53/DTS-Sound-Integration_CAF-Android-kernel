@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -173,7 +173,7 @@
 
 		coresight-id = <8>;
 		coresight-name = "coresight-funnel-apss";
-		coresight-nr-inports = <4>;
+		coresight-nr-inports = <8>;
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_apss1>;
 		coresight-child-ports = <0>;
@@ -214,6 +214,7 @@
 		coresight-child-list = <&funnel_apss1>;
 		coresight-child-ports = <3>;
 
+		qcom,tpda-atid = <64>;
 		qcom,cmb-elem-size = <0 64>;
 
 		clocks = <&clock_rpm clk_qdss_clk>,
@@ -250,6 +251,8 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_in0>;
 		coresight-child-ports = <7>;
+
+		qcom,data-barrier;
 
 		clocks = <&clock_rpm clk_qdss_clk>,
 			 <&clock_rpm clk_qdss_a_clk>;
@@ -604,7 +607,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -622,7 +624,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -640,7 +641,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -658,7 +658,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -676,7 +675,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -694,7 +692,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -712,7 +709,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -730,7 +726,6 @@
 			 <&clock_rpm clk_qdss_a_clk>;
 		clock-names = "core_clk", "core_a_clk";
 
-		qcom,cti-ack-atomic;
 		qcom,cti-save;
 	};
 
@@ -801,14 +796,13 @@
 		      <0xfd4ab160 0x80>,
 		      <0xfc401600 0x80>,
 		      <0xfd4ab360 0x80>,
-		      <0xfc596000 0x80>,
 		      <0xfc520000 0x4>,
 		      <0xfc520058 0x80>,
 		      <0xfc528000 0x4>,
 		      <0xfc528058 0x80>;
 		reg-names = "mmss-mux", "apcs-hwev", "apcs-spi", "apcs-ppi",
 			    "apcs-cpu", "apcs-cci", "ppss-mux", "gcc-mux",
-			    "tcsr-mux", "ufs-mux", "pcie0-sysctl", "pcie0-hwev",
+			    "tcsr-mux", "pcie0-sysctl", "pcie0-hwev",
 			    "pcie1-sysctl", "pcie1-hwev";
 
 		coresight-id = <47>;
@@ -817,15 +811,10 @@
 
 		clocks = <&clock_rpm clk_qdss_clk>,
 			 <&clock_rpm clk_qdss_a_clk>,
-			 <&clock_mmss clk_mmss_misc_ahb_clk>,
-			 <&clock_gcc clk_gcc_ufs_ahb_clk>,
-			 <&clock_gcc clk_gcc_ufs_axi_clk>;
-		clock-names = "core_clk", "core_a_clk", "core_mmss_clk",
-			      "ufs_ahb_clk", "ufs_axi_clk";
+			 <&clock_mmss clk_mmss_misc_ahb_clk>;
+		clock-names = "core_clk", "core_a_clk", "core_mmss_clk";
 
-		qcom,hwevent-clks = "core_mmss_clk", "ufs_ahb_clk",
-				    "ufs_axi_clk";
-		qcom,hwevent-regs = "gdsc_ufs";
+		qcom,hwevent-clks = "core_mmss_clk";
 	};
 
 	fuse: fuse@fc4be024 {

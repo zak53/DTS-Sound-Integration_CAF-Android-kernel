@@ -52,7 +52,8 @@ struct kgsl_pwrlevel {
  * @csdev:		Pointer to the coresight device for this device
  * @coresight_pdata:	Coresight configuration for specific device
  * @chipid:		Chip ID for the device's GPU
- * @pm_qos_latency:		latency value for cpu
+ * @pm_qos_active_latency:	GPU PM QoS latency request for active state
+ * @pm_qos_wakeup_latency:	GPU PM QoS latency request during wakeup
  */
 struct kgsl_device_platform_data {
 	struct kgsl_pwrlevel pwrlevel[KGSL_MAX_PWRLEVELS];
@@ -69,7 +70,16 @@ struct kgsl_device_platform_data {
 	struct coresight_device *csdev;
 	struct coresight_platform_data *coresight_pdata;
 	unsigned int chipid;
+	unsigned int pm_qos_active_latency;
+	unsigned int pm_qos_wakeup_latency;
 };
+
+/* Limits mitigations APIs */
+void *kgsl_pwr_limits_add(enum kgsl_deviceid id);
+void kgsl_pwr_limits_del(void *limit);
+int kgsl_pwr_limits_set_freq(void *limit, unsigned int freq);
+void kgsl_pwr_limits_set_default(void *limit);
+unsigned int kgsl_pwr_limits_get_freq(enum kgsl_deviceid id);
 
 #ifdef CONFIG_MSM_KGSL_DRM
 int kgsl_gem_obj_addr(int drm_fd, int handle, unsigned long *start,

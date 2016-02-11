@@ -39,6 +39,7 @@
 #include <linux/of_gpio.h>
 #include <linux/irq.h>
 #include <linux/clk/msm-clk.h>
+#include <linux/msm-bus.h>
 
 #include <linux/usb/ulpi.h>
 #include <linux/usb/msm_hsusb_hw.h>
@@ -94,6 +95,9 @@ struct msm_hcd {
 	int					wakeup_irq;
 	void __iomem				*usb_phy_ctrl_reg;
 	struct pinctrl				*hsusb_pinctrl;
+	struct pm_qos_request			pm_qos_req_dma;
+	struct msm_bus_scale_pdata		*bus_scale_table;
+	u32					bus_perf_client;
 };
 
 static inline struct msm_hcd *hcd_to_mhcd(struct usb_hcd *hcd)
@@ -726,23 +730,15 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 		func_ctrl |= ULPI_FUNC_CTRL_OPMODE_NONDRIVING;
 		msm_ulpi_write(mhcd, func_ctrl, ULPI_FUNC_CTRL);
 	}
-	/* If port is enabled wait 5ms for PHCD to come up. Reset PHY
-	 * and link if it fails to do so.
-	 * If port is not enabled set the PHCD bit and poll for it to
-	 * come up with in 500ms. Reset phy and link if it fails to do so.
+
+	/*
+	 * Set the PHCD bit, only if it is not set by the controller.
+	 * PHY may take some time or even fail to enter into low power
+	 * mode (LPM). Hence poll for 500 msec and reset the PHY and link
+	 * in failure case.
 	 */
 	portsc = readl_relaxed(USB_PORTSC);
-	if (portsc & PORT_PE) {
-
-		usleep_range(5000, 5000);
-
-		if (!(readl_relaxed(USB_PORTSC) & PORTSC_PHCD)) {
-			dev_err(mhcd->dev,
-				"Unable to suspend PHY. portsc: %8x\n",
-				readl_relaxed(USB_PORTSC));
-			goto reset_phy_and_link;
-		}
-	} else {
+	if (!(portsc & PORTSC_PHCD)) {
 		writel_relaxed(portsc | PORTSC_PHCD, USB_PORTSC);
 
 		timeout = jiffies + msecs_to_jiffies(PHY_SUSP_TIMEOUT_MSEC);
@@ -756,6 +752,9 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 			usleep_range(10000, 10000);
 		}
 	}
+
+	/* Suspend QUSB2 PHY */
+	usb_phy_set_suspend(hcd->phy, 1);
 
 	/*
 	 * PHY has capability to generate interrupt asynchronously in low
@@ -807,6 +806,16 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 		enable_irq_wake(mhcd->async_irq);
 		enable_irq(mhcd->async_irq);
 	}
+
+	if (mhcd->bus_perf_client) {
+		int ret = msm_bus_scale_client_update_request(
+						mhcd->bus_perf_client, 0);
+		if (ret)
+			dev_err(mhcd->dev, "Failed to vote for bus scaling\n");
+	}
+
+	pm_qos_update_request(&mhcd->pm_qos_req_dma, PM_QOS_DEFAULT_VALUE);
+
 	pm_relax(mhcd->dev);
 
 	dev_info(mhcd->dev, "EHCI USB in low power mode\n");
@@ -859,6 +868,18 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 
 	pm_stay_awake(mhcd->dev);
 
+	pdata = mhcd->dev->platform_data;
+	if (pdata)
+		pm_qos_update_request(&mhcd->pm_qos_req_dma,
+			pdata->pm_qos_latency + 1);
+
+	if (mhcd->bus_perf_client) {
+		int ret = msm_bus_scale_client_update_request(
+						mhcd->bus_perf_client, 1);
+		if (ret)
+			dev_err(mhcd->dev, "Failed to vote for bus scaling\n");
+	}
+
 	/* Vote for TCXO when waking up the phy */
 	if (mhcd->xo_clk)
 		clk_prepare_enable(mhcd->xo_clk);
@@ -873,10 +894,15 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 	temp &= ~ULPI_STP_CTRL;
 	writel_relaxed(temp, USB_USBCMD);
 
+	/* Resume QUSB2 PHY */
+	usb_phy_set_suspend(hcd->phy, 0);
+
 	if (!(readl_relaxed(USB_PORTSC) & PORTSC_PHCD))
 		goto skip_phy_resume;
 
 	temp = readl_relaxed(USB_PORTSC) & ~PORTSC_PHCD;
+	temp &= ~PORT_RWC_BITS;
+	temp |= PORT_RESUME;
 	writel_relaxed(temp, USB_PORTSC);
 
 	timeout = jiffies + usecs_to_jiffies(PHY_RESUME_TIMEOUT_USEC);
@@ -892,8 +918,7 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 	}
 
 skip_phy_resume:
-	pdata = mhcd->dev->platform_data;
-	if (pdata && pdata->is_uicc) {
+	if (pdata->is_uicc) {
 		/* put the controller in normal mode */
 		func_ctrl = msm_ulpi_read(mhcd, ULPI_FUNC_CTRL);
 		func_ctrl &= ~ULPI_FUNC_CTRL_OPMODE_MASK;
@@ -982,6 +1007,7 @@ static int msm_ehci_reset(struct usb_hcd *hcd)
 
 	ehci->caps = USB_CAPLENGTH;
 	hcd->has_tt = 1;
+	ehci->no_testmode_suspend = true;
 
 	retval = ehci_setup(hcd);
 	if (retval)
@@ -1305,6 +1331,8 @@ struct msm_usb_host_platform_data *ehci_msm2_dt_to_pdata(
 					"qcom,ext-hub-reset-gpio", 0);
 	pdata->is_uicc = of_property_read_bool(node,
 					"qcom,usb2-enable-uicc");
+	of_property_read_u32(node, "qcom,pm-qos-latency",
+				&pdata->pm_qos_latency);
 
 	return pdata;
 }
@@ -1523,12 +1551,15 @@ static int ehci_msm2_probe(struct platform_device *pdev)
 		hcd->phy = NULL;
 	}
 
-	if (hcd->phy)
+	if (hcd->phy) {
 		usb_phy_init(hcd->phy);
-	else if (pdata && pdata->use_sec_phy)
+		/* Set Host mode flag */
+		hcd->phy->flags |= PHY_HOST_MODE;
+	} else if (pdata && pdata->use_sec_phy) {
 		mhcd->usb_phy_ctrl_reg = USB_PHY_CTRL2;
-	else
+	} else {
 		mhcd->usb_phy_ctrl_reg = USB_PHY_CTRL;
+	}
 
 	ret = msm_hsusb_reset(mhcd);
 	if (ret) {
@@ -1540,6 +1571,18 @@ static int ehci_msm2_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(&pdev->dev, "unable to register HCD\n");
 		goto vbus_deinit;
+	}
+
+	mhcd->bus_scale_table = msm_bus_cl_get_pdata(pdev);
+	if (!mhcd->bus_scale_table) {
+		dev_dbg(&pdev->dev, "bus scaling is disabled\n");
+	} else {
+		mhcd->bus_perf_client =
+			msm_bus_scale_register_client(mhcd->bus_scale_table);
+		ret = msm_bus_scale_client_update_request(
+						mhcd->bus_perf_client, 1);
+		if (ret)
+			dev_err(&pdev->dev, "Failed to vote for bus scaling\n");
 	}
 
 	pdata = mhcd->dev->platform_data;
@@ -1596,6 +1639,11 @@ static int ehci_msm2_probe(struct platform_device *pdev)
 			mhcd->pmic_gpio_dp_irq = 0;
 		}
 	}
+
+	if (pdata && pdata->pm_qos_latency)
+		pm_qos_add_request(&mhcd->pm_qos_req_dma,
+			PM_QOS_CPU_DMA_LATENCY, pdata->pm_qos_latency + 1);
+
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
@@ -1649,6 +1697,7 @@ static int ehci_msm2_remove(struct platform_device *pdev)
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 	struct msm_hcd *mhcd = hcd_to_mhcd(hcd);
 	struct pinctrl_state *set_state;
+	struct msm_usb_host_platform_data *pdata;
 
 	if (mhcd->pmic_gpio_dp_irq) {
 		if (mhcd->pmic_gpio_dp_irq_enabled)
@@ -1676,8 +1725,18 @@ static int ehci_msm2_remove(struct platform_device *pdev)
 
 	usb_remove_hcd(hcd);
 
-	if (hcd->phy)
+	if (mhcd->bus_perf_client)
+		msm_bus_scale_unregister_client(mhcd->bus_perf_client);
+
+	pdata = pdev->dev.platform_data;
+	if (pdata && pdata->pm_qos_latency)
+		pm_qos_remove_request(&mhcd->pm_qos_req_dma);
+
+	if (hcd->phy) {
+		/* Clear host mode flag */
+		hcd->phy->flags &= ~PHY_HOST_MODE;
 		usb_phy_shutdown(hcd->phy);
+	}
 
 	if (mhcd->xo_clk) {
 		clk_disable_unprepare(mhcd->xo_clk);

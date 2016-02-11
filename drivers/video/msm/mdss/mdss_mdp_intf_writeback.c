@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,13 +17,14 @@
 #include "mdss_mdp.h"
 #include "mdss_mdp_rotator.h"
 #include "mdss_panel.h"
+#include "mdss_mdp_trace.h"
+#include "mdss_debug.h"
 
 /*
  * if BWC enabled and format is H1V2 or 420, do not use site C or I.
  * Hence, set the bits 29:26 in format register, as zero.
  */
 #define BWC_FMT_MASK	0xC3FFFFFF
-#define VBIF_WR_LIM_CONF    0xC0
 #define MDSS_DEFAULT_OT_SETTING    0x10
 
 enum mdss_mdp_writeback_type {
@@ -46,6 +47,7 @@ struct mdss_mdp_writeback_ctx {
 
 	u32 xin_id;
 	u32 wr_lim;
+	struct mdss_mdp_shared_reg_ctrl clk_ctrl;
 
 	u32 opmode;
 	struct mdss_mdp_format_params *dst_fmt;
@@ -75,30 +77,40 @@ static struct mdss_mdp_writeback_ctx wb_ctx_list[MDSS_MDP_MAX_WRITEBACK] = {
 		.intr_type = MDSS_MDP_IRQ_WB_ROT_COMP,
 		.intf_num = 0,
 		.xin_id = 3,
+		.clk_ctrl.reg_off = 0x2BC,
+		.clk_ctrl.bit_off = 0x8,
 	},
 	{
 		.type = MDSS_MDP_WRITEBACK_TYPE_ROTATOR,
 		.intr_type = MDSS_MDP_IRQ_WB_ROT_COMP,
 		.intf_num = 1,
 		.xin_id = 11,
+		.clk_ctrl.reg_off = 0x2BC,
+		.clk_ctrl.bit_off = 0xC,
 	},
 	{
 		.type = MDSS_MDP_WRITEBACK_TYPE_LINE,
 		.intr_type = MDSS_MDP_IRQ_WB_ROT_COMP,
 		.intf_num = 0,
 		.xin_id = 3,
+		.clk_ctrl.reg_off = 0x2BC,
+		.clk_ctrl.bit_off = 0x8,
 	},
 	{
 		.type = MDSS_MDP_WRITEBACK_TYPE_LINE,
 		.intr_type = MDSS_MDP_IRQ_WB_ROT_COMP,
 		.intf_num = 1,
 		.xin_id = 11,
+		.clk_ctrl.reg_off = 0x2BC,
+		.clk_ctrl.bit_off = 0xC,
 	},
 	{
 		.type = MDSS_MDP_WRITEBACK_TYPE_WFD,
 		.intr_type = MDSS_MDP_IRQ_WB_WFD,
 		.intf_num = 0,
 		.xin_id = 6,
+		.clk_ctrl.reg_off = 0x2BC,
+		.clk_ctrl.bit_off = 0x10,
 	},
 };
 
@@ -119,9 +131,6 @@ static int mdss_mdp_writeback_addr_setup(struct mdss_mdp_writeback_ctx *ctx,
 	data = *in_data;
 
 	pr_debug("wb_num=%d addr=0x%pa\n", ctx->wb_num, &data.p[0].addr);
-
-	if (ctx->bwc_mode)
-		data.bwc_enabled = 1;
 
 	ret = mdss_mdp_data_check(&data, &ctx->dst_planes);
 	if (ret)
@@ -232,7 +241,7 @@ static int mdss_mdp_writeback_format_setup(struct mdss_mdp_writeback_ctx *ctx,
 	outsize = (ctx->dst_rect.h << 16) | ctx->dst_rect.w;
 
 	if (ctx->type == MDSS_MDP_WRITEBACK_TYPE_ROTATOR &&
-			mdata->has_rot_dwnscale) {
+			mdata && mdata->has_rot_dwnscale) {
 		dnsc_factor = (ctx->dnsc_factor_h) | (ctx->dnsc_factor_w << 16);
 		mdp_wb_write(ctx, MDSS_MDP_REG_WB_ROTATOR_PIPE_DOWNSCALER,
 								dnsc_factor);
@@ -333,11 +342,8 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 		return -EINVAL;
 	}
 
-	if (ctx->bwc_mode || ctx->rot90)
-		format = mdss_mdp_get_rotator_dst_format(rot->format,
-				ctx->rot90, ctx->bwc_mode);
-	else
-		format = rot->format;
+	format = mdss_mdp_get_rotator_dst_format(rot->format,
+			ctx->rot90, ctx->bwc_mode);
 
 	if (ctx->rot90)
 		ctx->opmode |= BIT(5); /* ROT 90 */
@@ -449,6 +455,7 @@ static void mdss_mdp_writeback_intr_done(void *arg)
 	spin_unlock(&ctx->wb_lock);
 
 	complete_all(&ctx->wb_comp);
+	MDSS_XLOG(ctx->wb_num, ctx->type, ctx->xin_id, ctx->intf_num);
 }
 
 static bool mdss_mdp_traffic_shaper_helper(struct mdss_mdp_ctl *ctl,
@@ -474,6 +481,8 @@ static bool mdss_mdp_traffic_shaper_helper(struct mdss_mdp_ctl *ctl,
 		struct mdss_mdp_perf_params perf;
 		u32 traffic_shaper;
 		pipe = mixer->stage_pipe[i];
+
+		memset(&perf, 0, sizeof(perf));
 
 		if (pipe == NULL)
 			continue;
@@ -545,6 +554,7 @@ static int mdss_mdp_wb_wait4comp(struct mdss_mdp_ctl *ctl, void *arg)
 	struct mdss_mdp_writeback_ctx *ctx;
 	int rc = 0;
 	u64 rot_time;
+	u32 status, mask, isr;
 
 	ctx = (struct mdss_mdp_writeback_ctx *) ctl->priv_data;
 	if (!ctx) {
@@ -561,14 +571,36 @@ static int mdss_mdp_wb_wait4comp(struct mdss_mdp_ctl *ctl, void *arg)
 		NULL, NULL);
 
 	if (rc == 0) {
-		mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_TIMEOUT);
-		rc = -ENODEV;
-		WARN(1, "writeback kickoff timed out (%d) ctl=%d\n",
-						rc, ctl->num);
+		mask = BIT(ctx->intr_type + ctx->intf_num);
+
+		isr = readl_relaxed(ctl->mdata->mdp_base +
+					MDSS_MDP_REG_INTR_STATUS);
+		status = mask & isr;
+
+		pr_info_once("mask: 0x%x, isr: 0x%x, status: 0x%x\n",
+				mask, isr, status);
+
+		if (status) {
+			pr_warn_once("wb done but irq not triggered\n");
+			mdss_mdp_irq_clear(ctl->mdata,
+					ctx->intr_type,
+					ctx->intf_num);
+
+			mdss_mdp_writeback_intr_done(ctl);
+			rc = 0;
+		} else {
+			mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_TIMEOUT);
+			rc = -ENODEV;
+			WARN(1, "writeback kickoff timed out (%d) ctl=%d\n",
+							rc, ctl->num);
+		}
 	} else {
+		rc = 0;
+	}
+
+	if (rc == 0) {
 		ctx->end_time = ktime_get();
 		mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_DONE);
-		rc = 0;
 	}
 
 	/* once operation is done, disable traffic shaper */
@@ -595,11 +627,31 @@ static int mdss_mdp_wb_wait4comp(struct mdss_mdp_ctl *ctl, void *arg)
 	return rc;
 }
 
+static void mdss_mdp_set_ot_limit_wb(struct mdss_mdp_writeback_ctx *ctx)
+{
+	struct mdss_mdp_set_ot_params ot_params;
+
+	ot_params.xin_id = ctx->xin_id;
+	ot_params.num = ctx->wb_num;
+	ot_params.width = ctx->width;
+	ot_params.height = ctx->height;
+	ot_params.reg_off_vbif_lim_conf = MMSS_VBIF_WR_LIM_CONF;
+	ot_params.reg_off_mdp_clk_ctrl = ctx->clk_ctrl.reg_off;
+	ot_params.bit_off_mdp_clk_ctrl = ctx->clk_ctrl.bit_off;
+	ot_params.is_rot = (ctx->type == MDSS_MDP_WRITEBACK_TYPE_ROTATOR);
+	ot_params.is_wb = (ctx->type == MDSS_MDP_WRITEBACK_TYPE_WFD) ||
+		(ctx->type == MDSS_MDP_WRITEBACK_TYPE_LINE);
+	ot_params.is_yuv = ctx->dst_fmt->is_yuv;
+
+	mdss_mdp_set_ot_limit(&ot_params);
+
+}
+
 static int mdss_mdp_writeback_display(struct mdss_mdp_ctl *ctl, void *arg)
 {
 	struct mdss_mdp_writeback_ctx *ctx;
 	struct mdss_mdp_writeback_arg *wb_args;
-	u32 flush_bits = 0, val, bit_off, reg_off;
+	u32 flush_bits = 0;
 	int ret;
 
 	if (!ctl || !ctl->mdata)
@@ -615,22 +667,9 @@ static int mdss_mdp_writeback_display(struct mdss_mdp_ctl *ctl, void *arg)
 		return -EPERM;
 	}
 
-	if (ctl->mdata->rotator_ot_limit) {
-		if (ctx->type == MDSS_MDP_WRITEBACK_TYPE_ROTATOR)
-			ctx->wr_lim = ctl->mdata->rotator_ot_limit;
-		else
-			ctx->wr_lim = MDSS_DEFAULT_OT_SETTING;
-
-		reg_off = (ctx->xin_id / 4) * 4;
-		bit_off = (ctx->xin_id % 4) * 8;
-
-		val = MDSS_VBIF_READ(ctl->mdata, VBIF_WR_LIM_CONF + reg_off,
-							ctx->is_vbif_nrt);
-		val &= ~(0xFF << bit_off);
-		val |= (ctx->wr_lim) << bit_off;
-		MDSS_VBIF_WRITE(ctl->mdata, VBIF_WR_LIM_CONF + reg_off, val,
-							ctx->is_vbif_nrt);
-	}
+	if (ctl->mdata->default_ot_wr_limit ||
+			ctl->mdata->default_ot_rd_limit)
+		mdss_mdp_set_ot_limit_wb(ctx);
 
 	wb_args = (struct mdss_mdp_writeback_arg *) arg;
 	if (!wb_args)
@@ -668,6 +707,8 @@ static int mdss_mdp_writeback_display(struct mdss_mdp_ctl *ctl, void *arg)
 	mdss_mdp_ctl_write(ctl, MDSS_MDP_REG_CTL_START, 1);
 	wmb();
 
+	MDSS_XLOG(ctx->wb_num, ctx->type, ctx->xin_id, ctx->intf_num,
+		ctx->dst_rect.w, ctx->dst_rect.h);
 	pr_debug("ctx%d type:%d xin_id:%d intf_num:%d start\n",
 		ctx->wb_num, ctx->type, ctx->xin_id, ctx->intf_num);
 
@@ -704,9 +745,9 @@ int mdss_mdp_writeback_start(struct mdss_mdp_ctl *ctl)
 	INIT_LIST_HEAD(&ctx->vsync_handlers);
 
 	if (ctx->type == MDSS_MDP_WRITEBACK_TYPE_ROTATOR)
-		ctl->prepare_fnc = mdss_mdp_writeback_prepare_rot;
+		ctl->ops.prepare_fnc = mdss_mdp_writeback_prepare_rot;
 	else {  /* wfd or line mode */
-		ctl->prepare_fnc = mdss_mdp_writeback_prepare_wfd;
+		ctl->ops.prepare_fnc = mdss_mdp_writeback_prepare_wfd;
 
 		/* WB2 Intr Enable is BIT(2) in MDSS 1.8.0 */
 		if (ctl->mdata->mdp_rev == MDSS_MDP_HW_REV_108) {
@@ -714,14 +755,13 @@ int mdss_mdp_writeback_start(struct mdss_mdp_ctl *ctl)
 			ctx->intf_num = 2;
 		}
 	}
-	ctl->stop_fnc = mdss_mdp_writeback_stop;
-	ctl->display_fnc = mdss_mdp_writeback_display;
-	ctl->wait_fnc = mdss_mdp_wb_wait4comp;
-	ctl->add_vsync_handler = mdss_mdp_wb_add_vsync_handler;
-	ctl->remove_vsync_handler = mdss_mdp_wb_remove_vsync_handler;
+	ctl->ops.stop_fnc = mdss_mdp_writeback_stop;
+	ctl->ops.display_fnc = mdss_mdp_writeback_display;
+	ctl->ops.wait_fnc = mdss_mdp_wb_wait4comp;
+	ctl->ops.add_vsync_handler = mdss_mdp_wb_add_vsync_handler;
+	ctl->ops.remove_vsync_handler = mdss_mdp_wb_remove_vsync_handler;
 
-	ctx->is_vbif_nrt = IS_MDSS_MAJOR_MINOR_SAME(ctl->mdata->mdp_rev,
-							MDSS_MDP_HW_REV_107);
+	ctx->is_vbif_nrt = mdss_mdp_is_vbif_nrt(ctl->mdata->mdp_rev);
 
 	return 0;
 }

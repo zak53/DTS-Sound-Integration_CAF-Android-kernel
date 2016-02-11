@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -124,6 +124,7 @@ static int msm_iommu_dump_fault_regs(int smmu_id, int cb_num,
 				struct msm_scm_fault_regs_dump *regs)
 {
 	int ret;
+	struct scm_desc desc = {0};
 
 	struct msm_scm_fault_regs_dump_req {
 		uint32_t id;
@@ -133,15 +134,19 @@ static int msm_iommu_dump_fault_regs(int smmu_id, int cb_num,
 	} req_info;
 	int resp = 0;
 
-	req_info.id = smmu_id;
-	req_info.cb_num = cb_num;
-	req_info.buff = virt_to_phys(regs);
-	req_info.len = sizeof(*regs);
+	desc.args[0] = req_info.id = smmu_id;
+	desc.args[1] = req_info.cb_num = cb_num;
+	desc.args[2] = req_info.buff = virt_to_phys(regs);
+	desc.args[3] = req_info.len = sizeof(*regs);
+	desc.arginfo = SCM_ARGS(4, SCM_VAL, SCM_VAL, SCM_RW, SCM_VAL);
 
 	dmac_clean_range(regs, regs + 1);
-	ret = scm_call(SCM_SVC_UTIL, IOMMU_DUMP_SMMU_FAULT_REGS,
-		&req_info, sizeof(req_info), &resp, 1);
-
+	if (!is_scm_armv8())
+		ret = scm_call(SCM_SVC_UTIL, IOMMU_DUMP_SMMU_FAULT_REGS,
+			&req_info, sizeof(req_info), &resp, 1);
+	else
+		ret = scm_call2(SCM_SIP_FNID(SCM_SVC_UTIL,
+			IOMMU_DUMP_SMMU_FAULT_REGS), &desc);
 	dmac_inv_range(regs, regs + 1);
 
 	return ret;
@@ -346,7 +351,7 @@ static int msm_iommu_sec_ptbl_init(void)
 	unsigned int spare;
 	int ret, ptbl_ret = 0;
 	int version;
-	/* Use a dummy device for dma_alloc_coherent allocation */
+	/* Use a dummy device for dma_alloc_attrs allocation */
 	struct device dev = { 0 };
 	void *cpu_addr;
 	dma_addr_t paddr;
@@ -447,7 +452,7 @@ static int msm_iommu_sec_ptbl_init(void)
 	return 0;
 
 fail_mem:
-	dma_free_coherent(&dev, psize[0], cpu_addr, paddr);
+	dma_free_attrs(&dev, psize[0], cpu_addr, paddr, &attrs);
 fail:
 	return ret;
 }
@@ -514,6 +519,9 @@ static int msm_iommu_sec_ptbl_map(struct msm_iommu_drvdata *iommu_drvdata,
 	void *flush_va, *flush_va_end;
 	int ret = 0;
 
+	if (!IS_ALIGNED(va, SZ_1M) || !IS_ALIGNED(len, SZ_1M) ||
+		!IS_ALIGNED(pa, SZ_1M))
+		return -EINVAL;
 	map.plist.list = virt_to_phys(&pa);
 	map.plist.list_size = 1;
 	map.plist.size = len;
@@ -559,9 +567,12 @@ static int msm_iommu_sec_ptbl_map_range(struct msm_iommu_drvdata *iommu_drvdata,
 	struct msm_scm_map2_req map;
 	unsigned int *pa_list = 0;
 	unsigned int pa, cnt;
-	void *flush_va;
+	void *flush_va, *flush_va_end;
 	unsigned int offset = 0, chunk_offset = 0;
 	int ret;
+
+	if (!IS_ALIGNED(va, SZ_1M) || !IS_ALIGNED(len, SZ_1M))
+		return -EINVAL;
 
 	map.info.id = iommu_drvdata->sec_id;
 	map.info.ctx_id = ctx_drvdata->num;
@@ -569,16 +580,27 @@ static int msm_iommu_sec_ptbl_map_range(struct msm_iommu_drvdata *iommu_drvdata,
 	map.info.size = len;
 
 	if (sg->length == len) {
+		/*
+		 * physical address for secure mapping needs
+		 * to be 1MB aligned
+		 */
 		pa = get_phys_addr(sg);
+		if (!IS_ALIGNED(pa, SZ_1M))
+			return -EINVAL;
 		map.plist.list = virt_to_phys(&pa);
 		map.plist.list_size = 1;
 		map.plist.size = len;
 		flush_va = &pa;
 	} else {
 		sgiter = sg;
+		if (!IS_ALIGNED(sgiter->length, SZ_1M))
+			return -EINVAL;
 		cnt = sg->length / SZ_1M;
-		while ((sgiter = sg_next(sgiter)))
+		while ((sgiter = sg_next(sgiter))) {
+			if (!IS_ALIGNED(sgiter->length, SZ_1M))
+				return -EINVAL;
 			cnt += sgiter->length / SZ_1M;
+		}
 
 		pa_list = kmalloc(cnt * sizeof(*pa_list), GFP_KERNEL);
 		if (!pa_list)
@@ -587,6 +609,10 @@ static int msm_iommu_sec_ptbl_map_range(struct msm_iommu_drvdata *iommu_drvdata,
 		sgiter = sg;
 		cnt = 0;
 		pa = get_phys_addr(sgiter);
+		if (!IS_ALIGNED(pa, SZ_1M)) {
+			kfree(pa_list);
+			return -EINVAL;
+		}
 		while (offset < len) {
 			pa += chunk_offset;
 			pa_list[cnt] = pa;
@@ -613,7 +639,9 @@ static int msm_iommu_sec_ptbl_map_range(struct msm_iommu_drvdata *iommu_drvdata,
 	/*
 	 * Ensure that the buffer is in RAM by the time it gets to TZ
 	 */
-	dmac_clean_range(flush_va, flush_va + map.plist.list_size);
+	flush_va_end = (void *) (((unsigned long) flush_va) +
+			(map.plist.list_size * sizeof(*pa_list)));
+	dmac_clean_range(flush_va, flush_va_end);
 
 	ret = msm_iommu_sec_map2(&map);
 	kfree(pa_list);
@@ -632,6 +660,8 @@ static int msm_iommu_sec_ptbl_unmap(struct msm_iommu_drvdata *iommu_drvdata,
 	int ret, scm_ret;
 	struct scm_desc desc = {0};
 
+	if (!IS_ALIGNED(va, SZ_1M) || !IS_ALIGNED(len, SZ_1M))
+		return -EINVAL;
 	desc.args[0] = unmap.info.id = iommu_drvdata->sec_id;
 	desc.args[1] = unmap.info.ctx_id = ctx_drvdata->num;
 	desc.args[2] = unmap.info.va = va;
@@ -649,7 +679,7 @@ static int msm_iommu_sec_ptbl_unmap(struct msm_iommu_drvdata *iommu_drvdata,
 	return ret;
 }
 
-static int msm_iommu_domain_init(struct iommu_domain *domain, int flags)
+static int msm_iommu_domain_init(struct iommu_domain *domain)
 {
 	struct msm_iommu_priv *priv;
 
@@ -871,6 +901,9 @@ static int msm_iommu_unmap_range(struct iommu_domain *domain, unsigned int va,
 	struct msm_iommu_drvdata *iommu_drvdata;
 	struct msm_iommu_ctx_drvdata *ctx_drvdata;
 	int ret = -EINVAL;
+
+	if (!IS_ALIGNED(va, SZ_1M) || !IS_ALIGNED(len, SZ_1M))
+		return -EINVAL;
 
 	iommu_access_ops->iommu_lock_acquire(0);
 

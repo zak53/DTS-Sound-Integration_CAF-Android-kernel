@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -40,6 +40,14 @@
 #include <soc/qcom/rpm-smd.h>
 #include <soc/qcom/scm.h>
 #include <linux/debugfs.h>
+#include <linux/pm_opp.h>
+#include <linux/sched/rt.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
+#include <linux/suspend.h>
+#include <soc/qcom/msm-core.h>
+#include <linux/cpumask.h>
+#include <linux/suspend.h>
 
 #define CREATE_TRACE_POINTS
 #define TRACE_MSM_THERMAL
@@ -47,14 +55,13 @@
 
 #define MAX_CURRENT_UA 100000
 #define MAX_RAILS 5
-#define MAX_THRESHOLD 2
-#define MONITOR_ALL_TSENS -1
-#define TSENS_NAME_MAX 20
 #define TSENS_NAME_FORMAT "tsens_tz_sensor%d"
 #define THERM_SECURE_BITE_CMD 8
 #define SENSOR_SCALING_FACTOR 1
 #define MSM_THERMAL_NAME "msm_thermal"
 #define MSM_TSENS_PRINT  "log_tsens_temperature"
+#define CPU_BUF_SIZE 64
+#define CPU_DEVICE "cpu%d"
 
 #define THERM_CREATE_DEBUGFS_DIR(_node, _name, _parent, _ret) \
 	do { \
@@ -66,10 +73,18 @@
 		} \
 	} while (0)
 
+#define UPDATE_THRESHOLD_SET(_val, _trip) do {		\
+	if (_trip == THERMAL_TRIP_CONFIGURABLE_HI)	\
+		_val |= 1;				\
+	else if (_trip == THERMAL_TRIP_CONFIGURABLE_LOW)\
+		_val |= 2;				\
+} while (0)
+
 static struct msm_thermal_data msm_thermal_info;
 static struct delayed_work check_temp_work;
 static bool core_control_enabled;
 static uint32_t cpus_offlined;
+static cpumask_var_t cpus_previously_online;
 static DEFINE_MUTEX(core_control_mutex);
 static struct kobject *cc_kobj;
 static struct kobject *mx_kobj;
@@ -124,6 +139,7 @@ static DEFINE_MUTEX(cx_mutex);
 static DEFINE_MUTEX(gfx_mutex);
 static DEFINE_MUTEX(ocr_mutex);
 static DEFINE_MUTEX(vdd_mx_mutex);
+static DEFINE_MUTEX(threshold_mutex);
 static uint32_t min_freq_limit;
 static uint32_t curr_gfx_band;
 static uint32_t curr_cx_band;
@@ -138,19 +154,17 @@ static struct cpufreq_frequency_table *pending_freq_table_ptr;
 static int pending_cpu_freq = -1;
 static long *tsens_temp_at_panic;
 static u32 tsens_temp_print;
+static uint32_t bucket;
+static cpumask_t throttling_mask;
 
+static LIST_HEAD(devices_list);
+static LIST_HEAD(thresholds_list);
 enum thermal_threshold {
 	HOTPLUG_THRESHOLD_HIGH,
 	HOTPLUG_THRESHOLD_LOW,
 	FREQ_THRESHOLD_HIGH,
 	FREQ_THRESHOLD_LOW,
 	THRESHOLD_MAX_NR,
-};
-
-enum sensor_id_type {
-	THERM_ZONE_ID,
-	THERM_TSENS_ID,
-	THERM_ID_MAX_NR,
 };
 
 struct cluster_info {
@@ -179,27 +193,13 @@ struct cpu_info {
 	struct sensor_threshold threshold[THRESHOLD_MAX_NR];
 	bool max_freq;
 	uint32_t user_max_freq;
+	uint32_t shutdown_max_freq;
+	uint32_t suspend_max_freq;
 	uint32_t user_min_freq;
 	uint32_t limited_max_freq;
 	uint32_t limited_min_freq;
 	bool freq_thresh_clear;
 	struct cluster_info *parent_ptr;
-};
-
-struct threshold_info;
-struct therm_threshold {
-	int32_t sensor_id;
-	enum sensor_id_type id_type;
-	struct sensor_threshold threshold[MAX_THRESHOLD];
-	int32_t trip_triggered;
-	void (*notify)(struct therm_threshold *);
-	struct threshold_info *parent;
-};
-
-struct threshold_info {
-	uint32_t thresh_ct;
-	bool thresh_triggered;
-	struct therm_threshold *thresh_list;
 };
 
 struct rail {
@@ -230,6 +230,11 @@ struct psm_rail {
 	struct rpm_regulator *reg;
 	struct regulator *phase_reg;
 	struct attribute_group attr_gp;
+};
+
+struct devmgr_devices {
+	struct device_manager_data *hotplug_dev;
+	struct device_manager_data *cpufreq_dev[NR_CPUS];
 };
 
 enum msm_thresh_list {
@@ -274,6 +279,7 @@ static struct threshold_info *thresh;
 static bool mx_restr_applied;
 static struct cluster_info *core_ptr;
 static struct msm_thermal_debugfs_entry *msm_therm_debugfs;
+static struct devmgr_devices *devices;
 
 struct vdd_rstr_enable {
 	struct kobj_attribute ko_attr;
@@ -292,6 +298,8 @@ enum ocr_request {
 	OPTIMUM_CURRENT_MAX,
 	OPTIMUM_CURRENT_NR,
 };
+
+#define __ATTR_RW(attr) __ATTR(attr, 0644, attr##_show, attr##_store)
 
 #define SYNC_CORE(_cpu) \
 	(core_ptr && cpus[_cpu].parent_ptr->sync_cluster)
@@ -356,6 +364,426 @@ enum ocr_request {
 	sysfs_attr_init(&ko_attr.attr); \
 	_attr_gp.attrs[0] = &ko_attr.attr;
 
+void get_cluster_mask(uint32_t cpu, cpumask_t *mask)
+{
+	int i;
+
+	cpumask_set_cpu(cpu, mask);
+	if (core_ptr) {
+		for (i = 0; i < core_ptr->entity_count; i++) {
+			struct cluster_info *cluster_ptr =
+				&core_ptr->child_entity_ptr[i];
+			if (*cluster_ptr->cluster_cores.bits & BIT(cpu)) {
+				cpumask_copy(mask,
+					&cluster_ptr->cluster_cores);
+				break;
+			}
+		}
+	}
+}
+
+uint32_t get_core_max_freq(uint32_t cpu)
+{
+	int i;
+	uint32_t max_freq = 0;
+
+	if (core_ptr) {
+		for (i = 0; i < core_ptr->entity_count; i++) {
+			struct cluster_info *cluster_ptr =
+				&core_ptr->child_entity_ptr[i];
+			if (*cluster_ptr->cluster_cores.bits & BIT(cpu)) {
+				if (cluster_ptr->freq_table)
+					max_freq =
+					cluster_ptr->freq_table
+					[cluster_ptr->freq_idx_high].frequency;
+				break;
+			}
+		}
+	} else {
+		if (table)
+			max_freq = table[limit_idx_high].frequency;
+	}
+
+	return max_freq;
+}
+
+static void cpus_previously_online_update(void)
+{
+	char buf[CPU_BUF_SIZE];
+
+	get_online_cpus();
+	cpumask_or(cpus_previously_online, cpus_previously_online,
+		   cpu_online_mask);
+	put_online_cpus();
+	cpulist_scnprintf(buf, sizeof(buf), cpus_previously_online);
+	pr_debug("%s\n", buf);
+}
+
+uint32_t get_core_min_freq(uint32_t cpu)
+{
+	int i;
+	uint32_t min_freq = UINT_MAX;
+
+	if (core_ptr) {
+		for (i = 0; i < core_ptr->entity_count; i++) {
+			struct cluster_info *cluster_ptr =
+				&core_ptr->child_entity_ptr[i];
+			if (*cluster_ptr->cluster_cores.bits & BIT(cpu)) {
+				if (cluster_ptr->freq_table)
+					min_freq =
+					cluster_ptr->freq_table[0].frequency;
+				break;
+			}
+		}
+	} else {
+		if (table)
+			min_freq = table[0].frequency;
+	}
+
+	return min_freq;
+}
+
+static void msm_thermal_update_freq(bool is_shutdown, bool mitigate)
+{
+	uint32_t cpu;
+	bool update = false;
+
+	for_each_possible_cpu(cpu) {
+		if (msm_thermal_info.freq_mitig_control_mask
+			& BIT(cpu)) {
+			uint32_t *freq = (is_shutdown)
+				? &cpus[cpu].shutdown_max_freq
+				: &cpus[cpu].suspend_max_freq;
+			uint32_t mitigation_freq = (mitigate) ?
+				get_core_min_freq(cpu) : UINT_MAX;
+
+			if (*freq == mitigation_freq)
+				continue;
+			*freq = mitigation_freq;
+			update = true;
+			pr_debug("%s mitigate CPU%u to %u\n",
+				(is_shutdown) ? "Shutdown" : "Suspend", cpu,
+				mitigation_freq);
+		}
+	}
+
+	if (!update)
+		goto notify_exit;
+
+	if (freq_mitigation_task)
+		complete(&freq_mitigation_complete);
+	else
+		pr_err("Freq mitigation task is not initialized\n");
+notify_exit:
+	return;
+}
+
+static int msm_thermal_power_down_callback(
+		struct notifier_block *nfb, unsigned long action, void *data)
+{
+
+	switch (action) {
+	case SYS_RESTART:
+	case SYS_POWER_OFF:
+	case SYS_HALT:
+		msm_thermal_update_freq(true, true);
+		break;
+
+	default:
+		return NOTIFY_DONE;
+	}
+
+	return NOTIFY_OK;
+}
+
+static int msm_thermal_suspend_callback(
+	struct notifier_block *nfb, unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_SUSPEND_PREPARE:
+		msm_thermal_update_freq(false, true);
+		break;
+
+	case PM_POST_HIBERNATION:
+	case PM_POST_SUSPEND:
+		msm_thermal_update_freq(false, false);
+		if (hotplug_task)
+			complete(&hotplug_notify_complete);
+		else
+			pr_debug("Hotplug task not initialized\n");
+		break;
+
+	default:
+		return NOTIFY_DONE;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block msm_thermal_reboot_notifier = {
+	.notifier_call = msm_thermal_power_down_callback,
+};
+
+static struct device_manager_data *find_device_by_name(const char *device_name)
+{
+	struct device_manager_data *dev_mgr = NULL;
+
+	list_for_each_entry(dev_mgr, &devices_list, dev_ptr) {
+		if (strcmp(dev_mgr->device_name, device_name) == 0)
+			return dev_mgr;
+	}
+
+	return NULL;
+}
+
+static int validate_client(struct device_clnt_data *clnt)
+{
+	int ret = 0;
+	struct device_manager_data *dev_mgr = NULL;
+	struct device_clnt_data *client_ptr = NULL;
+
+	if (!clnt || !clnt->dev_mgr) {
+		pr_err("Invalid client\n");
+		ret = -EINVAL;
+		goto validate_exit;
+	}
+
+	list_for_each_entry(dev_mgr, &devices_list, dev_ptr) {
+		if (dev_mgr == clnt->dev_mgr)
+			break;
+	}
+	if (dev_mgr != clnt->dev_mgr) {
+		pr_err("Invalid device manager\n");
+		ret = -EINVAL;
+		goto validate_exit;
+	}
+
+	mutex_lock(&dev_mgr->clnt_lock);
+	list_for_each_entry(client_ptr, &dev_mgr->client_list, clnt_ptr) {
+		if (clnt == client_ptr)
+			break;
+	}
+	if (clnt != client_ptr) {
+		pr_err("Invalid client\n");
+		ret = -EINVAL;
+		goto validate_unlock;
+	}
+validate_unlock:
+	mutex_unlock(&dev_mgr->clnt_lock);
+
+validate_exit:
+	return ret;
+}
+
+static int devmgr_client_cpufreq_update(struct device_manager_data *dev_mgr)
+{
+	int ret = 0;
+	struct device_clnt_data *clnt = NULL;
+	uint32_t max_freq = UINT_MAX;
+	uint32_t min_freq = 0;
+
+	mutex_lock(&dev_mgr->clnt_lock);
+	list_for_each_entry(clnt, &dev_mgr->client_list, clnt_ptr) {
+		if (!clnt->req_active)
+			continue;
+		max_freq = min(max_freq, clnt->request.freq.max_freq);
+		min_freq = max(min_freq, clnt->request.freq.min_freq);
+	}
+	if (dev_mgr->active_req.freq.max_freq == max_freq &&
+		dev_mgr->active_req.freq.min_freq == min_freq) {
+		goto update_exit;
+	}
+	dev_mgr->active_req.freq.max_freq = max_freq;
+	dev_mgr->active_req.freq.min_freq = min_freq;
+
+	if (freq_mitigation_task) {
+		complete(&freq_mitigation_complete);
+	} else {
+		pr_err("Frequency mitigation task is not initialized\n");
+		ret = -ESRCH;
+	}
+
+update_exit:
+	mutex_unlock(&dev_mgr->clnt_lock);
+	return ret;
+}
+
+static int devmgr_client_hotplug_update(struct device_manager_data *dev_mgr)
+{
+	int ret = 0;
+	struct device_clnt_data *clnt = NULL;
+	cpumask_t offline_mask = CPU_MASK_NONE;
+
+	mutex_lock(&dev_mgr->clnt_lock);
+	list_for_each_entry(clnt, &dev_mgr->client_list, clnt_ptr) {
+		if (!clnt->req_active)
+			continue;
+		cpumask_or(&offline_mask, &offline_mask,
+				&clnt->request.offline_mask);
+	}
+	if (cpumask_equal(&dev_mgr->active_req.offline_mask, &offline_mask))
+		goto update_exit;
+
+	cpumask_copy(&dev_mgr->active_req.offline_mask, &offline_mask);
+
+	if (hotplug_task) {
+		complete(&hotplug_notify_complete);
+	} else {
+		pr_err("Hotplug task is not initialized\n");
+		ret = -ESRCH;
+	}
+
+update_exit:
+	mutex_unlock(&dev_mgr->clnt_lock);
+	return ret;
+}
+
+static int devmgr_hotplug_client_request_validate_and_update(
+				struct device_clnt_data *clnt,
+				union device_request *req,
+				enum device_req_type type)
+{
+	if (type != HOTPLUG_MITIGATION_REQ)
+		return -EINVAL;
+
+	cpumask_copy(&clnt->request.offline_mask, &req->offline_mask);
+
+	if (!cpumask_empty(&req->offline_mask))
+		clnt->req_active = true;
+	else
+		clnt->req_active = false;
+
+	return 0;
+}
+
+static int devmgr_cpufreq_client_request_validate_and_update(
+						struct device_clnt_data *clnt,
+						union device_request *req,
+						enum device_req_type type)
+{
+	if (type != CPUFREQ_MITIGATION_REQ)
+		return -EINVAL;
+
+	if (req->freq.max_freq < req->freq.min_freq) {
+		pr_err("Invalid Max and Min freq req. max:%u min:%u\n",
+			req->freq.max_freq, req->freq.min_freq);
+		return -EINVAL;
+	}
+
+	clnt->request.freq.max_freq = req->freq.max_freq;
+	clnt->request.freq.min_freq = req->freq.min_freq;
+
+	if ((req->freq.max_freq == CPUFREQ_MAX_NO_MITIGATION) &&
+		(req->freq.min_freq == CPUFREQ_MIN_NO_MITIGATION))
+		clnt->req_active = false;
+	else
+		clnt->req_active = true;
+
+	return 0;
+}
+
+int devmgr_client_request_mitigation(struct device_clnt_data *clnt,
+					enum device_req_type type,
+					union device_request *req)
+{
+	int ret = 0;
+	struct device_manager_data *dev_mgr = NULL;
+
+	if (!clnt || !req) {
+		pr_err("Invalid inputs for mitigation.\n");
+		ret = -EINVAL;
+		goto req_exit;
+	}
+
+	ret = validate_client(clnt);
+	if (ret) {
+		pr_err("Invalid mitigation client. ret:%d\n", ret);
+		goto req_exit;
+	}
+
+	if (!clnt->dev_mgr->request_validate) {
+		pr_err("Invalid dev mgr request update\n");
+		ret = -EINVAL;
+		goto req_exit;
+	}
+
+	dev_mgr = clnt->dev_mgr;
+	mutex_lock(&dev_mgr->clnt_lock);
+	ret = dev_mgr->request_validate(clnt, req, type);
+	if (ret) {
+		pr_err("Invalid client request\n");
+		goto req_unlock;
+	}
+
+req_unlock:
+	mutex_unlock(&dev_mgr->clnt_lock);
+	if (!ret && dev_mgr->update)
+		dev_mgr->update(dev_mgr);
+
+req_exit:
+	return ret;
+}
+
+struct device_clnt_data *devmgr_register_mitigation_client(struct device *dev,
+				const char *device_name,
+				void (*callback)(struct device_clnt_data *,
+				union device_request *, void *))
+{
+	struct device_clnt_data *client = NULL;
+	struct device_manager_data *dev_mgr = NULL;
+
+	if (!dev || !device_name) {
+		pr_err("Invalid input\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	dev_mgr = find_device_by_name(device_name);
+	if (!dev_mgr) {
+		pr_err("Invalid device %s\n", device_name);
+		return ERR_PTR(-EINVAL);
+	}
+
+	client = devm_kzalloc(dev,
+		sizeof(struct device_clnt_data), GFP_KERNEL);
+	if (!client) {
+		pr_err("Memory alloc failed\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	mutex_lock(&dev_mgr->clnt_lock);
+	client->dev_mgr = dev_mgr;
+	client->callback = callback;
+	list_add_tail(&client->clnt_ptr, &dev_mgr->client_list);
+	mutex_unlock(&dev_mgr->clnt_lock);
+
+	return client;
+}
+
+void devmgr_unregister_mitigation_client(struct device *dev,
+					struct device_clnt_data *clnt)
+{
+	int ret = 0;
+	struct device_manager_data *dev_mgr = NULL;
+
+	if (!clnt) {
+		pr_err("Invalid input\n");
+		return;
+	}
+
+	ret = validate_client(clnt);
+	if (ret)
+		return;
+
+	dev_mgr = clnt->dev_mgr;
+	mutex_lock(&dev_mgr->clnt_lock);
+	list_del(&clnt->clnt_ptr);
+	mutex_unlock(&dev_mgr->clnt_lock);
+	devm_kfree(dev, clnt);
+	if (dev_mgr->update)
+		dev_mgr->update(dev_mgr);
+}
+
 static int  msm_thermal_cpufreq_callback(struct notifier_block *nfb,
 		unsigned long event, void *data)
 {
@@ -406,8 +834,19 @@ static struct notifier_block msm_thermal_cpufreq_notifier = {
 static void update_cpu_freq(int cpu)
 {
 	int ret = 0;
+	cpumask_t mask;
 
+	get_cluster_mask(cpu, &mask);
 	if (cpu_online(cpu)) {
+		if ((cpumask_intersects(&mask, &throttling_mask))
+			&& (cpus[cpu].limited_max_freq
+				>= get_core_max_freq(cpu))) {
+			cpumask_xor(&throttling_mask, &mask, &throttling_mask);
+			set_cpu_throttled(&mask, false);
+		} else if (!cpumask_intersects(&mask, &throttling_mask)) {
+			cpumask_or(&throttling_mask, &mask, &throttling_mask);
+			set_cpu_throttled(&mask, true);
+		}
 		trace_thermal_pre_frequency_mit(cpu,
 			cpus[cpu].limited_max_freq,
 			cpus[cpu].limited_min_freq);
@@ -672,6 +1111,13 @@ static void update_cpu_topology(struct device *dev)
 	core_ptr->entity_count = cluster_cnt;
 	core_ptr->cluster_id = -1;
 	core_ptr->sync_cluster = false;
+
+	sync_cluster_id = get_sync_cluster(dev, &sync_cluster_cnt);
+	if (!sync_cluster_id) {
+		devm_kfree(dev, core_ptr);
+		core_ptr = NULL;
+		return;
+	}
 	temp_ptr = devm_kzalloc(dev, sizeof(struct cluster_info) * cluster_cnt,
 					GFP_KERNEL);
 	if (!temp_ptr) {
@@ -680,8 +1126,6 @@ static void update_cpu_topology(struct device *dev)
 		core_ptr = NULL;
 		return;
 	}
-
-	sync_cluster_id = get_sync_cluster(dev, &sync_cluster_cnt);
 
 	for (i = 0; i < cluster_cnt; i++) {
 		pr_debug("Cluster_ID:%d CPU's:%lu\n", cluster_id[i],
@@ -709,7 +1153,8 @@ static void update_cpu_topology(struct device *dev)
 static int __ref init_cluster_freq_table(void)
 {
 	uint32_t _cluster = 0, _cpu = 0, table_len = 0, idx = 0;
-	int ret = 0;
+	int ret = 0, cpu_set;
+	char buf[CPU_BUF_SIZE];
 	struct cluster_info *cluster_ptr = NULL;
 	struct cpufreq_policy *policy = NULL;
 	struct cpufreq_frequency_table *freq_table_ptr = NULL;
@@ -741,10 +1186,22 @@ static int __ref init_cluster_freq_table(void)
 				cluster_ptr->cluster_id, _cpu);
 			pending_cpu_freq = _cpu;
 			if (!cpu_online(_cpu)) {
+				cpu_set = cpumask_test_cpu(_cpu,
+						cpus_previously_online);
 #ifdef CONFIG_SMP
 				cpu_up(_cpu);
 				cpu_down(_cpu);
 #endif
+				/* Remove prev online bit if we are first to
+				   put it online */
+				if (!cpu_set) {
+					cpumask_clear_cpu(_cpu,
+						cpus_previously_online);
+					cpumask_scnprintf(buf, sizeof(buf),
+						cpus_previously_online);
+					pr_debug("Reset prev online to %s\n",
+						 buf);
+				}
 			}
 			freq_table_ptr = pending_freq_table_ptr;
 		}
@@ -1674,7 +2131,7 @@ static struct notifier_block msm_thermal_panic_notifier = {
 	.notifier_call = msm_thermal_panic_callback,
 };
 
-static int set_threshold(uint32_t zone_id,
+int sensor_mgr_set_threshold(uint32_t zone_id,
 	struct sensor_threshold *threshold)
 {
 	int i = 0, ret = 0;
@@ -1692,7 +2149,7 @@ static int set_threshold(uint32_t zone_id,
 			zone_id, ret);
 		goto set_threshold_exit;
 	}
-
+	pr_debug("Sensor:[%d] temp:[%ld]\n", zone_id, temp);
 	while (i < MAX_THRESHOLD) {
 		switch (threshold[i].trip) {
 		case THERMAL_TRIP_CONFIGURABLE_HI:
@@ -1701,6 +2158,8 @@ static int set_threshold(uint32_t zone_id,
 					&threshold[i]);
 				if (ret)
 					goto set_threshold_exit;
+				UPDATE_THRESHOLD_SET(ret,
+					THERMAL_TRIP_CONFIGURABLE_HI);
 			}
 			break;
 		case THERMAL_TRIP_CONFIGURABLE_LOW:
@@ -1709,6 +2168,8 @@ static int set_threshold(uint32_t zone_id,
 					&threshold[i]);
 				if (ret)
 					goto set_threshold_exit;
+				UPDATE_THRESHOLD_SET(ret,
+					THERMAL_TRIP_CONFIGURABLE_LOW);
 			}
 			break;
 		default:
@@ -1853,7 +2314,8 @@ static void vdd_mx_notify(struct therm_threshold *trig_thresh)
 			pr_err("Failed to remove vdd mx restriction\n");
 	}
 	mutex_unlock(&vdd_mx_mutex);
-	set_threshold(trig_thresh->sensor_id, trig_thresh->threshold);
+	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+					trig_thresh->threshold);
 }
 
 static void msm_thermal_bite(int tsens_id, long temp)
@@ -1929,7 +2391,8 @@ static void therm_reset_notify(struct therm_threshold *thresh_data)
 		pr_err("Invalid trip type\n");
 		break;
 	}
-	set_threshold(thresh_data->sensor_id, thresh_data->threshold);
+	sensor_mgr_set_threshold(thresh_data->sensor_id,
+					thresh_data->threshold);
 }
 
 #ifdef CONFIG_SMP
@@ -1951,13 +2414,15 @@ static void __ref do_core_control(long temp)
 				continue;
 			pr_info("Set Offline: CPU%d Temp: %ld\n",
 					i, temp);
-			trace_thermal_pre_core_offline(i);
-			ret = cpu_down(i);
-			if (ret)
-				pr_err("Error %d offline core %d\n",
-					ret, i);
-			trace_thermal_post_core_offline(i,
-				cpumask_test_cpu(i, cpu_online_mask));
+			if (cpu_online(i)) {
+				trace_thermal_pre_core_offline(i);
+				ret = cpu_down(i);
+				if (ret)
+					pr_err("Error %d offline core %d\n",
+					       ret, i);
+				trace_thermal_post_core_offline(i,
+					cpumask_test_cpu(i, cpu_online_mask));
+			}
 			cpus_offlined |= BIT(i);
 			break;
 		}
@@ -1975,6 +2440,10 @@ static void __ref do_core_control(long temp)
 			 * next offlined core.
 			 */
 			if (cpu_online(i))
+				continue;
+			/* If this core wasn't previously online don't put it
+			   online */
+			if (!(cpumask_test_cpu(i, cpus_previously_online)))
 				continue;
 			trace_thermal_pre_core_online(i);
 			ret = cpu_up(i);
@@ -2017,15 +2486,21 @@ static int __ref update_offline_cores(int val)
 		} else if (online_core && (previous_cpus_offlined & BIT(cpu))) {
 			if (cpu_online(cpu))
 				continue;
+			/* If this core wasn't previously online don't put it
+			   online */
+			if (!(cpumask_test_cpu(cpu, cpus_previously_online)))
+				continue;
 			trace_thermal_pre_core_online(cpu);
 			ret = cpu_up(cpu);
-			if (ret && ret == notifier_to_errno(NOTIFY_BAD))
+			if (ret && ret == notifier_to_errno(NOTIFY_BAD)) {
 				pr_debug("Onlining CPU%d is vetoed\n", cpu);
-			else if (ret)
+			} else if (ret) {
+				cpus_offlined |= BIT(cpu);
 				pr_err("Unable to online CPU%d. err:%d\n",
-						cpu, ret);
-			else
+					cpu, ret);
+			} else {
 				pr_debug("Onlined CPU%d\n", cpu);
+			}
 			trace_thermal_post_core_online(cpu,
 				cpumask_test_cpu(cpu, cpu_online_mask));
 		}
@@ -2037,12 +2512,15 @@ static __ref int do_hotplug(void *data)
 {
 	int ret = 0;
 	uint32_t cpu = 0, mask = 0;
+	struct device_clnt_data *clnt = NULL;
+	struct sched_param param = {.sched_priority = MAX_RT_PRIO-2};
 
 	if (!core_control_enabled) {
 		pr_debug("Core control disabled\n");
 		return -EINVAL;
 	}
 
+	sched_setscheduler(current, SCHED_FIFO, &param);
 	while (!kthread_should_stop()) {
 		while (wait_for_completion_interruptible(
 			&hotplug_notify_complete) != 0)
@@ -2054,17 +2532,48 @@ static __ref int do_hotplug(void *data)
 		for_each_possible_cpu(cpu) {
 			if (hotplug_enabled &&
 				cpus[cpu].hotplug_thresh_clear) {
-				set_threshold(cpus[cpu].sensor_id,
+				ret =
+				sensor_mgr_set_threshold(cpus[cpu].sensor_id,
 				&cpus[cpu].threshold[HOTPLUG_THRESHOLD_HIGH]);
 
+				if (cpus[cpu].offline
+					&& !IS_LOW_THRESHOLD_SET(ret))
+					cpus[cpu].offline = 0;
 				cpus[cpu].hotplug_thresh_clear = false;
 			}
 			if (cpus[cpu].offline || cpus[cpu].user_offline)
 				mask |= BIT(cpu);
 		}
-		if (mask != cpus_offlined)
-			update_offline_cores(mask);
+		if (devices && devices->hotplug_dev) {
+			mutex_lock(&devices->hotplug_dev->clnt_lock);
+			for_each_cpu_mask(cpu,
+				devices->hotplug_dev->active_req.offline_mask)
+				mask |= BIT(cpu);
+			mutex_unlock(&devices->hotplug_dev->clnt_lock);
+		}
+		update_offline_cores(mask);
 		mutex_unlock(&core_control_mutex);
+
+		if (devices && devices->hotplug_dev) {
+			union device_request req;
+
+			req.offline_mask = CPU_MASK_NONE;
+			mutex_lock(&devices->hotplug_dev->clnt_lock);
+			for_each_cpu_mask(cpu,
+				devices->hotplug_dev->active_req.offline_mask)
+				if (mask & BIT(cpu))
+					cpumask_test_and_set_cpu(cpu,
+						&req.offline_mask);
+
+			list_for_each_entry(clnt,
+					&devices->hotplug_dev->client_list,
+					clnt_ptr) {
+				if (clnt->callback)
+					clnt->callback(clnt, &req,
+							clnt->usr_data);
+			}
+			mutex_unlock(&devices->hotplug_dev->clnt_lock);
+		}
 		sysfs_notify(cc_kobj, NULL, "cpus_offlined");
 	}
 
@@ -2483,7 +2992,11 @@ static int __ref msm_thermal_cpu_callback(struct notifier_block *nfb,
 {
 	uint32_t cpu = (uintptr_t)hcpu;
 
-	if (action == CPU_UP_PREPARE || action == CPU_UP_PREPARE_FROZEN) {
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_UP_PREPARE:
+		if (!cpumask_test_and_set_cpu(cpu, cpus_previously_online))
+			pr_debug("Total prev cores online tracked %u\n",
+				cpumask_weight(cpus_previously_online));
 		if (core_control_enabled &&
 			(msm_thermal_info.core_control_mask & BIT(cpu)) &&
 			(cpus_offlined & BIT(cpu))) {
@@ -2491,6 +3004,32 @@ static int __ref msm_thermal_cpu_callback(struct notifier_block *nfb,
 				cpu);
 			return NOTIFY_BAD;
 		}
+		break;
+	case CPU_DOWN_PREPARE:
+		if (!cpumask_test_and_set_cpu(cpu, cpus_previously_online))
+			pr_debug("Total prev cores online tracked %u\n",
+				cpumask_weight(cpus_previously_online));
+		break;
+	case CPU_ONLINE:
+		if (core_control_enabled &&
+			(msm_thermal_info.core_control_mask & BIT(cpu)) &&
+			(cpus_offlined & BIT(cpu))) {
+			if (hotplug_task) {
+				pr_debug("Re-evaluate and hotplug CPU%d\n",
+					cpu);
+				complete(&hotplug_notify_complete);
+			} else {
+				/*
+				 * This will be auto-corrected next time
+				 * do_core_control() is called
+				 */
+				pr_err("CPU%d online, after thermal veto\n",
+					cpu);
+			}
+		}
+		break;
+	default:
+		break;
 	}
 
 	pr_debug("voting for CPU%d to be online\n", cpu);
@@ -2504,7 +3043,8 @@ static int hotplug_notify(enum thermal_trip_type type, int temp, void *data)
 {
 	struct cpu_info *cpu_node = (struct cpu_info *)data;
 
-	pr_info("%s reach temp threshold: %d\n", cpu_node->sensor_type, temp);
+	pr_info_ratelimited("%s reach temp threshold: %d\n",
+			       cpu_node->sensor_type, temp);
 
 	if (!(msm_thermal_info.core_control_mask & BIT(cpu_node->cpu)))
 		return 0;
@@ -2593,7 +3133,7 @@ static void hotplug_init(void)
 		hi_thresh->notify = low_thresh->notify = hotplug_notify;
 		hi_thresh->data = low_thresh->data = (void *)&cpus[cpu];
 
-		set_threshold(cpus[cpu].sensor_id, hi_thresh);
+		sensor_mgr_set_threshold(cpus[cpu].sensor_id, hi_thresh);
 	}
 init_kthread:
 	init_completion(&hotplug_notify_complete);
@@ -2615,14 +3155,17 @@ static __ref int do_freq_mitigation(void *data)
 {
 	int ret = 0;
 	uint32_t cpu = 0, max_freq_req = 0, min_freq_req = 0;
+	struct sched_param param = {.sched_priority = MAX_RT_PRIO-1};
+	struct device_clnt_data *clnt = NULL;
+	struct device_manager_data *cpu_dev = NULL;
 
+	sched_setscheduler(current, SCHED_FIFO, &param);
 	while (!kthread_should_stop()) {
 		while (wait_for_completion_interruptible(
 			&freq_mitigation_complete) != 0)
 			;
 		INIT_COMPLETION(freq_mitigation_complete);
 
-		get_online_cpus();
 		for_each_possible_cpu(cpu) {
 			max_freq_req = (cpus[cpu].max_freq) ?
 					msm_thermal_info.freq_limit :
@@ -2630,8 +3173,24 @@ static __ref int do_freq_mitigation(void *data)
 			max_freq_req = min(max_freq_req,
 					cpus[cpu].user_max_freq);
 
+			max_freq_req = min(max_freq_req,
+					cpus[cpu].shutdown_max_freq);
+
+			max_freq_req = min(max_freq_req,
+					cpus[cpu].suspend_max_freq);
+
 			min_freq_req = max(min_freq_limit,
 					cpus[cpu].user_min_freq);
+
+			if (devices && devices->cpufreq_dev[cpu]) {
+				cpu_dev = devices->cpufreq_dev[cpu];
+				mutex_lock(&cpu_dev->clnt_lock);
+				max_freq_req = min(max_freq_req,
+					cpu_dev->active_req.freq.max_freq);
+				min_freq_req = max(min_freq_req,
+					cpu_dev->active_req.freq.min_freq);
+				mutex_unlock(&cpu_dev->clnt_lock);
+			}
 
 			if ((max_freq_req == cpus[cpu].limited_max_freq)
 				&& (min_freq_req ==
@@ -2643,16 +3202,39 @@ static __ref int do_freq_mitigation(void *data)
 			if (!SYNC_CORE(cpu))
 				update_cpu_freq(cpu);
 reset_threshold:
+			if (!SYNC_CORE(cpu) &&
+				devices && devices->cpufreq_dev[cpu]) {
+				union device_request req;
+
+				req.freq.max_freq = max_freq_req;
+				req.freq.min_freq = min_freq_req;
+				cpu_dev = devices->cpufreq_dev[cpu];
+				mutex_lock(&cpu_dev->clnt_lock);
+				list_for_each_entry(clnt,
+					&cpu_dev->client_list,
+					clnt_ptr) {
+					if (clnt->callback)
+						clnt->callback(clnt,
+							&req,
+							clnt->usr_data);
+				}
+				mutex_unlock(&cpu_dev->clnt_lock);
+			}
 			if (freq_mitigation_enabled &&
 				cpus[cpu].freq_thresh_clear) {
-				set_threshold(cpus[cpu].sensor_id,
+				ret =
+				sensor_mgr_set_threshold(cpus[cpu].sensor_id,
 				&cpus[cpu].threshold[FREQ_THRESHOLD_HIGH]);
 
+				if (cpus[cpu].max_freq
+					&& !IS_LOW_THRESHOLD_SET(ret)) {
+					cpus[cpu].max_freq = false;
+					complete(&freq_mitigation_complete);
+				}
 				cpus[cpu].freq_thresh_clear = false;
 			}
 		}
 		update_cluster_freq();
-		put_online_cpus();
 	}
 	return ret;
 }
@@ -2672,16 +3254,17 @@ static int freq_mitigation_notify(enum thermal_trip_type type,
 	switch (type) {
 	case THERMAL_TRIP_CONFIGURABLE_HI:
 		if (!cpu_node->max_freq) {
-			pr_info("Mitigating CPU%d frequency to %d\n",
-				cpu_node->cpu,
-				msm_thermal_info.freq_limit);
+			pr_info_ratelimited(
+				"Mitigating CPU%d frequency to %d\n",
+				cpu_node->cpu, msm_thermal_info.freq_limit);
 
 			cpu_node->max_freq = true;
 		}
 		break;
 	case THERMAL_TRIP_CONFIGURABLE_LOW:
 		if (cpu_node->max_freq) {
-			pr_info("Removing frequency mitigation for CPU%d\n",
+			pr_info_ratelimited(
+				"Removing frequency mitigation for CPU%d\n",
 				cpu_node->cpu);
 
 			cpu_node->max_freq = false;
@@ -2726,7 +3309,7 @@ static void freq_mitigation_init(void)
 			freq_mitigation_notify;
 		hi_thresh->data = low_thresh->data = (void *)&cpus[cpu];
 
-		set_threshold(cpus[cpu].sensor_id, hi_thresh);
+		sensor_mgr_set_threshold(cpus[cpu].sensor_id, hi_thresh);
 	}
 init_freq_thread:
 	init_completion(&freq_mitigation_complete);
@@ -2771,6 +3354,67 @@ int msm_thermal_get_freq_plan_size(uint32_t cluster, unsigned int *table_len)
 
 	pr_err("Invalid cluster ID:%d\n", cluster);
 	return -EINVAL;
+}
+
+int msm_thermal_get_cluster_voltage_plan(uint32_t cluster, uint32_t *table_ptr)
+{
+	int i = 0, corner = 0;
+	struct opp *opp = NULL;
+	unsigned int table_len = 0;
+	struct device *cpu_dev = NULL;
+	struct cluster_info *cluster_ptr = NULL;
+
+	if (!core_ptr) {
+		pr_err("Topology ptr not initialized\n");
+		return -ENODEV;
+	}
+	if (!table_ptr) {
+		pr_err("Invalid input\n");
+		return -EINVAL;
+	}
+	if (!freq_table_get)
+		check_freq_table();
+
+	for (i = 0; i < core_ptr->entity_count; i++) {
+		cluster_ptr = &core_ptr->child_entity_ptr[i];
+		if (cluster_ptr->cluster_id == cluster)
+			break;
+	}
+	if (i == core_ptr->entity_count) {
+		pr_err("Invalid cluster ID:%d\n", cluster);
+		return -EINVAL;
+	}
+	if (!cluster_ptr->freq_table) {
+		pr_err("Cluster%d clock plan not initialized\n", cluster);
+		return -EINVAL;
+	}
+
+	cpu_dev = get_cpu_device(first_cpu(cluster_ptr->cluster_cores));
+	table_len =  cluster_ptr->freq_idx_high + 1;
+
+	rcu_read_lock();
+	for (i = 0; i < table_len; i++) {
+		opp = dev_pm_opp_find_freq_exact(cpu_dev,
+			cluster_ptr->freq_table[i].frequency * 1000, true);
+		if (IS_ERR(opp)) {
+			pr_err("Error on OPP freq :%d\n",
+				cluster_ptr->freq_table[i].frequency);
+			return -EINVAL;
+		}
+		corner = dev_pm_opp_get_voltage(opp);
+		if (corner == 0) {
+			pr_err("Bad voltage corner for OPP freq :%d\n",
+				cluster_ptr->freq_table[i].frequency);
+			return -EINVAL;
+		}
+		table_ptr[i] = corner / 1000;
+		pr_debug("Cluster:%d freq:%d Khz voltage:%d mV\n",
+			cluster, cluster_ptr->freq_table[i].frequency,
+			table_ptr[i]);
+	}
+	rcu_read_unlock();
+
+	return 0;
 }
 
 int msm_thermal_get_cluster_freq_plan(uint32_t cluster, unsigned int *table_ptr)
@@ -2910,9 +3554,9 @@ int therm_set_threshold(struct threshold_info *thresh_inp)
 	for (i = 0; i < thresh_inp->thresh_ct; i++) {
 		thresh_ptr = &thresh_inp->thresh_list[i];
 		thresh_ptr->trip_triggered = -1;
-		err = set_threshold(thresh_ptr->sensor_id,
+		err = sensor_mgr_set_threshold(thresh_ptr->sensor_id,
 			thresh_ptr->threshold);
-		if (err) {
+		if (err < 0) {
 			ret = err;
 			err = 0;
 		}
@@ -2964,7 +3608,8 @@ static void cx_phase_ctrl_notify(struct therm_threshold *trig_thresh)
 cx_phase_unlock_exit:
 	mutex_unlock(&cx_mutex);
 cx_phase_ctrl_exit:
-	set_threshold(trig_thresh->sensor_id, trig_thresh->threshold);
+	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+					trig_thresh->threshold);
 	return;
 }
 
@@ -3092,7 +3737,8 @@ static void vdd_restriction_notify(struct therm_threshold *trig_thresh)
 unlock_and_exit:
 	mutex_unlock(&vdd_rstr_mutex);
 set_and_exit:
-	set_threshold(trig_thresh->sensor_id, trig_thresh->threshold);
+	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+					trig_thresh->threshold);
 	return;
 }
 
@@ -3140,14 +3786,16 @@ static void ocr_notify(struct therm_threshold *trig_thresh)
 unlock_and_exit:
 	mutex_unlock(&ocr_mutex);
 set_and_exit:
-	set_threshold(trig_thresh->sensor_id, trig_thresh->threshold);
+	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+					trig_thresh->threshold);
 	return;
 }
 
 static __ref int do_thermal_monitor(void *data)
 {
-	int ret = 0, i, j;
+	int ret = 0, j;
 	struct therm_threshold *sensor_list;
+	struct threshold_info *thresholds = NULL;
 
 	while (!kthread_should_stop()) {
 		while (wait_for_completion_interruptible(
@@ -3155,18 +3803,20 @@ static __ref int do_thermal_monitor(void *data)
 			;
 		INIT_COMPLETION(thermal_monitor_complete);
 
-		for (i = 0; i < MSM_LIST_MAX_NR; i++) {
-			if (!thresh[i].thresh_triggered)
+		mutex_lock(&threshold_mutex);
+		list_for_each_entry(thresholds, &thresholds_list, list_ptr) {
+			if (!thresholds->thresh_triggered)
 				continue;
-			thresh[i].thresh_triggered = false;
-			for (j = 0; j < thresh[i].thresh_ct; j++) {
-				sensor_list = &thresh[i].thresh_list[j];
+			thresholds->thresh_triggered = false;
+			for (j = 0; j < thresholds->thresh_ct; j++) {
+				sensor_list = &thresholds->thresh_list[j];
 				if (sensor_list->trip_triggered < 0)
 					continue;
 				sensor_list->notify(sensor_list);
 				sensor_list->trip_triggered = -1;
 			}
 		}
+		mutex_unlock(&threshold_mutex);
 	}
 	return ret;
 }
@@ -3202,6 +3852,24 @@ static int convert_to_zone_id(struct threshold_info *thresh_inp)
 	}
 
 convert_to_exit:
+	return ret;
+}
+
+int sensor_mgr_convert_id_and_set_threshold(struct threshold_info *thresh_inp)
+{
+	int ret = 0;
+
+	if (!thresh_inp) {
+		pr_err("Invalid input\n");
+		ret = -EINVAL;
+		goto therm_set_exit;
+	}
+	ret = convert_to_zone_id(thresh_inp);
+	if (ret)
+		goto therm_set_exit;
+	ret = therm_set_threshold(thresh_inp);
+
+therm_set_exit:
 	return ret;
 }
 
@@ -3267,45 +3935,46 @@ static int msm_thermal_notify(enum thermal_trip_type type, int temp, void *data)
 	return 0;
 }
 
-static int init_threshold(enum msm_thresh_list index,
-	int sensor_id, int32_t hi_temp, int32_t low_temp,
+int sensor_mgr_init_threshold(struct device *dev,
+	struct threshold_info *thresh_inp,
+	int sensor_id, int32_t high_temp, int32_t low_temp,
 	void (*callback)(struct therm_threshold *))
 {
 	int ret = 0, i;
 	struct therm_threshold *thresh_ptr;
 
-	if (!callback || index >= MSM_LIST_MAX_NR || index < 0
+	if (!dev || !callback || !thresh_inp
 		|| sensor_id == -ENODEV) {
-		pr_err("Invalid input. sensor:%d. index:%d\n",
-				sensor_id, index);
+		pr_err("Invalid input\n");
 		ret = -EINVAL;
 		goto init_thresh_exit;
 	}
-	if (thresh[index].thresh_list) {
-		pr_info("threshold id:%d already initialized\n", index);
+	if (thresh_inp->thresh_list) {
+		pr_info("threshold id already initialized\n");
 		goto init_thresh_exit;
 	}
 
-	thresh[index].thresh_ct = (sensor_id == MONITOR_ALL_TSENS) ?
+	mutex_lock(&threshold_mutex);
+	thresh_inp->thresh_ct = (sensor_id == MONITOR_ALL_TSENS) ?
 						max_tsens_num : 1;
-	thresh[index].thresh_triggered = false;
-	thresh[index].thresh_list = kzalloc(sizeof(struct therm_threshold) *
-					thresh[index].thresh_ct, GFP_KERNEL);
-	if (!thresh[index].thresh_list) {
-		pr_err("kzalloc failed for thresh index:%d\n", index);
+	thresh_inp->thresh_triggered = false;
+	thresh_inp->thresh_list = kzalloc(sizeof(struct therm_threshold) *
+					thresh_inp->thresh_ct, GFP_KERNEL);
+	if (!thresh_inp->thresh_list) {
+		pr_err("kzalloc failed for thresh\n");
 		ret = -ENOMEM;
-		goto init_thresh_exit;
+		goto init_thresh_unlock;
 	}
 
-	thresh_ptr = thresh[index].thresh_list;
+	thresh_ptr = thresh_inp->thresh_list;
 	if (sensor_id == MONITOR_ALL_TSENS) {
 		for (i = 0; i < max_tsens_num; i++) {
 			thresh_ptr[i].sensor_id = tsens_id_map[i];
 			thresh_ptr[i].id_type = THERM_TSENS_ID;
 			thresh_ptr[i].notify = callback;
 			thresh_ptr[i].trip_triggered = -1;
-			thresh_ptr[i].parent = &thresh[index];
-			thresh_ptr[i].threshold[0].temp = hi_temp;
+			thresh_ptr[i].parent = thresh_inp;
+			thresh_ptr[i].threshold[0].temp = high_temp;
 			thresh_ptr[i].threshold[0].trip =
 				THERMAL_TRIP_CONFIGURABLE_HI;
 			thresh_ptr[i].threshold[1].temp = low_temp;
@@ -3322,8 +3991,8 @@ static int init_threshold(enum msm_thresh_list index,
 		thresh_ptr->id_type = THERM_TSENS_ID;
 		thresh_ptr->notify = callback;
 		thresh_ptr->trip_triggered = -1;
-		thresh_ptr->parent = &thresh[index];
-		thresh_ptr->threshold[0].temp = hi_temp;
+		thresh_ptr->parent = thresh_inp;
+		thresh_ptr->threshold[0].temp = high_temp;
 		thresh_ptr->threshold[0].trip =
 			THERMAL_TRIP_CONFIGURABLE_HI;
 		thresh_ptr->threshold[1].temp = low_temp;
@@ -3334,9 +4003,36 @@ static int init_threshold(enum msm_thresh_list index,
 		thresh_ptr->threshold[0].data =
 		thresh_ptr->threshold[1].data = (void *)thresh_ptr;
 	}
+	list_add_tail(&thresh_inp->list_ptr, &thresholds_list);
+
+init_thresh_unlock:
+	mutex_unlock(&threshold_mutex);
 
 init_thresh_exit:
 	return ret;
+}
+
+void sensor_mgr_remove_threshold(struct device *dev,
+			struct threshold_info *thresh_inp)
+{
+	int i;
+	struct therm_threshold *thresh_ptr;
+
+	mutex_lock(&threshold_mutex);
+	for (i = 0; i < thresh_inp->thresh_ct; i++) {
+		thresh_ptr = &thresh_inp->thresh_list[i];
+		thresh_ptr->trip_triggered = -1;
+		sensor_cancel_trip(thresh_ptr->sensor_id,
+				&thresh_ptr->threshold[0]);
+		sensor_cancel_trip(thresh_ptr->sensor_id,
+				&thresh_ptr->threshold[1]);
+	}
+	kfree(thresh_inp->thresh_list);
+	thresh_inp->thresh_list = NULL;
+	thresh_inp->thresh_ct = 0;
+	thresh_inp->thresh_triggered = false;
+	list_del(&thresh_inp->list_ptr);
+	mutex_unlock(&threshold_mutex);
 }
 
 static int msm_thermal_add_gfx_nodes(void)
@@ -3531,6 +4227,7 @@ static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 	core_control_enabled = !!val;
 	if (core_control_enabled) {
 		pr_info("Core control enabled\n");
+		cpus_previously_online_update();
 		register_cpu_notifier(&msm_thermal_cpu_notifier);
 		/*
 		 * Re-evaluate thermal core condition, update current status
@@ -3544,7 +4241,7 @@ static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 				if (!(msm_thermal_info.core_control_mask &
 					BIT(cpus[cpu].cpu)))
 					continue;
-				set_threshold(cpus[cpu].sensor_id,
+				sensor_mgr_set_threshold(cpus[cpu].sensor_id,
 				&cpus[cpu].threshold[HOTPLUG_THRESHOLD_HIGH]);
 			}
 		}
@@ -3790,10 +4487,86 @@ pre_init_exit:
 	return ret;
 }
 
+static int devmgr_devices_init(struct platform_device *pdev)
+{
+	int ret = 0;
+	uint32_t cpu;
+	struct device_manager_data *dev_mgr = NULL;
+
+	devices = devm_kzalloc(&pdev->dev,
+				sizeof(struct devmgr_devices),
+				GFP_KERNEL);
+	if (!devices) {
+		pr_err("Malloc failed for devmgr devices\n");
+		ret = -ENOMEM;
+		goto device_exit;
+	}
+	if (num_possible_cpus() > 1) {
+		/* Add hotplug device */
+		dev_mgr = devm_kzalloc(&pdev->dev,
+		sizeof(struct device_manager_data),
+			GFP_KERNEL);
+		if (!dev_mgr) {
+			pr_err("Malloc failed for hotplug device\n");
+			ret = -ENOMEM;
+			goto device_exit;
+		}
+		snprintf(dev_mgr->device_name,
+				TSENS_NAME_MAX, HOTPLUG_DEVICE);
+		dev_mgr->request_validate =
+			devmgr_hotplug_client_request_validate_and_update;
+		dev_mgr->update = devmgr_client_hotplug_update;
+		HOTPLUG_NO_MITIGATION(&dev_mgr->active_req.offline_mask);
+		mutex_init(&dev_mgr->clnt_lock);
+		INIT_LIST_HEAD(&dev_mgr->client_list);
+		list_add_tail(&dev_mgr->dev_ptr, &devices_list);
+		devices->hotplug_dev = dev_mgr;
+	}
+	/*  Add cpu devices */
+	for_each_possible_cpu(cpu) {
+		dev_mgr = devm_kzalloc(&pdev->dev,
+		sizeof(struct device_manager_data),
+			GFP_KERNEL);
+		if (!dev_mgr) {
+			pr_err("Malloc failed for cpu%d device\n", cpu);
+			ret = -ENOMEM;
+			goto device_exit;
+		}
+		snprintf(dev_mgr->device_name, TSENS_NAME_MAX, CPU_DEVICE, cpu);
+		dev_mgr->request_validate =
+			devmgr_cpufreq_client_request_validate_and_update;
+		dev_mgr->update = devmgr_client_cpufreq_update;
+		dev_mgr->active_req.freq.max_freq = CPUFREQ_MAX_NO_MITIGATION;
+		dev_mgr->active_req.freq.min_freq = CPUFREQ_MIN_NO_MITIGATION;
+		mutex_init(&dev_mgr->clnt_lock);
+		INIT_LIST_HEAD(&dev_mgr->client_list);
+		list_add_tail(&dev_mgr->dev_ptr, &devices_list);
+		devices->cpufreq_dev[cpu] = dev_mgr;
+	}
+device_exit:
+	if (ret) {
+		if (devices) {
+			if (devices->hotplug_dev)
+				devm_kfree(&pdev->dev,
+					devices->hotplug_dev);
+			for_each_possible_cpu(cpu) {
+				if (devices->cpufreq_dev[cpu])
+					devm_kfree(&pdev->dev,
+					devices->cpufreq_dev[cpu]);
+			}
+		}
+	}
+	return ret;
+}
+
 int msm_thermal_init(struct msm_thermal_data *pdata)
 {
 	int ret = 0;
 	uint32_t cpu;
+
+	ret = devmgr_devices_init(pdata->pdev);
+	if (ret)
+		pr_err("cannot initialize devm devices. err:%d\n", ret);
 
 	for_each_possible_cpu(cpu) {
 		cpus[cpu].cpu = cpu;
@@ -3802,6 +4575,8 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 		cpus[cpu].hotplug_thresh_clear = false;
 		cpus[cpu].max_freq = false;
 		cpus[cpu].user_max_freq = UINT_MAX;
+		cpus[cpu].shutdown_max_freq = UINT_MAX;
+		cpus[cpu].suspend_max_freq = UINT_MAX;
 		cpus[cpu].user_min_freq = 0;
 		cpus[cpu].limited_max_freq = UINT_MAX;
 		cpus[cpu].limited_min_freq = 0;
@@ -3823,11 +4598,15 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 	if (ret)
 		pr_err("cannot register cpufreq notifier. err:%d\n", ret);
 
+	register_reboot_notifier(&msm_thermal_reboot_notifier);
+	pm_notifier(msm_thermal_suspend_callback, 0);
 	INIT_DELAYED_WORK(&check_temp_work, check_temp);
 	schedule_delayed_work(&check_temp_work, 0);
 
-	if (num_possible_cpus() > 1)
+	if (num_possible_cpus() > 1) {
+		cpus_previously_online_update();
 		register_cpu_notifier(&msm_thermal_cpu_notifier);
+	}
 
 	return ret;
 }
@@ -3953,6 +4732,56 @@ psm_reg_exit:
 			if (psm_rails[j].reg != NULL)
 				rpm_regulator_put(psm_rails[j].reg);
 		}
+	}
+
+	return ret;
+}
+
+static ssize_t bucket_info_store(struct kobject *kobj,
+	struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int ret = 0;
+	uint32_t val = 0;
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret) {
+		pr_err("Invalid input:%s. ret:%d", buf, ret);
+		goto done_store;
+	}
+
+	bucket = val & 0xff;
+	pr_debug("\"%s\"(PID:%i) request cluster:%d bucket:%d\n",
+		current->comm, current->pid, (bucket & 0xf0) >> 4,
+		bucket & 0xf);
+
+done_store:
+	return count;
+}
+
+static ssize_t bucket_info_show(
+	struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", bucket);
+}
+
+static struct kobj_attribute bucket_info_attr =
+		__ATTR_RW(bucket_info);
+static int msm_thermal_add_bucket_info_nodes(void)
+{
+	struct kobject *module_kobj = NULL;
+	int ret = 0;
+
+	module_kobj = kset_find_obj(module_kset, KBUILD_MODNAME);
+	if (!module_kobj) {
+		pr_err("cannot find kobject\n");
+		return -ENOENT;
+	}
+	sysfs_attr_init(&bucket_info_attr.attr);
+	ret = sysfs_create_file(module_kobj, &bucket_info_attr.attr);
+	if (ret) {
+		pr_err(
+		"cannot create bucket info kobject attribute. err:%d\n", ret);
+		return ret;
 	}
 
 	return ret;
@@ -4253,7 +5082,9 @@ static int probe_vdd_mx(struct device_node *node,
 		goto read_node_done;
 	}
 
-	ret = init_threshold(MSM_VDD_MX_RESTRICTION, MONITOR_ALL_TSENS,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+			&thresh[MSM_VDD_MX_RESTRICTION],
+			MONITOR_ALL_TSENS,
 			data->vdd_mx_temp_degC + data->vdd_mx_temp_hyst_degC,
 			data->vdd_mx_temp_degC, vdd_mx_notify);
 
@@ -4361,7 +5192,9 @@ static int probe_vdd_rstr(struct device_node *node,
 					ret);
 			goto read_node_fail;
 		}
-		ret = init_threshold(MSM_VDD_RESTRICTION, MONITOR_ALL_TSENS,
+		ret = sensor_mgr_init_threshold(&pdev->dev,
+			&thresh[MSM_VDD_RESTRICTION],
+			MONITOR_ALL_TSENS,
 			data->vdd_rstr_temp_hyst_degC, data->vdd_rstr_temp_degC,
 			vdd_restriction_notify);
 		if (ret) {
@@ -4535,7 +5368,8 @@ static int probe_ocr(struct device_node *node, struct msm_thermal_data *data,
 		}
 	}
 
-	ret = init_threshold(MSM_OCR, data->ocr_sensor_id,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+		&thresh[MSM_OCR], data->ocr_sensor_id,
 		data->ocr_temp_degC,
 		data->ocr_temp_degC - data->ocr_temp_hyst_degC,
 		ocr_notify);
@@ -4769,7 +5603,9 @@ static int probe_gfx_phase_ctrl(struct device_node *node,
 		goto probe_gfx_crit;
 	}
 
-	ret = init_threshold(MSM_GFX_PHASE_CTRL_WARM, data->gfx_sensor,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+		&thresh[MSM_GFX_PHASE_CTRL_WARM],
+		data->gfx_sensor,
 		data->gfx_phase_warm_temp_degC, data->gfx_phase_warm_temp_degC -
 		data->gfx_phase_warm_temp_hyst_degC,
 		gfx_phase_ctrl_notify);
@@ -4794,7 +5630,9 @@ probe_gfx_crit:
 	if (ret)
 		goto probe_gfx_exit;
 
-	ret = init_threshold(MSM_GFX_PHASE_CTRL_HOT, data->gfx_sensor,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+		&thresh[MSM_GFX_PHASE_CTRL_HOT],
+		data->gfx_sensor,
 		data->gfx_phase_hot_temp_degC, data->gfx_phase_hot_temp_degC -
 		data->gfx_phase_hot_temp_hyst_degC,
 		gfx_phase_ctrl_notify);
@@ -4860,7 +5698,9 @@ static int probe_cx_phase_ctrl(struct device_node *node,
 	if (ret)
 		goto probe_cx_exit;
 
-	ret = init_threshold(MSM_CX_PHASE_CTRL_HOT, MONITOR_ALL_TSENS,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+		&thresh[MSM_CX_PHASE_CTRL_HOT],
+		MONITOR_ALL_TSENS,
 		data->cx_phase_hot_temp_degC, data->cx_phase_hot_temp_degC -
 		data->cx_phase_hot_temp_hyst_degC,
 		cx_phase_ctrl_notify);
@@ -4893,7 +5733,9 @@ static int probe_therm_reset(struct device_node *node,
 	if (ret)
 		goto PROBE_RESET_EXIT;
 
-	ret = init_threshold(MSM_THERM_RESET, MONITOR_ALL_TSENS,
+	ret = sensor_mgr_init_threshold(&pdev->dev,
+		&thresh[MSM_THERM_RESET],
+		MONITOR_ALL_TSENS,
 		data->therm_reset_temp_degC, data->therm_reset_temp_degC - 10,
 		therm_reset_notify);
 	if (ret) {
@@ -5078,29 +5920,39 @@ static int msm_thermal_dev_exit(struct platform_device *inp_dev)
 {
 	int i = 0;
 
+	unregister_reboot_notifier(&msm_thermal_reboot_notifier);
 	if (msm_therm_debugfs && msm_therm_debugfs->parent)
 		debugfs_remove_recursive(msm_therm_debugfs->parent);
 	msm_thermal_ioctl_cleanup();
 	if (thresh) {
+		if (therm_reset_enabled)
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_THERM_RESET]);
 		if (vdd_rstr_enabled)
-			kfree(thresh[MSM_VDD_RESTRICTION].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_VDD_RESTRICTION]);
 		if (cx_phase_ctrl_enabled)
-			kfree(thresh[MSM_CX_PHASE_CTRL_HOT].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_CX_PHASE_CTRL_HOT]);
 		if (gfx_warm_phase_ctrl_enabled)
-			kfree(thresh[MSM_GFX_PHASE_CTRL_WARM].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_GFX_PHASE_CTRL_WARM]);
 		if (gfx_crit_phase_ctrl_enabled)
-			kfree(thresh[MSM_GFX_PHASE_CTRL_HOT].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_GFX_PHASE_CTRL_HOT]);
 		if (ocr_enabled) {
 			for (i = 0; i < ocr_rail_cnt; i++)
 				kfree(ocr_rails[i].attr_gp.attrs);
 			kfree(ocr_rails);
 			ocr_rails = NULL;
-			kfree(thresh[MSM_OCR].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_OCR]);
 		}
 		if (vdd_mx_enabled) {
 			kfree(mx_kobj);
 			kfree(mx_attr_group.attrs);
-			kfree(thresh[MSM_VDD_MX_RESTRICTION].thresh_list);
+			sensor_mgr_remove_threshold(&inp_dev->dev,
+				&thresh[MSM_VDD_MX_RESTRICTION]);
 		}
 		kfree(thresh);
 		thresh = NULL;
@@ -5131,6 +5983,9 @@ arch_initcall(msm_thermal_device_init);
 
 int __init msm_thermal_late_init(void)
 {
+	if (!msm_thermal_probed)
+		return 0;
+
 	if (num_possible_cpus() > 1)
 		msm_thermal_add_cc_nodes();
 	msm_thermal_add_psm_nodes();
@@ -5146,6 +6001,7 @@ int __init msm_thermal_late_init(void)
 	interrupt_mode_init();
 	create_cpu_topology_sysfs();
 	create_thermal_debugfs();
+	msm_thermal_add_bucket_info_nodes();
 	return 0;
 }
 late_initcall(msm_thermal_late_init);

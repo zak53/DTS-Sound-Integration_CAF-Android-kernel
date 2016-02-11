@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #endif
 
+#include <linux/v4l2-mediabus.h>
 #include <media/msm_camsensor_sdk.h>
 
 #include <linux/types.h>
@@ -37,7 +38,15 @@
 #define MAX_AF_ITERATIONS 3
 #define MAX_NUMBER_OF_STEPS 47
 
-#define MAX_LED_TRIGGERS 3
+#define MSM_V4L2_PIX_FMT_META v4l2_fourcc('M', 'E', 'T', 'A') /* META */
+#define MSM_V4L2_PIX_FMT_SBGGR14 v4l2_fourcc('B', 'G', '1', '4')
+	/* 14  BGBG.. GRGR.. */
+#define MSM_V4L2_PIX_FMT_SGBRG14 v4l2_fourcc('G', 'B', '1', '4')
+	/* 14  GBGB.. RGRG.. */
+#define MSM_V4L2_PIX_FMT_SGRBG14 v4l2_fourcc('B', 'A', '1', '4')
+	/* 14  GRGR.. BGBG.. */
+#define MSM_V4L2_PIX_FMT_SRGGB14 v4l2_fourcc('R', 'G', '1', '4')
+	/* 14  RGRG.. GBGB.. */
 
 enum flash_type {
 	LED_FLASH = 1,
@@ -553,26 +562,25 @@ enum msm_camera_led_config_t {
 
 struct msm_camera_led_cfg_t {
 	enum msm_camera_led_config_t cfgtype;
-	uint32_t torch_current[MAX_LED_TRIGGERS];
-	uint32_t flash_current[MAX_LED_TRIGGERS];
-	uint32_t flash_duration[MAX_LED_TRIGGERS];
+	int32_t torch_current[MAX_LED_TRIGGERS];
+	int32_t flash_current[MAX_LED_TRIGGERS];
+	int32_t flash_duration[MAX_LED_TRIGGERS];
 };
 
 struct msm_flash_init_info_t {
 	enum msm_flash_driver_type flash_driver_type;
+	uint32_t slave_addr;
 	struct msm_sensor_power_setting_array *power_setting_array;
 	struct msm_camera_i2c_reg_setting_array *settings;
 };
 
 struct msm_flash_cfg_data_t {
 	enum msm_flash_cfg_type_t cfg_type;
-	uint32_t torch_current;
-	uint32_t flash_current[MAX_LED_TRIGGERS];
-	uint32_t flash_duration[MAX_LED_TRIGGERS];
+	int32_t flash_current[MAX_LED_TRIGGERS];
+	int32_t flash_duration[MAX_LED_TRIGGERS];
 	union {
 		struct msm_flash_init_info_t *flash_init_info;
 		struct msm_camera_i2c_reg_setting_array *settings;
-		uint32_t flash_current[MAX_LED_TRIGGERS];
 	} cfg;
 };
 
@@ -733,19 +741,18 @@ struct msm_ois_cfg_data32 {
 
 struct msm_flash_init_info_t32 {
 	enum msm_flash_driver_type flash_driver_type;
+	uint32_t slave_addr;
 	compat_uptr_t power_setting_array;
 	compat_uptr_t settings;
 };
 
 struct msm_flash_cfg_data_t32 {
 	enum msm_flash_cfg_type_t cfg_type;
-	uint32_t torch_current;
-	uint32_t flash_current[MAX_LED_TRIGGERS];
-	uint32_t flash_duration[MAX_LED_TRIGGERS];
+	int32_t flash_current[MAX_LED_TRIGGERS];
+	int32_t flash_duration[MAX_LED_TRIGGERS];
 	union {
 		compat_uptr_t flash_init_info;
 		compat_uptr_t settings;
-		uint32_t flash_current[MAX_LED_TRIGGERS];
 	} cfg;
 };
 

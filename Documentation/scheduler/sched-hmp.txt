@@ -11,6 +11,7 @@ CONTENTS
    2.5 Task Events
    2.6 update_task_ravg()
    2.7 update_history()
+   2.8 Per-task 'initial task load'
 3. CPU Capacity
    3.1 Load scale factor
    3.2 CPU Power
@@ -21,7 +22,7 @@ CONTENTS
    5.3 Scheduler Tick
    5.4 Load Balancer
    5.5 Real Time Tasks
-   5.6 Stop-Class Tasks
+   5.6 Task packing
 6. Frequency Guidance
    6.1 Per-CPU Window-Based Stats
    6.1 Per-task Window-Based Stats
@@ -342,6 +343,39 @@ window. 'sum', which represents task's cpu demand in its elapsed window is
 pushed onto sum_history[] array and its 'demand' attribute is updated based on
 the sched_window_stats_policy in effect.
 
+*** 2.8 Initial task load attribute for a task (init_load_pct)
+
+In some cases, it may be desirable for children of a task to be assigned a
+"high" load so that they can start running on best capacity cluster. By default,
+newly created tasks are assigned a load defined by tunable sched_init_task_load
+(Sec 7.8). Some specialized tasks may need a higher value than the global
+default for their child tasks. This will let child tasks run on cpus with best
+capacity. This is accomplished by setting the 'initial task load' attribute
+(init_load_pct) for a task. Child tasks starting load (ravg.demand and
+ravg.sum_history[]) is initialized from their parent's 'initial task load'
+attribute. Note that child task's 'initial task load' attribute itself will be 0
+by default (i.e it is not inherited from parent).
+
+A task's 'initial task load' attribute can be set in two ways:
+
+**** /proc interface
+
+/proc/[pid]/sched_init_task_load can be written to for setting a task's 'initial
+task load' attribute. A numeric value between 0 - 100 (in percent scale) is
+accepted for task's 'initial task load' attribute.
+
+Reading /proc/[pid]/sched_init_task_load returns the 'initial task load'
+attribute for the given task.
+
+**** kernel API
+
+Following kernel APIs are provided to set or retrieve a given task's 'initial
+task load' attribute:
+
+int sched_set_init_task_load(struct task_struct *p, int init_load_pct);
+int sched_get_init_task_load(struct task_struct *p);
+
+
 ===============
 3. CPU CAPACITY
 ===============
@@ -523,30 +557,38 @@ both tasks and CPUs to aid in the placement of tasks.
 
   /proc/sys/kernel/sched_upmigrate
 
-  This value is a percentage. If a task consumes more than this much of
-  a particular CPU, that CPU will be considered too small for the task.
+  This value is a percentage. If a task consumes more than this much of a
+  particular CPU, that CPU will be considered too small for the task. The task
+  will thus be seen as a "big" task on the cpu and will reflect in nr_big_tasks
+  statistics maintained for that cpu. Note that certain tasks (whose nice
+  value exceeds sched_upmigrate_min_nice value or those that belong to a cgroup
+  whose upmigrate_discourage flag is set) will never be classified as big tasks
+  despite their high demand.
 
 - mostly_idle
 
   The "mostly_idle" classification applies to CPUs. This
   classification attempts to answer the following question: if a task
-  is put on this CPU, is it likely to be able to run soon? One
-  possible way to answer this question would be to just check whether
-  the CPU is idle or not. That may be too conservative however. The
-  CPU may be currently executing a very small task and could become
-  idle soon. Since the scheduler is tracking the demand of each task
-  it can make an educated guess as to whether a CPU will become idle
-  in the near future.
+  is put on this CPU, is it likely to be able to run with low contention for
+  bandwidth? One possible way to answer this question would be to just check
+  whether the CPU is idle or not. That may be too conservative however. The CPU
+  may be currently executing a very small task and could become idle soon. Since
+  the scheduler is tracking the demand of each task it can make an educated
+  guess as to whether a CPU will become idle in the near future.
 
-  There are two tunable parameters which are used to determine whether
+  There are three tunable parameters which are used to determine whether
   a CPU is mostly idle:
 
-  /proc/sys/kernel/sched_mostly_idle_nr_run
-  /proc/sys/kernel/sched_mostly_idle_load
+  /sys/devices/system/cpu/cpuX/sched_mostly_idle_nr_run
+  /sys/devices/system/cpu/cpuX/sched_mostly_idle_load
+  /sys/devices/system/cpu/cpuX/sched_mostly_idle_freq
 
-  If a CPU does not have more than sched_mostly_idle_nr_run runnable
-  tasks and is not more than sched_mostly_idle_load percent busy, it
-  is considered mostly idle.
+  Note that these tunables are per-cpu. If a CPU does not have more than
+  sched_mostly_idle_nr_run runnable tasks and is not more than
+  sched_mostly_idle_load percent busy, it is considered mostly idle.
+  Additionally if a cpu's sched_mostly_idle_freq is non-zero and its current
+  frequency is less than threshold, then scheduler will attempt to pack
+  tasks on the most power-efficient cpu in the cluster.
 
 - spill threshold
 
@@ -604,192 +646,63 @@ select_best_cpu(), represents the heart of the HMP scheduling
 algorithm described in this document.
 
 The behavior of select_best_cpu() differs depending on whether the
-task being placed is a small task or not.
+task being placed is a small task or not and the value of the sched_prefer_idle
+tunable.
 
 --- Wakeup Logic a Non-Small Task "p"
 
-  The following is evaluated for every online CPU i which task p may run on:
+The order of CPU preference for a non-small task when sched_prefer_idle = 1 is
+the following:
 
-       |
-       |                    task doesn't fit, but
-       |                    is this CPU a good
-       V                    fallback candidate?
-+---------------+             +-------------+            +--------+
-| does task fit |------------>|   is CPU    |----------->| ignore |
-|   on CPU      |     no      | mostly idle |     no     |   cpu  |
-+---------------+             +-------------+            +--------+
-       |                             |
-       | yes                         | yes
-       |                             |         +--------------------------+
-       |                             --------->| load < min_fallback_load |
-       |                                       +--------------------------+
-       |                                         |                    |
-       |                                         | yes                | no
-       |                                         V                    V
-       |                          +-----------------------+       +------------+
-       |                          | fallback_idle_cpu = i |       | ignore cpu |
-       | task fits, prefer        +-----------------------+       +------------+
-       | mostly idle CPUs                        |                    |
-       | or non-max capacity                     V                    V
-       | CPUs that won't hit                   next CPU            next CPU
-       | spill threshold
-       V
-+---------------------+           task does not meet load requirements
-| CPU mostly idle ||  |    no     +------------+
-| (!max_capacity &&   |---------->| ignore cpu |----> next CPU
-|  !(p causes spill)) |           +------------+
-+---------------------+
-       |
-       | yes
-       |
-       |
-       |
-       | is CPU in a lower power band
-       V than previously seen min cost CPU        CPU in a lower power band
-+---------------------+                           than previously seen min,
-| cost(p, i) is       |   yes     +----------------------------+  override
-| > band_limit % less |---------->| best_cpu = i               |  previously
-| than current min    |           | min_cost = cost(p,i)       |  seen min_load
-+---------------------+           | min_load = load(i)         |  CPU
-       |                          +----------------------------+
-       | no                               |
-       |                                  ---------> next CPU
-       |
-       |
-       |
-       | does CPU have lower load than            CPU has lower load than
-       V previously seen min_load CPU             previously seen lowest load
-+--------------------+    yes                   +-----------------+
-| load(i) < min_load |------------------------->| best_cpu = i    |
-+--------------------+                          | min_load = load |
-       |                                        +-----------------+
-       | no                                             |
-       |                                                |
-       | if load is tied with lowest previously         |
-       | seen lowest load, is power cost less           |
-       V                                                |
-+------------------------+                              |
-| load(i) == min_load && |  yes    +--------------+     |
-| cost(p, i) < min_cost  |-------->| best_cpu = i |     |
-+------------------------+         +--------------+     |
-       |                                |               |
-       | no                             |              /
-       \_____________________________   |   __________/
-                                     \  |  /
-                                      | | |
-                                      V V V              if power cost of this
-                                +----------------------+ CPU is lower than
-                                | cost(p,i) < min_cost | current min, update
-                                +----------------------+ min_cost
-                                   |                |
-                                   | yes            | no
-                                   |                ----------> next CPU
-                                   V
-                           +----------------------+
-                           | min_cost = cost(p,i) |-------> next CPU
-                           +----------------------+
+  1. The shallowest-cstate idle CPU in the lowest-power cluster which can fit
+     the task. Where there is a tie of two CPUs with the same load, the CPU with
+     the lowest power cost is chosen.
 
-Once this flow chart has been evaluated for every online CPU the task
-may run on, if a "best_cpu" was found, it is returned. If a best_cpu
-was not found but a fallback_idle_cpu was found, then the
-fallback_idle_cpu is returned. Finally, if no best_cpu or
-fallback_idle cpu was found, then the task's previous CPU is returned.
+  2. The least-loaded CPU the task is allowed to run on in the lowest power band
+     where the task will fit and where the placement will not result in cpu
+     exceeding spill level. When there is a tie of two CPUs at same load, the
+     CPU with the lowest power cost is chosen.
 
-Phew! Fortunately, all of that can be summarized relatively easily. The
-order of CPU preference for a non-small task is the following:
+  3. The least-loaded mostly idle CPU that the task is allowed to run on where
+     the task won't fit (since there was no CPU where the task would fit).
 
-  1. The least-loaded CPU the task is allowed to run on in the lowest
-     power band where the task will fit and where the placement will
-     not result in cpu exceeding spill level. When there is a tie of
-     two cpus at same load, their CPU with the lowest power cost is
-     chosen.
+  4. The CPU which the task last ran on.
 
-  2. The least-loaded mostly idle CPU that the task is allowed to run
-     on where the task won't fit (since there was no CPU where the
-     task would fit).
+The order of CPU preference for a non-small task when sched_prefer_idle = 0
+is the following:
 
-  3. The CPU which the task last ran on.
+  1. The least-loaded non-idle mostly idle CPU the task is allowed to run on in
+     the lowest power band where the task will fit. When there is a tie of two
+     CPUs at same load, the CPU with the lowest power cost is chosen.
+
+  2. The shallowest-cstate idle CPU in the lowest-power cluster which can fit
+     the task. Where there is a tie of two CPUs with the same load, the CPU with
+     the lowest power cost is chosen.
+
+  3. The least-loaded CPU the task is allowed to run on in the lowest power band
+     where the task will fit and where the placement will not result in the CPU
+     exceeding spill level. When there is a tie of two CPUs at the same load,
+     the CPU with the lowest power cost is chosen.
+
+  4. The least-loaded mostly idle CPU that the task is allowed to run on where
+     the task won't fit (since there was no CPU where the task would fit).
+
+  5. The CPU which the task last ran on.
 
 --- Wakeup Logic a Small Task "p"
 
-The online CPUs the task is allowed to run on are scanned and the
-lowest power CPU is found. This is marked as the min_cost_cpu.
-
-If the minimum cost CPU is mostly idle but not idle, that CPU is
-immediately chosen.
-
-If the minimum cost CPU is idle or not mostly idle, then the following
-will be evaluated for every online CPU i the task is allowed to run
-on:
-      |   is CPU i in higher power band          is this CPU lower power than
-      V   than min_cost_cpu?                     best fallback CPU seen
-+---------------------+                +-----------------------+
-| cost(p, i) is       |       yes      | cost(p,i) <           | no   +--------+
-| > band_limit % more |--------------->| min_fallback_cpu_cost |----->| ignore |
-| than min_cost_cpu   |                +-----------------------+      |  cpu   |
-+---------------------+                           |                   +--------+
-      |                                           | yes                   |
-      | no                                        |                       V
-      |                                           |                    next cpu
-      |  is this CPU                              V
-      V  idle                          +-----------------------------------+
-+-----------------+    yes             | best_fallback_cpu = i             |
-| cpu cstate > 0? |-----------         | min_fallback_cpu_cost = cost(p,i) |
-+-----------------+          |         +-----------------------------------+
-      |                      |                    |
-      | no                   |                    \------> next CPU
-      |                      | is this CPU
-      |  is this CPU         | the shallowest
-      V  mostly idle         | idle CPU seen
-+--------------+       +----------------------+  no  +--------+
-|   cpu i      |       | cstate < min_cstate? |----->| ignore |
-| mostly idle? |       +----------------------+      |  cpu   |--> next cpu
-+--------------+                            |        +--------+
-      |       |                             | yes
-      | no    | yes                         |
-      |       |       +--------------+      |     +---------------------+
-      |       \------>| return cpu i |      ----->| min_cstate_cpu = i  |
-      |               +--------------+            | min_cstate = cstate |
-      |                                           +---------------------+
-      |                                                    |
-      | will task not cross spill                          |
-      | threshold, and is this the                         |
-      V least loaded busy CPU we've seen                   |
-+-------------------------+                                \-----> next cpu
-| !(p causes spill) &&    |  no   +--------+
-| load(i) < min_busy_load |------>| ignore |---> next cpu
-+-------------------------+       |  cpu   |
-      |                           +--------+
-      | yes
-      V
-+----------------------+
-| best_busy_cpu = i    |
-| min_busy_load = load |--------> next cpu
-+----------------------+
-
-Note that the process of evaluating the flow chart for every online
-CPU the task may run on could be interrupted if a mostly idle CPU is
-found in the lowest power band. Such a CPU will be selected
-immediately by the algorithm. Otherwise, once the flow chart has been
-evaluated for every online CPU the task is allowed to run on, a CPU is
-selected from the candidates. If one or more idle CPUs exist in the
-lowest power band then the one in the shallowest C-state is
-returned. If not, then the least loaded CPU in the lowest power band
-which would not exceed its spill threshold by accepting the task is
-selected, assuming it exists. If none of the former possibilities
-exist, the most power-efficient CPU outside the lowest power band is
-selected.
-
-Phew! But once again this can all be summarized. The order of CPU
-preference for a small task is the following:
+The order of CPU preference for a small task is the following:
 
   1. The lowest-power CPU, if it is not idle but is mostly idle.
-  2. A non-idle CPU in the lowest power band which is mostly idle. The
-     first such CPU found is selected.
-  3. An idle CPU in the lowest power band that is in the least shallow
-     C-state.
-  4. The least busy CPU in the lowest power band where adding the task
-     will not result in exceeding the spill threshold.
+
+  2. A non-idle CPU in the lowest power band which is mostly idle. The first
+     such CPU found is selected.
+
+  3. An idle CPU in the lowest power band that is in the least shallow C-state.
+
+  4. The least busy CPU in the lowest power band where adding the task will not
+     result in exceeding the spill threshold.
+
   5. The most power-efficient CPU outside of the lowest power band.
 
 *** 5.3 Scheduler Tick
@@ -860,6 +773,85 @@ is to place them on a cpu where they can be run immediately.
 HMP scheduler brings in a change which avoids fast-path and always resorts to
 slow-path. Further cpu with lowest power-rating from candidate list of cpus is
 chosen as cpu for placing waking real-time task.
+
+*** 5.6 Task packing
+
+Task packing is letting one cpu take up more than one task in an attempt to
+improve power (and in some cases performance). Power benefit is derived by
+avoiding wakeup cost for idle cpus from their deep sleep states. For example,
+consider a system with one cpu busy while other cpus are idle and in deep
+sleep state. A small task in this situation needs to be placed on a suitable
+cpu. Placing the small task on the busy cpu will likely not hurt its
+performance (it is after all a low-demand task) while helping gain on power
+because we avoid the cost associated with waking idle cpu from deep sleep
+state.
+
+Task packing can have good or bad implications for power and performance.
+
+a. Power implications
+
+As described in the small task wakeup example, task packing can be beneficial
+for power. However, the adverse impact on power can arise when packing on one
+cpu can increase its busy time and hence result in frequency raise.
+
+b. Performance implications
+
+The most obvious negative impact on performance because of packing is
+increased scheduling latencies for tasks that can occur. Positive impact on
+performance from packing has also been seen. This arises from the fact
+that a waking task, when woken to busy cpu because of packing, will incur very
+low latency to run immediately, when compared to being woken to a idle cpu in
+deep sleep state. In later case, task has to wait for cpu to exit sleep state,
+considerable enough in some cases to hurt performance.
+
+Packing thus is a delicate matter to play with! The following parameters control
+packing behavior.
+
+- sched_small_task
+	This parameter specifies demand threshold below which a task will be
+classified as "small". As described in Sec 5.2 ("Task Wakeup and
+select_best_cpu()"), for small tasks wakeups, a busy cpu is prefered as target
+rather than idle cpu.
+
+- mostly_idle_load and mostly_idle_nr_run
+
+These are per-cpu parameters that define mostly_idle thresholds for a cpu. A cpu
+whose load < mostly_idle_load AND whose nr_running is < mostly_idle_nr_run is
+classified as mostly_idle. See further description of "mostly_idle" thresholds
+in Sec 5.
+
+- mostly_idle_freq
+
+This is a per-cpu parameter. If non-zero for a cpu which is part of a cluster
+and cluster current frequency is less than this threshold, then scheduler will
+pack all tasks on a single cpu in cluster. The cpu chosen is the first most
+power-efficient cpu found while scanning cluster's online cpus.
+
+- PF_WAKE_UP_IDLE
+	Any task that has this flag set in its 'task_struct.flags' field will be
+always woken to idle cpu. Further any task woken by such tasks will be also
+placed on idle cpu. PF_WAKE_UP_IDLE flag is inherited by children of a task.
+It can be modified for a task in two ways:
+
+	> kernel-space interface
+		set_wake_up_idle() needs to be called in the context of a task
+		to set or clear its PF_WAKE_UP_IDLE flag.
+
+	> user-space interface
+		/proc/[pid]/sched_wake_up_idle file needs to be written to for
+		setting or clearing PF_WAKE_UP_IDLE flag for a given task
+
+For some low band of frequency, spread of task on all available cpus can be
+groslly power-inefficient. As an example, consider two tasks that each need
+500MHz. Packing them on one cpu could lead to 1GHz. In spread case, we incur
+cost of two cpus running at 500MHz, while in packed case, we incur the cost of
+one cpu running at 1GHz. Based on the silicon characteristics, where leakage
+power can be dominant factor, former can be worse on power rather than latter.
+Running at slow frequency (in spread case) can actually makes it worse on
+leakage power (especially if 500MHz and 1GHz share the same voltage point).
+sched_mostly_idle_freq is set based on silicon characteristics and can provide
+a winning argument for both power and performance.
+
 
 =====================
 6. FREQUENCY GUIDANCE
@@ -1008,9 +1000,9 @@ IRQ_UPDATE
 
 *** 7.1 sched_mostly_idle_nr_run
 
-Appears at: /proc/sys/kernel/sched_mostly_idle_nr_run
+Appears at: /sys/devices/system/cpu/cpuX/sched_mostly_idle_nr_run
 
-Default value: 4
+Default value: 3
 
 If a CPU has this many runnable tasks (or less), it is considered
 "mostly idle." A mostly idle CPU is a preferred destination for a
@@ -1020,7 +1012,7 @@ than sched_mostly_idle_load percent busy.
 
 *** 7.2 sched_mostly_idle_load
 
-Appears at: /proc/sys/kernel/sched_mostly_idle_load
+Appears at: /sys/devices/system/cpu/cpuX/sched_mostly_idle_load
 
 Default value: 20
 
@@ -1096,7 +1088,8 @@ Default value: 15
 This tunable is a percentage. When a task is first created it has no
 history, so the task load tracking mechanism cannot determine a
 historical load value to assign to it. This tunable specifies the
-initial load value for newly created tasks.
+initial load value for newly created tasks. Also see Sec 2.8 on per-task
+'initial task load' attribute.
 
 *** 7.9 sched_upmigrate_min_nice
 
@@ -1108,11 +1101,13 @@ A task whose nice value is greater than this tunable value will never
 be considered as a "big" task (it will not be allowed to run on a
 high-performance CPU).
 
+See also notes on 'cpu.upmigrate_discourage' tunable.
+
 *** 7.10 sched_enable_power_aware
 
 Appears at: /proc/sys/kernel/sched_enable_power_aware
 
-Default value: 1
+Default value: 0
 
 Controls whether or not per-CPU power values are used in determining
 task placement. If this is disabled, tasks are simply placed on the
@@ -1237,6 +1232,81 @@ comparison. Scheduler will request a raise in cpu frequency when heavy tasks
 wakeup after at least one window of sleep, where window size is defined by
 sched_ravg_window. Value 0 will disable this feature.
 
+** 7.21 sched_mostly_idle_freq
+
+Appears at: /sys/devices/system/cpu/cpuX/sched_mostly_idle_freq
+
+Default value: 0
+
+This tunable is intended to achieve task packing behavior based on cluster
+frequency. Hence it is strongly advised to have all cpus in a cluster have the
+same value for mostly_idle_freq. For more details, see section on "Task
+packing" (sec 5.6).
+
+*** 7.22 sched_cpu_high_irqload
+
+Appears at: /proc/sys/kernel/sched_cpu_high_irqload
+
+Default value: 10000000 (10ms)
+
+The scheduler keeps a decaying average of the amount of irq and softirq activity
+seen on each CPU within a ten millisecond window. Note that this "irqload"
+(reported in the sched_cpu_load tracepoint) will be higher than the typical load
+in a single window since every time the window rolls over, the value is decayed
+by some fraction and then added to the irq/softirq time spent in the next
+window.
+
+When the irqload on a CPU exceeds the value of this tunable, the CPU is no
+longer eligible to be seen as mostly idle. This will affect the task placement
+logic described above, causing the scheduler to try and steer tasks away from
+the CPU.
+
+** 7.23 sched_prefer_idle
+
+Appears at: /sys/devices/system/cpu/cpuX/sched_prefer_idle
+
+Default value: 1
+
+Non-small tasks will prefer to wake up on idle CPUs if this tunable is set to 1.
+If the tunable is set to 0, non-small tasks will prefer to wake up on mostly
+idle CPUs which are not completely idle, increasing task packing behavior.
+
+** 7.24 sched_min_runtime
+
+Appears at: /proc/sys/kernel/sched_min_runtime
+
+Default value: 0 (0 ms)
+
+This tunable helps avouid frequent migration of task on account of
+energy-awareness. During scheduler tick, a check is made (in migration_needed())
+whether the running task needs to be migrated to a "better" cpu, which could
+either offer better performance or power. When deciding to migrate task on
+account of power, we want to avoid "frequent" migration of task (say every
+tick), which could be add more overhead for comparatively little gains. A task's
+'run_start' attribute is set when it starts running on a cpu. This information
+is used in migration_needed() to avoid "frequent" migrations. Once a task has
+been associated with a cpu (in either running or runnable state) for more than
+'sched_min_vruntime' ns, it is considered eligible for migration in tick path on
+account of energy awareness reasons.
+The same logic also applies to the load balancer path to avoid frequent
+migrations due to energy awareness.
+
+** 7.25 cpu.upmigrate_discourage
+
+Default value : 0
+
+This is a cgroup attribute supported by the cpu resource controller. It normally
+appears at [root_cpu]/[name1]/../[name2]/cpu.upmigrate_discourage. Here
+"root_cpu" is the mount point for cgroup (cpu resource control) filesystem
+and name1, name2 etc are names of cgroups that form a hierarchy.
+
+Setting this flag to 1 discourages upmigration for all tasks of a cgroup. High
+demand tasks of such a cgroup will never be classified as big tasks and hence
+not upmigrated. Any task of the cgroup is allowed to upmigrate only under
+overcommitted scenario. See notes on sched_spill_nr_run and sched_spill_load for
+how overcommitment threshold is defined and also notes on
+'sched_upmigrate_min_nice' tunable.
+
 =========================
 8. HMP SCHEDULER TRACE POINTS
 =========================
@@ -1290,7 +1360,7 @@ Logged when selecting the best CPU to run a task (select_best_cpu() for fair
 class tasks, find_lowest_rq_hmp() for RT tasks) and load balancing
 (update_sg_lb_stats()).
 
-<idle>-0     [004] d.h3 12700.711541: sched_cpu_load: cpu 0 idle 1 mostly_idle 1 nr_run 0 nr_big 0 nr_small 0 lsf 1945 capacity 1045 cr_avg 0 fcur 199200 fmax 940800 power_cost 1045 cstate 1
+<idle>-0     [004] d.h3 12700.711541: sched_cpu_load: cpu 0 idle 1 mostly_idle 1 nr_run 0 nr_big 0 nr_small 0 lsf 1945 capacity 1045 cr_avg 0 irqload 4456 fcur 199200 fmax 940800 power_cost 1045 cstate 1 temp 73
 
 - cpu: the CPU being described
 - idle: boolean indicating whether the CPU is idle
@@ -1303,10 +1373,12 @@ class tasks, find_lowest_rq_hmp() for RT tasks) and load balancing
 - capacity: capacity of CPU (based on max possible frequency and efficiency)
 - cr_avg: cumulative runnable average, instantaneous sum of the demand (either
   PELT or window-based) of all the runnable task on a CPU (ns)
+- irqload: decaying average of irq activity on CPU (ns)
 - fcur: current CPU frequency (Khz)
 - fmax: max CPU frequency (but not maximum _possible_ frequency) (KHz)
 - power_cost: cost of running this CPU at the current frequency
 - cstate: current cstate of CPU
+- temp: current temperature of the CPU
 
 The power_cost value above differs in how it is calculated depending on the
 callsite of this tracepoint. The select_best_cpu() call to this tracepoint

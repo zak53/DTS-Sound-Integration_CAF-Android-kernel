@@ -14,14 +14,16 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
+#include <linux/rtmutex.h>
 #include <linux/clk.h>
 #include <linux/msm-bus.h>
 #include "msm_bus_core.h"
 #include "msm_bus_adhoc.h"
+#include <trace/events/trace_msm_bus.h>
 
 #define NUM_CL_HANDLES	50
 #define NUM_LNODES	3
+#define MAX_STR_CL	50
 
 struct bus_search_type {
 	struct list_head link;
@@ -37,7 +39,7 @@ static struct handle_type handle_list;
 struct list_head input_list;
 struct list_head apply_list;
 
-DEFINE_MUTEX(msm_bus_adhoc_lock);
+DEFINE_RT_MUTEX(msm_bus_adhoc_lock);
 
 static bool chk_bl_list(struct list_head *black_list, unsigned int id)
 {
@@ -397,6 +399,8 @@ static uint64_t arbitrate_bus_req(struct msm_bus_node_device_type *bus_dev,
 	uint64_t sum_ab = 0;
 	uint64_t bw_max_hz;
 	struct msm_bus_node_device_type *fab_dev = NULL;
+	uint32_t util_fact = 0;
+	uint32_t vrail_comp = 0;
 
 	/* Find max ib */
 	for (i = 0; i < bus_dev->num_lnodes; i++) {
@@ -408,22 +412,28 @@ static uint64_t arbitrate_bus_req(struct msm_bus_node_device_type *bus_dev,
 	 *  formula is:
 	 *  Freq_hz = max((sum(ab) * util_fact)/num_chan, max(ib)/vrail_comp)
 	 *				/ bus-width
-	 *  util_fact and vrail comp are obtained from fabric's dts properties.
+	 *  util_fact and vrail comp are obtained from fabric/Node's dts
+	 *  properties.
 	 *  They default to 100 if absent.
 	 */
 	fab_dev = bus_dev->node_info->bus_device->platform_data;
-
 	/* Don't do this for virtual fabrics */
 	if (fab_dev && fab_dev->fabdev) {
-		sum_ab *= fab_dev->fabdev->util_fact;
+		util_fact = bus_dev->node_info->util_fact ?
+			bus_dev->node_info->util_fact :
+			fab_dev->fabdev->util_fact;
+		vrail_comp = bus_dev->node_info->vrail_comp ?
+			bus_dev->node_info->vrail_comp :
+			fab_dev->fabdev->vrail_comp;
+		sum_ab *= util_fact;
 		sum_ab = msm_bus_div64(100, sum_ab);
 		max_ib *= 100;
-		max_ib = msm_bus_div64(fab_dev->fabdev->vrail_comp, max_ib);
+		max_ib = msm_bus_div64(vrail_comp, max_ib);
 	}
 
 	/* Account for multiple channels if any */
-	if (bus_dev->node_info->num_qports > 1)
-		sum_ab = msm_bus_div64(bus_dev->node_info->num_qports,
+	if (bus_dev->node_info->num_aggports > 1)
+		sum_ab = msm_bus_div64(bus_dev->node_info->num_aggports,
 					sum_ab);
 
 	if (!bus_dev->node_info->buswidth) {
@@ -463,7 +473,6 @@ static int msm_bus_apply_rules(struct list_head *list, bool after_clk_commit)
 	struct device *dev = NULL;
 	struct msm_bus_node_device_type *dev_info = NULL;
 	int ret = 0;
-	bool throttle_en = false;
 
 	list_for_each_entry(rule, list, link) {
 		if (!rule)
@@ -482,11 +491,11 @@ static int msm_bus_apply_rules(struct list_head *list, bool after_clk_commit)
 		}
 		dev_info = dev->platform_data;
 
-		throttle_en = ((rule->throttle == THROTTLE_ON) ? true : false);
-		ret = msm_bus_enable_limiter(dev_info, throttle_en,
+		ret = msm_bus_enable_limiter(dev_info, rule->throttle,
 							rule->lim_bw);
 		if (ret)
 			MSM_BUS_ERR("Failed to set limiter for %d", rule->id);
+		trace_bus_rules_apply(rule->id, rule->lim_bw, rule->throttle);
 	}
 
 	return ret;
@@ -503,9 +512,9 @@ static uint64_t get_node_aggab(struct msm_bus_node_device_type *bus_dev)
 		for (i = 0; i < bus_dev->num_lnodes; i++)
 			agg_ab += bus_dev->lnode_list[i].lnode_ab[ctx];
 
-		if (bus_dev->node_info->num_qports > 1)
-			agg_ab = msm_bus_div64(bus_dev->node_info->num_qports,
-							agg_ab);
+		if (bus_dev->node_info->num_aggports > 1)
+			agg_ab = msm_bus_div64(bus_dev->node_info->num_aggports,
+						agg_ab);
 
 		max_agg_ab = max(max_agg_ab, agg_ab);
 	}
@@ -737,7 +746,7 @@ static void unregister_client_adhoc(uint32_t cl)
 	uint64_t  cur_clk, cur_bw;
 	struct msm_bus_client *client;
 
-	mutex_lock(&msm_bus_adhoc_lock);
+	rt_mutex_lock(&msm_bus_adhoc_lock);
 	if (!cl) {
 		MSM_BUS_ERR("%s: Null cl handle passed unregister\n",
 				__func__);
@@ -774,7 +783,7 @@ static void unregister_client_adhoc(uint32_t cl)
 	kfree(client);
 	handle_list.cl_list[cl] = NULL;
 exit_unregister_client:
-	mutex_unlock(&msm_bus_adhoc_lock);
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
 	return;
 }
 
@@ -851,7 +860,7 @@ static uint32_t register_client_adhoc(struct msm_bus_scale_pdata *pdata)
 	int *lnode;
 	uint32_t handle = 0;
 
-	mutex_lock(&msm_bus_adhoc_lock);
+	rt_mutex_lock(&msm_bus_adhoc_lock);
 	client = kzalloc(sizeof(struct msm_bus_client), GFP_KERNEL);
 	if (!client) {
 		MSM_BUS_ERR("%s: Error allocating client data", __func__);
@@ -890,7 +899,7 @@ static uint32_t register_client_adhoc(struct msm_bus_scale_pdata *pdata)
 	MSM_BUS_DBG("%s:Client handle %d %s", __func__, handle,
 						client->pdata->name);
 exit_register_client:
-	mutex_unlock(&msm_bus_adhoc_lock);
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
 	return handle;
 }
 
@@ -904,7 +913,7 @@ static int update_request_adhoc(uint32_t cl, unsigned int index)
 	const char *test_cl = "Null";
 	bool log_transaction = false;
 
-	mutex_lock(&msm_bus_adhoc_lock);
+	rt_mutex_lock(&msm_bus_adhoc_lock);
 
 	if (!cl) {
 		MSM_BUS_ERR("%s: Invalid client handle %d", __func__, cl);
@@ -943,6 +952,7 @@ static int update_request_adhoc(uint32_t cl, unsigned int index)
 	MSM_BUS_DBG("%s: cl: %u index: %d curr: %d num_paths: %d\n", __func__,
 		cl, index, client->curr, client->pdata->usecase->num_paths);
 
+	msm_bus_dbg_client_data(client->pdata, index , cl);
 	for (i = 0; i < pdata->usecase->num_paths; i++) {
 		src = client->pdata->usecase[index].vectors[i].src;
 		dest = client->pdata->usecase[index].vectors[i].dst;
@@ -972,12 +982,135 @@ static int update_request_adhoc(uint32_t cl, unsigned int index)
 		if (log_transaction)
 			getpath_debug(src, lnode, pdata->active_only);
 	}
-	msm_bus_dbg_client_data(client->pdata, index , cl);
+	trace_bus_update_request_end(pdata->name);
 exit_update_request:
-	mutex_unlock(&msm_bus_adhoc_lock);
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
 	return ret;
 }
 
+static void free_cl_mem(struct msm_bus_client_handle *cl)
+{
+	if (cl) {
+		kfree(cl->name);
+		kfree(cl);
+		cl = NULL;
+	}
+}
+
+static int update_bw_adhoc(struct msm_bus_client_handle *cl, u64 ab, u64 ib)
+{
+	int ret = 0;
+	char *test_cl = "test-client";
+	bool log_transaction = false;
+
+	rt_mutex_lock(&msm_bus_adhoc_lock);
+
+	if (!cl) {
+		MSM_BUS_ERR("%s: Invalid client handle %p", __func__, cl);
+		ret = -ENXIO;
+		goto exit_update_request;
+	}
+
+	if (!strcmp(test_cl, cl->name))
+		log_transaction = true;
+
+	msm_bus_dbg_rec_transaction(cl, ab, ib);
+
+	if ((cl->cur_ib == ib) && (cl->cur_ab == ab)) {
+		MSM_BUS_DBG("%s:no change in request", cl->name);
+		goto exit_update_request;
+	}
+
+	ret = update_path(cl->mas, cl->slv, ib, ab, cl->cur_ib, cl->cur_ab,
+						cl->first_hop, cl->active_only);
+
+	if (ret) {
+		MSM_BUS_ERR("%s: Update path failed! %d active_only %d\n",
+				__func__, ret, cl->active_only);
+		goto exit_update_request;
+	}
+
+	cl->cur_ib = ib;
+	cl->cur_ab = ab;
+
+	if (log_transaction)
+		getpath_debug(cl->mas, cl->first_hop, cl->active_only);
+	trace_bus_update_request_end(cl->name);
+exit_update_request:
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
+
+	return ret;
+}
+
+static void unregister_adhoc(struct msm_bus_client_handle *cl)
+{
+	rt_mutex_lock(&msm_bus_adhoc_lock);
+	if (!cl) {
+		MSM_BUS_ERR("%s: Null cl handle passed unregister\n",
+				__func__);
+		goto exit_unregister_client;
+	}
+
+	MSM_BUS_DBG("%s: Unregistering client %p", __func__, cl);
+
+	remove_path(cl->mas, cl->slv, cl->cur_ib, cl->cur_ab,
+				cl->first_hop, cl->active_only);
+
+	msm_bus_dbg_remove_client(cl);
+	kfree(cl);
+exit_unregister_client:
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
+	return;
+}
+
+
+static struct msm_bus_client_handle*
+register_adhoc(uint32_t mas, uint32_t slv, char *name, bool active_only)
+{
+	struct msm_bus_client_handle *client = NULL;
+	int len = 0;
+
+	rt_mutex_lock(&msm_bus_adhoc_lock);
+
+	if (!(mas && slv && name)) {
+		pr_err("%s: Error: src dst name num_paths are required",
+								 __func__);
+		goto exit_register;
+	}
+
+	client = kzalloc(sizeof(struct msm_bus_client_handle), GFP_KERNEL);
+	if (!client) {
+		MSM_BUS_ERR("%s: Error allocating client data", __func__);
+		goto exit_register;
+	}
+
+	len = strnlen(name, MAX_STR_CL);
+	client->name = kzalloc(len, GFP_KERNEL);
+	if (!client->name) {
+		MSM_BUS_ERR("%s: Error allocating client name buf", __func__);
+		free_cl_mem(client);
+		goto exit_register;
+	}
+	strlcpy(client->name, name, MAX_STR_CL);
+	client->active_only = active_only;
+
+	client->mas = mas;
+	client->slv = slv;
+	client->first_hop = getpath(client->mas, client->slv);
+	if (client->first_hop < 0) {
+		MSM_BUS_ERR("%s:Failed to find path.src %d dest %d",
+			__func__, client->mas, client->slv);
+		free_cl_mem(client);
+		goto exit_register;
+	}
+
+	MSM_BUS_DBG("%s:Client handle %p %s", __func__, client,
+						client->name);
+	msm_bus_dbg_add_client(client);
+exit_register:
+	rt_mutex_unlock(&msm_bus_adhoc_lock);
+	return client;
+}
 /**
  *  msm_bus_arb_setops_adhoc() : Setup the bus arbitration ops
  *  @ arb_ops: pointer to the arb ops.
@@ -987,4 +1120,8 @@ void msm_bus_arb_setops_adhoc(struct msm_bus_arb_ops *arb_ops)
 	arb_ops->register_client = register_client_adhoc;
 	arb_ops->update_request = update_request_adhoc;
 	arb_ops->unregister_client = unregister_client_adhoc;
+
+	arb_ops->register_cl = register_adhoc;
+	arb_ops->unregister = unregister_adhoc;
+	arb_ops->update_bw = update_bw_adhoc;
 }

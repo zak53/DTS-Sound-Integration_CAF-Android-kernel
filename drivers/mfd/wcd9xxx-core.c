@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -104,6 +104,13 @@ static int wcd9xxx_dt_parse_vreg_info(struct device *dev,
 static int wcd9xxx_dt_parse_micbias_info(struct device *dev,
 	struct wcd9xxx_micbias_setting *micbias);
 static struct wcd9xxx_pdata *wcd9xxx_populate_dt_pdata(struct device *dev);
+
+static int wcd9xxx_slim_device_up(struct slim_device *sldev);
+static int wcd9xxx_slim_device_down(struct slim_device *sldev);
+static int wcd9xxx_enable_static_supplies(struct wcd9xxx *wcd9xxx,
+					  struct wcd9xxx_pdata *pdata);
+static void wcd9xxx_disable_supplies(struct wcd9xxx *wcd9xxx,
+				     struct wcd9xxx_pdata *pdata);
 
 struct wcd9xxx_i2c wcd9xxx_modules[MAX_WCD9XXX_DEVICE];
 
@@ -895,6 +902,8 @@ struct wcd9xxx *debugCodec;
 static struct dentry *debugfs_wcd9xxx_dent;
 static struct dentry *debugfs_peek;
 static struct dentry *debugfs_poke;
+static struct dentry *debugfs_power_state;
+static struct dentry *debugfs_reg_dump;
 
 static unsigned char read_data;
 
@@ -928,16 +937,112 @@ static int get_parameters(char *buf, long int *param1, int num_of_par)
 	return 0;
 }
 
+static ssize_t wcd9xxx_slimslave_reg_show(char __user *ubuf, size_t count,
+					  loff_t *ppos)
+{
+	int i, reg_val, len;
+	ssize_t total = 0;
+	char tmp_buf[20]; /* each line is 12 bytes but 20 for margin of error */
+
+	for (i = (int) *ppos / 12; i <= SLIM_MAX_REG_ADDR; i++) {
+		reg_val = wcd9xxx_interface_reg_read(debugCodec, i);
+		len = snprintf(tmp_buf, 25, "0x%.3x: 0x%.2x\n", i, reg_val);
+
+		if ((total + len) >= count - 1)
+			break;
+		if (copy_to_user((ubuf + total), tmp_buf, len)) {
+			pr_err("%s: fail to copy reg dump\n", __func__);
+			total = -EFAULT;
+			goto copy_err;
+		}
+		*ppos += len;
+		total += len;
+	}
+
+copy_err:
+	return total;
+}
+
 static ssize_t codec_debug_read(struct file *file, char __user *ubuf,
 				size_t count, loff_t *ppos)
 {
 	char lbuf[8];
+	char *access_str = file->private_data;
+	ssize_t ret_cnt;
 
-	snprintf(lbuf, sizeof(lbuf), "0x%x\n", read_data);
-	return simple_read_from_buffer(ubuf, count, ppos, lbuf,
-		strnlen(lbuf, 7));
+	if (*ppos < 0 || !count)
+		return -EINVAL;
+
+	if (!strcmp(access_str, "slimslave_peek")) {
+		snprintf(lbuf, sizeof(lbuf), "0x%x\n", read_data);
+		ret_cnt = simple_read_from_buffer(ubuf, count, ppos, lbuf,
+					       strnlen(lbuf, 7));
+	} else if (!strcmp(access_str, "slimslave_reg_dump")) {
+		ret_cnt = wcd9xxx_slimslave_reg_show(ubuf, count, ppos);
+	} else {
+		pr_err("%s: %s not permitted to read\n", __func__, access_str);
+		ret_cnt = -EPERM;
+	}
+
+	return ret_cnt;
 }
 
+/*
+ * Place inside CONFIG_DEBUG section as this function is only used by debugfs
+ * function
+ */
+static void wcd9xxx_set_reset_pin_state(struct wcd9xxx *wcd9xxx,
+					struct wcd9xxx_pdata *pdata,
+					bool active)
+{
+	if (pdata->use_pinctrl) {
+		if (active == true)
+			pinctrl_select_state(pinctrl_info.pinctrl,
+					     pinctrl_info.extncodec_act);
+		else
+			pinctrl_select_state(pinctrl_info.pinctrl,
+					     pinctrl_info.extncodec_sus);
+	} else
+		gpio_direction_output(wcd9xxx->reset_gpio,
+				      (active == true ? 1 : 0));
+}
+
+static int codec_debug_process_cdc_power(char *lbuf)
+{
+	long int param;
+	int rc;
+	struct wcd9xxx_pdata *pdata;
+
+	if (wcd9xxx_get_intf_type() != WCD9XXX_INTERFACE_TYPE_SLIMBUS) {
+		pr_err("%s: CODEC is not in SLIMBUS mode\n", __func__);
+		rc = -EPERM;
+		goto error_intf;
+	}
+
+	rc = get_parameters(lbuf, &param, 1);
+
+	if (likely(!rc)) {
+		pdata = debugCodec->slim->dev.platform_data;
+		if (param == 0) {
+			wcd9xxx_slim_device_down(debugCodec->slim);
+			wcd9xxx_disable_supplies(debugCodec, pdata);
+			wcd9xxx_set_reset_pin_state(debugCodec, pdata, false);
+		} else if (param == 1) {
+			wcd9xxx_enable_static_supplies(debugCodec, pdata);
+			usleep_range(1000, 2000);
+			wcd9xxx_set_reset_pin_state(debugCodec, pdata, false);
+			usleep_range(1000, 2000);
+			wcd9xxx_set_reset_pin_state(debugCodec, pdata, true);
+			usleep_range(1000, 2000);
+			wcd9xxx_slim_device_up(debugCodec->slim);
+		} else {
+			pr_err("%s: invalid command %ld\n", __func__, param);
+		}
+	}
+
+error_intf:
+	return rc;
+}
 
 static ssize_t codec_debug_write(struct file *filp,
 	const char __user *ubuf, size_t cnt, loff_t *ppos)
@@ -956,7 +1061,7 @@ static ssize_t codec_debug_write(struct file *filp,
 
 	lbuf[cnt] = '\0';
 
-	if (!strncmp(access_str, "poke", 6)) {
+	if (!strcmp(access_str, "slimslave_poke")) {
 		/* write */
 		rc = get_parameters(lbuf, param, 2);
 		if ((param[0] <= 0x3FF) && (param[1] <= 0xFF) &&
@@ -965,7 +1070,7 @@ static ssize_t codec_debug_write(struct file *filp,
 				param[1]);
 		else
 			rc = -EINVAL;
-	} else if (!strncmp(access_str, "peek", 6)) {
+	} else if (!strcmp(access_str, "slimslave_peek")) {
 		/* read */
 		rc = get_parameters(lbuf, param, 1);
 		if ((param[0] <= 0x3FF) && (rc == 0))
@@ -973,6 +1078,8 @@ static ssize_t codec_debug_write(struct file *filp,
 				param[0]);
 		else
 			rc = -EINVAL;
+	} else if (!strcmp(access_str, "power_state")) {
+		rc = codec_debug_process_cdc_power(lbuf);
 	}
 
 	if (rc == 0)
@@ -1107,6 +1214,15 @@ static void wcd9xxx_disable_supplies(struct wcd9xxx *wcd9xxx,
 				 wcd9xxx->supplies[i].supply);
 		}
 	}
+}
+
+static void wcd9xxx_release_supplies(struct wcd9xxx *wcd9xxx,
+				     struct wcd9xxx_pdata *pdata)
+{
+	int i;
+
+	wcd9xxx_disable_supplies(wcd9xxx, pdata);
+
 	for (i = 0; i < wcd9xxx->num_of_supplies; i++) {
 		if (regulator_count_voltages(wcd9xxx->supplies[i].consumer) <=
 		    0)
@@ -1399,7 +1515,7 @@ static int wcd9xxx_i2c_probe(struct i2c_client *client,
 err_device_init:
 	wcd9xxx_free_reset(wcd9xxx);
 err_supplies:
-	wcd9xxx_disable_supplies(wcd9xxx, pdata);
+	wcd9xxx_release_supplies(wcd9xxx, pdata);
 err_codec:
 	kfree(wcd9xxx);
 	dev_set_drvdata(&client->dev, NULL);
@@ -1413,7 +1529,7 @@ static int wcd9xxx_i2c_remove(struct i2c_client *client)
 	struct wcd9xxx_pdata *pdata = client->dev.platform_data;
 	pr_debug("exit\n");
 	wcd9xxx = dev_get_drvdata(&client->dev);
-	wcd9xxx_disable_supplies(wcd9xxx, pdata);
+	wcd9xxx_release_supplies(wcd9xxx, pdata);
 	wcd9xxx_device_exit(wcd9xxx);
 	dev_set_drvdata(&client->dev, NULL);
 	return 0;
@@ -1683,6 +1799,49 @@ undefined_rate:
 	return dmic_sample_rate;
 }
 
+/*
+ * wcd9xxx_validate_spkdrv_ocp_curr_limit:
+ *	Validate the spkdrv_ocp_curr_limit.
+ *	If spkdrv_ocp_curr_limit is found to be invalid,
+ *	assign the spkdrv_ocp_curr_limit as undefined, so individual codec
+ *	drivers can use thier own defaults
+ * @dev: the device for which the spkdrv_ocp_curr_limit is to be configured
+ * @spkdrv_ocp_curr_limit: The input spkdrv_ocp_curr_limit to be configured
+ */
+static u32 wcd9xxx_validate_spkdrv_ocp_curr_limit(struct device *dev,
+		u32 spkdrv_ocp_curr_limit)
+{
+	switch (spkdrv_ocp_curr_limit) {
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_0P0_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_0P375_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_0P750_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_1P125_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_1P500_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_1P875_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_2P250_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_2P625_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_3P000_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_3P375_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_3P750_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_4P125_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_4P500_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_4P875_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_5P250_A:
+	case WCD9XXX_SPKDRV_OCP_CURR_LIMIT_I_5P625_A:
+		break;
+	default:
+		/* Any other spkdrv_ocp_curr_limit values are invalid */
+		dev_info(dev, "%s: Invalid spkdrv_ocp_curr_limit = %u\n",
+				__func__, spkdrv_ocp_curr_limit);
+		spkdrv_ocp_curr_limit = WCD9XXX_SPKDRV_OCP_CURR_LIMIT_UNDEFINED;
+	}
+
+	dev_dbg(dev, "%s: spkdrv_ocp_curr_limit = %u\n", __func__,
+			spkdrv_ocp_curr_limit);
+
+	return spkdrv_ocp_curr_limit;
+}
+
 static struct wcd9xxx_pdata *wcd9xxx_populate_dt_pdata(struct device *dev)
 {
 	struct wcd9xxx_pdata *pdata;
@@ -1690,6 +1849,7 @@ static struct wcd9xxx_pdata *wcd9xxx_populate_dt_pdata(struct device *dev)
 	u32 mclk_rate = 0;
 	u32 dmic_sample_rate = 0;
 	u32 mad_dmic_sample_rate = 0;
+	u32 spkdrv_ocp_curr_limit = 0;
 	const char *static_prop_name = "qcom,cdc-static-supplies";
 	const char *ond_prop_name = "qcom,cdc-on-demand-supplies";
 	const char *cp_supplies_name = "qcom,cdc-cp-supplies";
@@ -1823,6 +1983,22 @@ static struct wcd9xxx_pdata *wcd9xxx_populate_dt_pdata(struct device *dev)
 		else
 			pdata->cdc_variant = WCD9XXX;
 	}
+
+
+	ret = of_property_read_u32(dev->of_node,
+				"qcom,cdc-spkdrv-ocp-curr-limit-mA",
+				&spkdrv_ocp_curr_limit);
+	if (ret) {
+		dev_dbg(dev, "Looking up %s property in node %s failed, err = %d",
+			"qcom,cdc-spkdrv-ocp-curr-limit-mA",
+			dev->of_node->full_name, ret);
+		spkdrv_ocp_curr_limit = WCD9XXX_SPKDRV_OCP_CURR_LIMIT_UNDEFINED;
+	}
+	pdata->ocp.spkdrv_ocp_curr_limit =
+		wcd9xxx_validate_spkdrv_ocp_curr_limit(dev,
+							spkdrv_ocp_curr_limit);
+
+
 
 	return pdata;
 err:
@@ -1982,15 +2158,23 @@ static int wcd9xxx_slim_probe(struct slim_device *slim)
 	debugCodec = wcd9xxx;
 
 	debugfs_wcd9xxx_dent = debugfs_create_dir
-		("wcd9310_slimbus_interface_device", 0);
+		("wcd9xxx_core", 0);
 	if (!IS_ERR(debugfs_wcd9xxx_dent)) {
-		debugfs_peek = debugfs_create_file("peek",
+		debugfs_peek = debugfs_create_file("slimslave_peek",
 		S_IFREG | S_IRUGO, debugfs_wcd9xxx_dent,
-		(void *) "peek", &codec_debug_ops);
+		(void *) "slimslave_peek", &codec_debug_ops);
 
-		debugfs_poke = debugfs_create_file("poke",
+		debugfs_poke = debugfs_create_file("slimslave_poke",
 		S_IFREG | S_IRUGO, debugfs_wcd9xxx_dent,
-		(void *) "poke", &codec_debug_ops);
+		(void *) "slimslave_poke", &codec_debug_ops);
+
+		debugfs_power_state = debugfs_create_file("power_state",
+		S_IFREG | S_IRUGO, debugfs_wcd9xxx_dent,
+		(void *) "power_state", &codec_debug_ops);
+
+		debugfs_reg_dump = debugfs_create_file("slimslave_reg_dump",
+		S_IFREG | S_IRUGO, debugfs_wcd9xxx_dent,
+		(void *) "slimslave_reg_dump", &codec_debug_ops);
 	}
 #endif
 
@@ -2001,7 +2185,7 @@ err_slim_add:
 err_reset:
 	wcd9xxx_free_reset(wcd9xxx);
 err_supplies:
-	wcd9xxx_disable_supplies(wcd9xxx, pdata);
+	wcd9xxx_release_supplies(wcd9xxx, pdata);
 err_codec:
 	kfree(wcd9xxx);
 	slim_set_clientdata(slim, NULL);
@@ -2014,14 +2198,12 @@ static int wcd9xxx_slim_remove(struct slim_device *pdev)
 	struct wcd9xxx_pdata *pdata = pdev->dev.platform_data;
 
 #ifdef CONFIG_DEBUG_FS
-	debugfs_remove(debugfs_peek);
-	debugfs_remove(debugfs_poke);
-	debugfs_remove(debugfs_wcd9xxx_dent);
+	debugfs_remove_recursive(debugfs_wcd9xxx_dent);
 #endif
 	wcd9xxx = slim_get_devicedata(pdev);
 	wcd9xxx_deinit_slimslave(wcd9xxx);
 	slim_remove_device(wcd9xxx->slim_slave);
-	wcd9xxx_disable_supplies(wcd9xxx, pdata);
+	wcd9xxx_release_supplies(wcd9xxx, pdata);
 	wcd9xxx_device_exit(wcd9xxx);
 	slim_set_clientdata(pdev, NULL);
 	return 0;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -68,8 +68,6 @@ int digital_get_div(struct div_clk *clk);
 int analog_set_div(struct div_clk *clk, int div);
 int analog_get_div(struct div_clk *clk);
 int dsi_pll_lock_status(struct mdss_pll_resources *dsi_pll_res);
-void dsi_pll_20nm_phy_ctrl_config
-		(struct mdss_pll_resources *dsi_pll_res, int off);
 int vco_set_rate(struct dsi_pll_vco_clk *vco, unsigned long rate);
 unsigned long vco_get_rate(struct clk *c);
 long vco_round_rate(struct clk *c, unsigned long rate);
@@ -85,7 +83,7 @@ long pll_20nm_vco_round_rate(struct clk *c, unsigned long rate);
 enum handoff pll_20nm_vco_handoff(struct clk *c);
 int pll_20nm_vco_prepare(struct clk *c);
 void pll_20nm_vco_unprepare(struct clk *c);
-int dsi_20nm_pll_lock_status(struct mdss_pll_resources *dsi_pll_res);
+int pll_20nm_vco_enable_seq(struct mdss_pll_resources *dsi_pll_res);
 
 int set_bypass_lp_div_mux_sel(struct mux_clk *clk, int sel);
 int set_shadow_bypass_lp_div_mux_sel(struct mux_clk *clk, int sel);
@@ -99,12 +97,11 @@ int hr_oclk3_get_div(struct div_clk *clk);
 int ndiv_set_div(struct div_clk *clk, int div);
 int shadow_ndiv_set_div(struct div_clk *clk, int div);
 int ndiv_get_div(struct div_clk *clk);
-void __dsi_pll_disable(void __iomem *pll_base);
+void pll_20nm_config_powerdown(void __iomem *pll_base);
 
 int set_mdss_pixel_mux_sel(struct mux_clk *clk, int sel);
 int get_mdss_pixel_mux_sel(struct mux_clk *clk);
 int set_mdss_byte_mux_sel(struct mux_clk *clk, int sel);
 int get_mdss_byte_mux_sel(struct mux_clk *clk);
-void dsi_cache_trim_codes(struct mdss_pll_resources *dsi_pll_res);
 
 #endif

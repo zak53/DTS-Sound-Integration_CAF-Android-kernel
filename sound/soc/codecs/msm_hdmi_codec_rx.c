@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -102,7 +102,7 @@ static int msm_hdmi_audio_codec_rx_dai_startup(
 		dev_err(dai->dev,
 			"%s() HDMI cable is not connected (ret val = %d)\n",
 			__func__, msm_hdmi_audio_codec_return_value);
-		ret = -EAGAIN;
+		ret = -ENODEV;
 	}
 
 	return ret;
@@ -123,15 +123,15 @@ static int msm_hdmi_audio_codec_rx_dai_hw_params(
 			dev_get_drvdata(dai->codec->dev);
 
 	if (IS_ERR_VALUE(msm_hdmi_audio_codec_return_value)) {
-		dev_err(dai->dev,
+		dev_err_ratelimited(dai->dev,
 			"%s() HDMI core is not ready (ret val = %d)\n",
 			__func__, msm_hdmi_audio_codec_return_value);
 		return msm_hdmi_audio_codec_return_value;
 	} else if (!msm_hdmi_audio_codec_return_value) {
-		dev_err(dai->dev,
+		dev_err_ratelimited(dai->dev,
 			"%s() HDMI cable is not connected (ret val = %d)\n",
 			__func__, msm_hdmi_audio_codec_return_value);
-		return -EAGAIN;
+		return -ENODEV;
 	}
 
 	/*refer to HDMI spec CEA-861-E: Table 28 Audio InfoFrame Data Byte 4*/
@@ -172,8 +172,9 @@ static int msm_hdmi_audio_codec_rx_dai_hw_params(
 			params_rate(params), num_channels,
 			channel_allocation, level_shift, down_mix);
 	if (IS_ERR_VALUE(rc)) {
-		dev_err(dai->dev,
-			"%s() HDMI core is not ready\n", __func__);
+		dev_err_ratelimited(dai->dev,
+			"%s() HDMI core is not ready, rc: %d\n",
+			__func__, rc);
 	}
 
 	return rc;
@@ -286,19 +287,7 @@ static struct snd_soc_codec_driver msm_hdmi_audio_codec_rx_soc_driver = {
 static int msm_hdmi_audio_codec_rx_plat_probe(
 		struct platform_device *pdev)
 {
-	dev_dbg(&pdev->dev, "%s(): orginal dev name  = %s, id = %d\n",
-		__func__, dev_name(&pdev->dev), pdev->id);
-
-	if (pdev->dev.of_node) {
-		dev_dbg(&pdev->dev, "%s(): node full name = %s,  name = %s\n",
-			__func__, pdev->dev.of_node->full_name,
-			pdev->dev.of_node->name);
-		dev_set_name(&pdev->dev, "%s", "msm-hdmi-audio-codec-rx");
-	} else
-		dev_err(&pdev->dev, "%s(): platfrom data not from device tree\n",
-				__func__);
-
-	dev_dbg(&pdev->dev, "%s(): new dev name %s\n", __func__,
+	dev_dbg(&pdev->dev, "%s(): dev name %s\n", __func__,
 		dev_name(&pdev->dev));
 
 	return snd_soc_register_codec(&pdev->dev,

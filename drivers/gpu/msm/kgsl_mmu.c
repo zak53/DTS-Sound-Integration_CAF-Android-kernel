@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -263,13 +263,7 @@ static void kgsl_destroy_pagetable(struct kref *kref)
 	struct kgsl_pagetable *pagetable = container_of(kref,
 		struct kgsl_pagetable, refcount);
 
-	unsigned long flags;
-
-	spin_lock_irqsave(&kgsl_driver.ptlock, flags);
-	list_del(&pagetable->list);
-	spin_unlock_irqrestore(&kgsl_driver.ptlock, flags);
-
-	pagetable_remove_sysfs_objects(pagetable);
+	kgsl_mmu_detach_pagetable(pagetable);
 
 	kgsl_unmap_global_pt_entries(pagetable);
 
@@ -410,6 +404,7 @@ pagetable_remove_sysfs_objects(struct kgsl_pagetable *pagetable)
 				   &pagetable_attr_group);
 
 	kobject_put(pagetable->kobj);
+	pagetable->kobj = NULL;
 }
 
 static int
@@ -435,6 +430,21 @@ err:
 	}
 
 	return ret;
+}
+
+void
+kgsl_mmu_detach_pagetable(struct kgsl_pagetable *pagetable)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kgsl_driver.ptlock, flags);
+	if (pagetable->list.next) {
+		list_del(&pagetable->list);
+		pagetable->list.next = NULL;
+	}
+	spin_unlock_irqrestore(&kgsl_driver.ptlock, flags);
+
+	pagetable_remove_sysfs_objects(pagetable);
 }
 
 int
@@ -700,7 +710,7 @@ kgsl_mmu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 	/* Add space for the guard page when allocating the mmu VA. */
 	size = memdesc->size;
 	if (kgsl_memdesc_has_guard_page(memdesc))
-		size += PAGE_SIZE;
+		size += kgsl_memdesc_guard_page_size(memdesc);
 
 	/*
 	 * Allocate aligned virtual addresses for iommu. This allows
@@ -777,7 +787,7 @@ kgsl_mmu_map(struct kgsl_pagetable *pagetable,
 	/* Add space for the guard page when allocating the mmu VA. */
 	size = memdesc->size;
 	if (kgsl_memdesc_has_guard_page(memdesc))
-		size += PAGE_SIZE;
+		size += kgsl_memdesc_guard_page_size(memdesc);
 
 	if (KGSL_MMU_TYPE_IOMMU != kgsl_mmu_get_mmutype())
 		spin_lock(&pagetable->lock);
@@ -826,7 +836,7 @@ kgsl_mmu_put_gpuaddr(struct kgsl_pagetable *pagetable,
 	/* Add space for the guard page when freeing the mmu VA. */
 	size = memdesc->size;
 	if (kgsl_memdesc_has_guard_page(memdesc))
-		size += PAGE_SIZE;
+		size += kgsl_memdesc_guard_page_size(memdesc);
 
 	if (KGSL_MEMDESC_BITMAP_ALLOC & memdesc->priv) {
 		bitmap_clear(pagetable->mem_bitmap,
@@ -874,7 +884,7 @@ kgsl_mmu_unmap(struct kgsl_pagetable *pagetable,
 	/* Add space for the guard page when freeing the mmu VA. */
 	size = memdesc->size;
 	if (kgsl_memdesc_has_guard_page(memdesc))
-		size += PAGE_SIZE;
+		size += kgsl_memdesc_guard_page_size(memdesc);
 
 	start_addr = memdesc->gpuaddr;
 	end_addr = (memdesc->gpuaddr + size);
